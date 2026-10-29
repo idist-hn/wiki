@@ -1,0 +1,3223 @@
+<template>
+  <w-layout class="fileman" view="hHh lpR lFr" container>
+    <!--
+      Three toolbars in one flex row, which below ~700px is more than fits: the row overflowed and took the
+      last of them -- the one holding Close -- off the side of the screen, so on a phone the overlay could
+      be opened and not shut. They wrap onto two lines instead below 900px; see the stylesheet, which is
+      also why each of the three carries a name.
+    -->
+    <w-header class="card-header">
+      <w-toolbar class="fileman-hdr-title" dark>
+        <w-icon name="img:/_assets/icons/fluent-folder.svg" left size="md" />
+        <span>{{ t(`fileman.title`) }}</span>
+      </w-toolbar>
+      <w-toolbar class="fileman-hdr-search" dark>
+        <!-- -> Same gate the sidebar's locale button uses in `MainLayout`: with the site's locale menu
+             off, switching locale is not something a reader is offered anywhere -->
+        <w-btn
+          v-if="siteStore.locales.showMenu"
+          class="fileman-locale mr-2 acrylic-btn"
+          flat
+          color="white"
+          :label="siteStore.localeAlias(state.locale)"
+          :aria-label="siteStore.localeAlias(state.locale)"
+          style="height: 40px">
+          <!-- -> Chooses which locale's content is LISTED, so it filters rather than navigates: going
+                  to another page would close the overlay the reader is working in -->
+          <locale-selector-menu :selected="state.locale" :navigate="false" @select="switchLocale" />
+        </w-btn>
+        <!--
+          The same pill the site header uses, rather than a `w-input`.
+
+          It was a `w-input` carrying `dark`, `standout="bg-white text-dark"` and `debounce`, none of
+          which that component has -- they fell through as bare attributes and styled nothing. What
+          rendered was the FILLED variant: a 4%-black wash holding white text, on a near-black header,
+          with its label stranded above the toolbar. Written out here so it matches HeaderSearch,
+          which is what a search field in this app looks like.
+        -->
+        <div class="fileman-search" :class="{ 'is-focused': state.searchIsFocused }">
+          <w-icon class="fileman-search-lead" name="la:search" />
+          <input
+            ref="searchField"
+            v-model="state.search"
+            type="text"
+            class="fileman-search-input"
+            :placeholder="searchPlaceholder"
+            :aria-label="searchPlaceholder"
+            autocomplete="off"
+            @focus="state.searchIsFocused = true"
+            @blur="state.searchIsFocused = false" />
+          <button
+            v-if="state.search.length > 0"
+            type="button"
+            class="fileman-search-clear"
+            :aria-label="t(`common.actions.clear`)"
+            @click="state.search = ``">
+            <w-icon name="la:times" />
+          </button>
+        </div>
+      </w-toolbar>
+      <!--
+        The same chrome the editing overlays close themselves with -- see `NavEditOverlay`: a flat round
+        help button, then the pushed group. One button in the group here, since there is nothing to save;
+        `push` goes on the buttons, which is where `WBtn` reads it, not on the group.
+
+        -> No right margin on the last control: the toolbar's own 12px is already close to the 9-10px the
+           header leaves above and below.
+      -->
+      <w-toolbar class="fileman-hdr-actions" dark>
+        <w-space />
+        <w-btn
+          class="mr-2"
+          flat
+          rounded
+          color="white"
+          :aria-label="t(`common.actions.viewDocs`)"
+          icon="la:question-circle"
+          :href="siteStore.docsBase + `/guide/file-manager`"
+          target="_blank">
+          <!-- -> `WTooltip` already defaults to below-the-trigger, which is where a header wants it -->
+          <w-tooltip>{{ t(`common.actions.viewDocs`) }}</w-tooltip>
+        </w-btn>
+        <w-btn-group>
+          <w-btn
+            push
+            color="white"
+            text-color="grey-7"
+            :label="t(`common.actions.close`)"
+            :aria-label="t(`common.actions.close`)"
+            icon="la:times"
+            @click="close" />
+        </w-btn-group>
+      </w-toolbar>
+    </w-header>
+    <!--
+      The folder tree. Beside the list where there is room for both, and a panel over it where there is
+      not -- which is what `WDrawer` does on its own below 1024px, except that this was bound `:model-value
+      ="true"`: one-way, and permanently open. Overlaying, that put 350px of tree across a 390px screen
+      with no way to put it away, since the drawer asks to be closed when its scrim is tapped and nothing
+      was listening. `treeDrawerOpen` is that listener, and above the breakpoint it answers true always.
+
+      Narrower while it overlays, so there is a comfortable width of scrim left to tap on.
+    -->
+    <w-drawer
+      class="fileman-left"
+      v-model="treeDrawerOpen"
+      :width="isTreeOverlay ? 300 : 350"
+      :inert="state.isGraph">
+      <div class="flex h-full flex-col">
+        <w-scroll-area
+          class="min-h-0 flex-1"
+          :thumb-style="thumbStyle"
+          :bar-style="barStyle"
+          style="height: 100%">
+          <!--
+            -> No side padding: the tree's rows run the full width of the drawer, so a hovered or
+               selected row reads as a band across it rather than a floating pill. `pt-2` is the gap
+               above the root entry that the padding used to imply.
+          -->
+          <!--
+            -> The tree is told the bin is selected by being handed an id no folder has, which leaves
+               every row -- the root included -- unhighlighted while the bin is open
+          -->
+          <div class="pt-2 pb-2">
+            <tree
+              ref="treeComp"
+              :nodes="state.treeNodes"
+              :roots="state.treeRoots"
+              :selected="state.isRecycleBin ? RECYCLE_BIN_SELECTION : state.currentFolderId"
+              @update:selected="openFolder"
+              @lazy-load="treeLazyLoad"
+              :use-lazy-load="true"
+              @context-action="treeContextAction"
+              :display-mode="state.displayMode"
+              :drag-active="state.dragItem !== null"
+              :can-drop="canDropOn"
+              @drop-item="dropOnFolder" />
+          </div>
+        </w-scroll-area>
+        <!--
+          The graph view, pinned with the Recycle Bin for the same reason: it is a way of looking at the
+          whole locale rather than a place in it. Not while inserting -- the editor sent the reader here
+          to pick a file, and the graph has no file to pick.
+        -->
+        <button
+          v-if="!insertMode"
+          type="button"
+          class="fileman-bin w-unstyled"
+          :class="{ 'is-active': state.isGraph }"
+          :aria-pressed="state.isGraph"
+          @click="openGraph">
+          <w-icon name="la:project-diagram" size="sm" />
+          <span class="fileman-bin-label">{{ t('fileman.graph.title') }}</span>
+        </button>
+        <!--
+          Pinned under the tree rather than a node in it: it is not a place in the wiki, and it has to
+          stay reachable however far the tree has been scrolled or expanded. Signed in only -- the
+          permissions that open it cannot be granted to the guests group, so a visitor would only
+          ever find it empty.
+        -->
+        <button
+          v-if="userStore.authenticated"
+          type="button"
+          class="fileman-bin w-unstyled"
+          :class="{ 'is-active': state.isRecycleBin }"
+          :aria-pressed="state.isRecycleBin"
+          @click="openRecycleBin">
+          <w-icon name="la:recycle" size="sm" />
+          <span class="fileman-bin-label">{{ t('fileman.recycleBin') }}</span>
+          <w-icon v-if="state.isRecycleBin" name="la:angle-right" />
+        </button>
+      </div>
+    </w-drawer>
+    <w-drawer
+      class="fileman-right"
+      :model-value="detailsPaneShown"
+      :width="350"
+      side="right"
+      :inert="state.isGraph">
+      <div class="flex h-full flex-col">
+        <w-scroll-area
+          class="min-h-0 flex-1"
+          :thumb-style="thumbStyle"
+          :bar-style="barStyle"
+          style="height: 100%">
+          <div class="p-4">
+            <template v-if="state.isRecycleBin">
+              <template v-if="selectedDeletedPage">
+                <img
+                  class="mb-4 w-full rounded object-cover"
+                  src="/_assets/illustrations/fileman-page.svg" />
+                <div
+                  class="fileman-details-row"
+                  v-for="item of deletedPageDetails"
+                  :key="item.label">
+                  <label>{{ item.label }}</label>
+                  <span>{{ item.value }}</span>
+                </div>
+              </template>
+            </template>
+            <template v-else-if="currentFileDetails">
+              <!--
+              A button around the thumbnail, and only for an image: it opens the full view, and the
+              illustration standing in for a page has nothing behind it to open.
+            -->
+              <button
+                class="fileman-details-thumb w-unstyled mb-4 block w-full"
+                v-if="currentFileDetails.thumbnail && currentFileDetails.viewable"
+                :aria-label="t(`common.actions.view`)"
+                @click="viewCurrentFile">
+                <img class="w-full rounded object-cover" :src="currentFileDetails.thumbnail" />
+              </button>
+              <img
+                class="mb-4 w-full rounded object-cover"
+                v-else-if="currentFileDetails.thumbnail"
+                :src="currentFileDetails.thumbnail" />
+              <div
+                class="fileman-details-row"
+                v-for="item of currentFileDetails.items"
+                :key="item.id">
+                <label>{{ item.label }}</label>
+                <div v-if="item.tags" class="mt-1 flex flex-wrap gap-1">
+                  <w-chip
+                    v-for="tag of item.tags"
+                    :key="tag"
+                    square
+                    dense
+                    color="secondary"
+                    text-color="white">
+                    <w-icon class="me-1" name="la:hashtag" size="14px" />
+                    <span class="text-caption">{{ tag }}</span>
+                  </w-chip>
+                </div>
+                <span v-else>{{ item.value }}</span>
+              </div>
+              <template v-if="insertMode">
+                <w-separator class="my-4" />
+                <w-btn
+                  class="w-full"
+                  @click="insertItem()"
+                  :label="t(`common.actions.insert`)"
+                  color="primary"
+                  icon="la:plus-circle"
+                  push
+                  padding="sm" />
+              </template>
+            </template>
+          </div>
+        </w-scroll-area>
+        <!--
+        Pinned under the details, the way the Recycle Bin is pinned under the tree: every action on a
+        file, a folder or a deleted page is in its right-click menu, and nothing on screen says so.
+      -->
+        <div class="fileman-hint">
+          <w-icon name="la:mouse-pointer" size="sm" />
+          <span>{{ t('fileman.rightClickHint') }}</span>
+        </div>
+      </div>
+    </w-drawer>
+    <w-page-container :inert="state.isGraph">
+      <!--
+        Tapping this pane puts the tree panel away, which is the "tap outside to dismiss" the drawer's own
+        scrim would normally provide. It cannot here: `WDrawer` teleports that scrim to <body> at z-30, and
+        this whole view is inside a dialog which paints above it -- so the scrim is invisible, and a tap
+        beside the panel lands on this pane instead. Rather than raise the z-index of a scrim shared with
+        the site's nav drawer, the pane takes the tap it is already receiving.
+
+        On the pane rather than on the list inside it, because the list is only as tall as its rows: below
+        the last file the tap reaches this element and nothing else. The handler steps aside for the
+        toolbar, which holds the button that OPENS the tree.
+      -->
+      <w-page class="fileman-center column" @click="dismissTreeOverlay">
+        <!-- TOOLBAR ----------------------------------------------------- -->
+        <w-toolbar class="fileman-toolbar">
+          <template v-if="state.isUploading">
+            <div class="fileman-progressbar">
+              <div :style="`width: ` + state.uploadPercentage + `%`">
+                {{ state.uploadPercentage }}%
+              </div>
+            </div>
+            <w-btn
+              class="acrylic-btn ml-2"
+              flat
+              dense
+              no-caps
+              color="negative"
+              :aria-label="t(`common.actions.cancel`)"
+              icon="la:square"
+              @click="uploadCancel"
+              v-if="state.uploadPercentage < 100" />
+          </template>
+          <template v-else>
+            <!--
+              What opens the tree while it is a panel: nothing else does, and the tree is how a reader
+              gets to another folder. First in the toolbar rather than in the pushed group, because it is
+              about where they are rather than about what to do here.
+            -->
+            <w-btn
+              v-if="isTreeOverlay"
+              class="mr-2"
+              flat
+              dense
+              no-caps
+              color="grey"
+              :aria-label="t(`common.sidebar.browse`)"
+              icon="mdi:file-tree"
+              @click="state.treeOpen = true">
+              <w-tooltip anchor="bottom middle" self="top middle">{{
+                t(`common.sidebar.browse`)
+              }}</w-tooltip>
+            </w-btn>
+            <div v-if="state.isRecycleBin" class="fileman-toolbar-title">
+              <w-icon name="la:recycle" class="mr-2" size="sm" />
+              {{ t('fileman.recycleBin') }}
+            </div>
+            <w-space />
+            <w-btn
+              class="mr-2"
+              flat
+              dense
+              no-caps
+              color="grey"
+              :aria-label="t(`fileman.viewOptions`)"
+              icon="la:th-list">
+              <w-tooltip anchor="bottom middle" self="top middle">{{
+                t(`fileman.viewOptions`)
+              }}</w-tooltip>
+              <w-menu
+                transition-show="jump-down"
+                transition-hide="jump-up"
+                anchor="bottom right"
+                self="top right">
+                <w-card class="p-2">
+                  <div class="text-center">
+                    <small class="text-grey">{{ t(`fileman.viewOptions`) }}</small>
+                  </div>
+                  <w-list dense>
+                    <w-separator class="my-2" />
+                    <w-item clickable>
+                      <w-item-section side>
+                        <w-icon name="la:list" color="grey" size="xs" />
+                      </w-item-section>
+                      <w-item-section class="pr-2">{{ t(`fileman.browseUsing`) }}</w-item-section>
+                      <w-item-section side>
+                        <w-icon name="la:angle-right" color="grey" size="xs" />
+                      </w-item-section>
+                      <w-menu anchor="top end" self="top start">
+                        <w-list class="p-2" dense>
+                          <w-item clickable @click="state.displayMode = `path`">
+                            <w-item-section side>
+                              <w-icon
+                                :name="
+                                  state.displayMode === `path` ? `la:check-circle` : `la:circle`
+                                "
+                                :color="state.displayMode === `path` ? `positive` : `grey`"
+                                size="xs" />
+                            </w-item-section>
+                            <w-item-section class="pr-2">{{
+                              t(`fileman.browseUsingPaths`)
+                            }}</w-item-section>
+                          </w-item>
+                          <w-item clickable @click="state.displayMode = `title`">
+                            <w-item-section side>
+                              <w-icon
+                                :name="
+                                  state.displayMode === `title` ? `la:check-circle` : `la:circle`
+                                "
+                                :color="state.displayMode === `title` ? `positive` : `grey`"
+                                size="xs" />
+                            </w-item-section>
+                            <w-item-section class="pr-2">{{
+                              t(`fileman.browseUsingTitles`)
+                            }}</w-item-section>
+                          </w-item>
+                        </w-list>
+                      </w-menu>
+                    </w-item>
+                    <w-item clickable @click="state.isCompact = !state.isCompact">
+                      <w-item-section side>
+                        <w-icon
+                          :name="state.isCompact ? `la:check-square` : `la:stop`"
+                          :color="state.isCompact ? `positive` : `grey`"
+                          size="xs" />
+                      </w-item-section>
+                      <w-item-section class="pr-2">{{ t(`fileman.compactList`) }}</w-item-section>
+                    </w-item>
+                    <w-item clickable @click="state.shouldShowFolders = !state.shouldShowFolders">
+                      <w-item-section side>
+                        <w-icon
+                          :name="state.shouldShowFolders ? `la:check-square` : `la:stop`"
+                          :color="state.shouldShowFolders ? `positive` : `grey`"
+                          size="xs" />
+                      </w-item-section>
+                      <w-item-section class="pr-2">{{ t(`fileman.showFolders`) }}</w-item-section>
+                    </w-item>
+                    <w-item
+                      clickable
+                      :disabled="!state.shouldShowFolders"
+                      @click="state.shouldListFoldersFirst = !state.shouldListFoldersFirst">
+                      <w-item-section side>
+                        <w-icon
+                          :name="state.shouldListFoldersFirst ? `la:check-square` : `la:stop`"
+                          :color="state.shouldListFoldersFirst ? `positive` : `grey`"
+                          size="xs" />
+                      </w-item-section>
+                      <w-item-section class="pr-2">{{
+                        t(`fileman.listFoldersFirst`)
+                      }}</w-item-section>
+                    </w-item>
+                  </w-list>
+                </w-card>
+              </w-menu>
+            </w-btn>
+            <w-btn
+              class="mr-2"
+              flat
+              dense
+              no-caps
+              color="grey"
+              :aria-label="t(`common.actions.refresh`)"
+              icon="la:redo-alt"
+              @click="refreshListing">
+              <w-tooltip anchor="bottom middle" self="top middle">{{
+                t(`common.actions.refresh`)
+              }}</w-tooltip>
+            </w-btn>
+            <!-- -> New, Upload and Insert all act on the folder being listed, and the bin is not one -->
+            <template v-if="!state.isRecycleBin">
+              <w-separator class="mr-2" inset vertical />
+              <w-btn
+                class="mr-2"
+                flat
+                dense
+                no-caps
+                color="blue"
+                :label="t(`common.actions.new`)"
+                :aria-label="t(`common.actions.new`)"
+                icon="la:plus-circle">
+                <new-menu
+                  :hide-asset-btn="true"
+                  :show-new-folder="true"
+                  @new-folder="() => newFolder(state.currentFolderId)"
+                  @new-page="() => close()"
+                  :base-path="folderPath"
+                  :locale="state.locale" />
+              </w-btn>
+              <w-btn
+                flat
+                dense
+                no-caps
+                color="positive"
+                :label="t(`common.actions.upload`)"
+                :aria-label="t(`common.actions.upload`)"
+                icon="la:cloud-upload-alt"
+                @click="uploadFile" />
+              <!--
+              Insert lives in the details pane, which is a 350px column with no overlay form -- so below
+              1440px the editor's insert flow could be opened and never completed: the file list offers it
+              only through a right-click menu, which is not a gesture a touch screen has. Here it is the
+              same call on the same selection, in the one place that is always on screen.
+            -->
+              <w-btn
+                v-if="insertMode && !detailsPaneShown && state.currentFileId"
+                class="ml-2"
+                flat
+                dense
+                no-caps
+                color="primary"
+                :label="t(`common.actions.insert`)"
+                :aria-label="t(`common.actions.insert`)"
+                icon="la:plus-circle"
+                @click="insertItem()" />
+            </template>
+          </template>
+        </w-toolbar>
+        <div class="flex flex-wrap" style="flex: 1 1 100%">
+          <div class="min-w-0 flex-1">
+            <w-scroll-area :thumb-style="thumbStyle" :bar-style="barStyle" style="height: 100%">
+              <!-- RECYCLE BIN ---------------------------------------------- -->
+              <template v-if="state.isRecycleBin">
+                <div class="fileman-loadinglist" v-if="state.binLoading">
+                  <w-spinner class="mr-2" color="primary" size="64px" />
+                  <span class="text-primary">{{ t('fileman.recycleBinLoading') }}</span>
+                </div>
+                <div class="fileman-emptylist" v-else-if="deletedPages.length < 1">
+                  <img src="/_assets/icons/carbon-copy-empty-box.svg" />
+                  <span>{{ t('fileman.recycleBinEmpty') }}</span>
+                </div>
+                <w-list class="fileman-filelist" v-else :class="state.isCompact && `is-compact`">
+                  <w-item
+                    v-for="item of deletedPages"
+                    :key="item.versionId"
+                    clickable
+                    active-class="active"
+                    :active="item.versionId === state.binSelectedId"
+                    @click="state.binSelectedId = item.versionId"
+                    @dblclick="viewDeletedPage(item)">
+                    <w-item-section class="fileman-filelist-icon" avatar>
+                      <!-- -> The page's own icon where it chose one, and its kind's otherwise. No
+                              colour of its own: it inherits the row's ink, which is what keeps it
+                              visible on a selected row's primary fill -->
+                      <w-icon
+                        :name="item.icon || deletedPageTypeIcon(item)"
+                        :size="state.isCompact ? `md` : `xl`" />
+                    </w-item-section>
+                    <w-item-section class="fileman-filelist-label">
+                      <w-item-label>{{ item.title }}</w-item-label>
+                      <w-item-label caption v-if="!state.isCompact">/{{ item.path }}</w-item-label>
+                    </w-item-section>
+                    <w-item-section class="fileman-filelist-side" side>
+                      <div class="text-caption">{{ formatDateTime(item.deletedAt) }}</div>
+                    </w-item-section>
+                    <!-- RIGHT-CLICK MENU -->
+                    <w-menu
+                      class="translucent-menu"
+                      touch-position
+                      context-menu
+                      auto-close
+                      transition-show="jump-down"
+                      transition-hide="jump-up">
+                      <w-card class="p-2">
+                        <w-list dense style="min-width: 150px">
+                          <w-item clickable @click="viewDeletedPage(item)">
+                            <w-item-section side>
+                              <w-icon name="la:eye" color="primary" />
+                            </w-item-section>
+                            <w-item-section>{{ t(`common.actions.view`) }}</w-item-section>
+                          </w-item>
+                          <w-item clickable @click="restoreDeletedItem(item)">
+                            <w-item-section side>
+                              <w-icon name="la:undo" color="deep-orange-9" />
+                            </w-item-section>
+                            <w-item-section>{{ t(`history.restore`) }}...</w-item-section>
+                          </w-item>
+                          <w-item clickable @click="downloadDeletedPage(item)">
+                            <w-item-section side>
+                              <w-icon name="la:download" color="primary" />
+                            </w-item-section>
+                            <w-item-section>{{ t(`common.actions.download`) }}</w-item-section>
+                          </w-item>
+                        </w-list>
+                      </w-card>
+                    </w-menu>
+                  </w-item>
+                </w-list>
+              </template>
+              <!-- FOLDER LISTING ------------------------------------------- -->
+              <template v-else>
+                <div class="fileman-loadinglist" v-if="state.fileListLoading">
+                  <w-spinner class="mr-2" color="primary" size="64px" />
+                  <span class="text-primary">Fetching folder contents...</span>
+                </div>
+                <div class="fileman-emptylist" v-else-if="files.length < 1">
+                  <img src="/_assets/icons/carbon-copy-empty-box.svg" />
+                  <span>This folder is empty.</span>
+                </div>
+                <!--
+                  Every row can be dragged onto a folder -- a folder row here, or any folder in the tree,
+                  root included -- to move it there. Only folder rows take a drop.
+                -->
+                <w-list class="fileman-filelist" v-else :class="state.isCompact && `is-compact`">
+                  <w-item
+                    v-for="item of files"
+                    :key="item.id"
+                    clickable
+                    active-class="active"
+                    :active="item.id === state.currentFileId"
+                    :class="{
+                      'is-drop-target': item.id === state.dropFolderId,
+                      'is-dragging': item.id === state.dragItem?.id
+                    }"
+                    draggable="true"
+                    @click="selectItem(item)"
+                    @dblclick="doubleClickItem(item)"
+                    @dragstart="onItemDragStart($event, item)"
+                    @dragend="onItemDragEnd"
+                    @dragenter="onListDragOver($event, item)"
+                    @dragover="onListDragOver($event, item)"
+                    @dragleave="onListDragLeave($event, item)"
+                    @drop="onListDrop($event, item)">
+                    <w-item-section class="fileman-filelist-icon" avatar>
+                      <w-icon
+                        :name="item.icon"
+                        :size="state.isCompact ? `md` : `xl`"
+                        :style="item.iconStyle" />
+                    </w-item-section>
+                    <w-item-section class="fileman-filelist-label">
+                      <w-item-label>{{ usePathTitle ? item.fileName : item.title }}</w-item-label>
+                      <w-item-label caption v-if="!state.isCompact">{{
+                        item.caption
+                      }}</w-item-label>
+                    </w-item-section>
+                    <w-item-section class="fileman-filelist-side" side v-if="item.side">
+                      <div class="text-caption">{{ item.side }}</div>
+                    </w-item-section>
+                    <!-- RIGHT-CLICK MENU -->
+                    <w-menu
+                      class="translucent-menu"
+                      touch-position
+                      context-menu
+                      auto-close
+                      transition-show="jump-down"
+                      transition-hide="jump-up">
+                      <w-card class="p-2">
+                        <w-list dense style="min-width: 150px">
+                          <w-item
+                            clickable
+                            v-if="insertMode && item.type !== `folder`"
+                            @click="insertItem(item)">
+                            <w-item-section side>
+                              <w-icon name="la:plus-circle" color="primary" />
+                            </w-item-section>
+                            <w-item-section>{{ t(`common.actions.insert`) }}</w-item-section>
+                          </w-item>
+                          <w-item clickable v-if="item.type === `page`" @click="editItem(item)">
+                            <w-item-section side>
+                              <w-icon name="la:edit" color="orange" />
+                            </w-item-section>
+                            <w-item-section>{{ t(`common.actions.edit`) }}</w-item-section>
+                          </w-item>
+                          <!-- -> Nothing to render on a page whose content is not an article: a
+                                redirection has a target, and a blog or a board has the pages under
+                                it, and the endpoint behind this refuses any editor but markdown -->
+                          <w-item
+                            clickable
+                            v-if="
+                              item.type === `page` &&
+                              ![`redirect`, `blog`, `feedback`].includes(item.pageType)
+                            "
+                            @click="rerenderPage(item)">
+                            <w-item-section side>
+                              <w-icon name="la:magic" color="orange" />
+                            </w-item-section>
+                            <w-item-section>{{ t(`common.actions.rerender`) }}</w-item-section>
+                          </w-item>
+                          <w-item clickable v-if="item.type !== `folder`" @click="openItem(item)">
+                            <w-item-section side>
+                              <w-icon name="la:eye" color="primary" />
+                            </w-item-section>
+                            <w-item-section>{{ t(`common.actions.view`) }}</w-item-section>
+                          </w-item>
+                          <!-- -> Behind the experimental flag: it has no handler behind it yet, so on
+                                an ordinary instance it is a row that does nothing -->
+                          <w-item
+                            clickable
+                            v-if="
+                              flagsStore.experimental && item.type === `asset` && item.imageEdit
+                            ">
+                            <w-item-section side>
+                              <w-icon name="la:edit" color="orange" />
+                            </w-item-section>
+                            <w-item-section>Edit Image...</w-item-section>
+                          </w-item>
+                          <!-- -> `imageEdit` is on the raster formats only, so never an SVG. And
+                                `can` answers whether write:assets is held ANYWHERE: the rule over
+                                this file's folder is the server's to check, per path. -->
+                          <w-item
+                            clickable
+                            v-if="
+                              item.type === `asset` &&
+                              item.imageEdit &&
+                              userStore.can(`write:assets`)
+                            "
+                            @click="resizeImage(item)">
+                            <w-item-section side>
+                              <w-icon name="la:crop" color="orange" />
+                            </w-item-section>
+                            <w-item-section>{{ t(`fileman.resizeImage`) }}...</w-item-section>
+                          </w-item>
+                          <w-item
+                            clickable
+                            v-if="item.type !== `folder`"
+                            @click="copyItemURL(item)">
+                            <w-item-section side>
+                              <w-icon name="la:clipboard" color="primary" />
+                            </w-item-section>
+                            <w-item-section>{{ t(`common.actions.copyURL`) }}</w-item-section>
+                          </w-item>
+                          <w-item
+                            clickable
+                            v-if="item.type === `asset`"
+                            @click="downloadItem(item)">
+                            <w-item-section side>
+                              <w-icon name="la:download" color="primary" />
+                            </w-item-section>
+                            <w-item-section>{{ t(`common.actions.download`) }}</w-item-section>
+                          </w-item>
+                          <w-item
+                            clickable
+                            v-if="item.type === `folder`"
+                            @click="setFolderColor(item.id)">
+                            <w-item-section side>
+                              <w-icon name="la:fill" color="orange" />
+                            </w-item-section>
+                            <w-item-section>{{ t(`common.actions.setColor`) }}...</w-item-section>
+                          </w-item>
+                          <!--
+                          Not for a file: duplicating is copying content to a second path, and an
+                          upload has none to copy -- a second name over the same bytes is all it could
+                          mean, which is not what anyone is asking a wiki for.
+                        -->
+                          <w-item
+                            clickable
+                            v-if="item.type !== `asset`"
+                            @click="duplicateItem(item)">
+                            <w-item-section side>
+                              <w-icon name="la:copy" color="teal" />
+                            </w-item-section>
+                            <w-item-section>Duplicate...</w-item-section>
+                          </w-item>
+                          <!--
+                          One entry for a page: its name and its place are picked in the same dialog
+                          the page view's own action rail opens, so offering them as two actions
+                          would be offering two ways into one form.
+                        -->
+                          <w-item
+                            clickable
+                            v-if="item.type === `page`"
+                            @click="renameMovePage(item)">
+                            <w-item-section side>
+                              <w-icon name="la:share" color="teal" />
+                            </w-item-section>
+                            <w-item-section>Rename / Move Page...</w-item-section>
+                          </w-item>
+                          <!--
+                          One entry for a file too, and for a plainer reason than a page's: its name
+                          and its folder are the two halves of where a storage target keeps it, so
+                          changing either is the same move to everything downstream of the rename.
+                        -->
+                          <w-item
+                            clickable
+                            v-else-if="item.type === `asset`"
+                            @click="renameMoveAsset(item)">
+                            <w-item-section side>
+                              <w-icon name="la:share" color="teal" />
+                            </w-item-section>
+                            <w-item-section>Rename / Move To...</w-item-section>
+                          </w-item>
+                          <!-- -> Folders, which are the only thing left with two entries: their name
+                                and their place are asked for in two different dialogs -->
+                          <template v-else>
+                            <w-item clickable @click="renameFolder(item.id)">
+                              <w-item-section side>
+                                <w-icon name="la:redo" color="teal" />
+                              </w-item-section>
+                              <w-item-section>Rename...</w-item-section>
+                            </w-item>
+                            <w-item clickable @click="moveFolder(item.id)">
+                              <w-item-section side>
+                                <w-icon name="la:arrow-right" color="teal" />
+                              </w-item-section>
+                              <w-item-section>Move To...</w-item-section>
+                            </w-item>
+                          </template>
+                          <w-item clickable @click="delItem(item)">
+                            <w-item-section side>
+                              <w-icon name="la:trash-alt" color="negative" />
+                            </w-item-section>
+                            <w-item-section class="text-negative">{{
+                              t(`common.actions.delete`)
+                            }}</w-item-section>
+                          </w-item>
+                        </w-list>
+                      </w-card>
+                    </w-menu>
+                  </w-item>
+                </w-list>
+              </template>
+            </w-scroll-area>
+          </div>
+        </div>
+      </w-page>
+    </w-page-container>
+    <w-footer :inert="state.isGraph">
+      <w-bar class="fileman-path">
+        <!--
+          -> `flex-1` on the path is what puts the counts at the far end: `ms-auto` cannot, because
+             `WBar` gives every child after the first a start margin from outside Tailwind's layers,
+             which beats any utility
+        -->
+        <small class="text-caption text-grey-7 min-w-0 flex-1 truncate">{{
+          state.isRecycleBin ? t('fileman.recycleBin') : folderPath
+        }}</small>
+        <!--
+          -> What the folder holds, not what the list is showing: the search box and the "show folders"
+             option are ways of looking at the folder, and the bar beside them describes the folder
+        -->
+        <small v-if="listCounts" class="text-caption text-grey-7 shrink-0 ps-4">{{
+          listCounts
+        }}</small>
+      </w-bar>
+    </w-footer>
+    <!--
+      Over everything below the header, rather than in place of the list: the tree, the listing and the
+      details stay mounted underneath, so going back to them is instant and finds them as they were.
+      What it covers is `inert` meanwhile, so the keyboard cannot wander into it.
+    -->
+    <page-graph
+      v-if="state.isGraph"
+      class="fileman-graph"
+      :locale="state.locale"
+      :search="state.search"
+      @close="closeGraph"
+      @open="openGraphPage" />
+    <input type="file" ref="fileIpt" multiple @change="uploadNewFiles" style="display: none" />
+  </w-layout>
+</template>
+
+<script setup>
+import { useI18n } from 'vue-i18n'
+import {
+  computed,
+  defineAsyncComponent,
+  nextTick,
+  onBeforeUnmount,
+  onMounted,
+  reactive,
+  ref,
+  toRaw,
+  watch
+} from 'vue'
+import { useRouter } from 'vue-router'
+
+import { dialog } from '@/composables/dialog'
+import { loading } from '@/composables/loading'
+import { notify } from '@/composables/notify'
+import { useMinWidth, useScreen } from '@/composables/screen'
+import { useDark } from '@/composables/dark'
+import { useDeletedPages } from '@/composables/deletedPages'
+
+import { useFlagsStore } from '@/stores/flags'
+import { usePageStore } from '@/stores/page'
+import { useSiteStore } from '@/stores/site'
+import { useUserStore } from '@/stores/user'
+
+import { filesize } from 'filesize'
+import Fuse from 'fuse.js/basic'
+import NewMenu from './PageNewMenu.vue'
+import Tree from './TreeNav.vue'
+import { apiErrorMessage } from '@/helpers/apiError'
+import { assetUrl } from '@/helpers/assets'
+import fileTypes from '@/helpers/fileTypes'
+import { folderIconStyle } from '@/helpers/folderColors'
+import { notifyRelinked } from '@/helpers/pageRelink'
+import { saveVersionSource } from '@/helpers/pageVersions'
+import FolderCreateDialog from '@/components/FolderCreateDialog.vue'
+import FolderDeleteDialog from '@/components/FolderDeleteDialog.vue'
+import FolderRenameDialog from '@/components/FolderRenameDialog.vue'
+import LocaleSelectorMenu from '@/components/LocaleSelectorMenu.vue'
+
+// -> d3 and everything else the graph draws with is fetched the first time it is opened, not with the
+//    file manager
+const PageGraph = defineAsyncComponent(() => import('@/components/PageGraph.vue'))
+
+// COMPOSABLES
+
+const dark = useDark()
+const screen = useScreen()
+const { restoreDeletedPage } = useDeletedPages()
+
+// STORES
+
+const flagsStore = useFlagsStore()
+const pageStore = usePageStore()
+const siteStore = useSiteStore()
+const userStore = useUserStore()
+
+// ROUTER
+
+const router = useRouter()
+
+// I18N
+
+const { t } = useI18n()
+
+// DATA
+
+/**
+ * Where the view options are remembered. The browser rather than the account, deliberately: how
+ * densely a list should be drawn is a property of the screen it is being read on, and the same person
+ * on a laptop and on a large monitor will not want the same answer.
+ */
+const VIEW_OPTIONS_KEY = 'wiki.fileman.viewOptions'
+
+/**
+ * What the folder tree is told is selected while the Recycle Bin is open: an id no folder can have, so
+ * that no row in it -- the root included, which is what a null would highlight -- claims to be the
+ * place being listed.
+ */
+const RECYCLE_BIN_SELECTION = 'recycle-bin'
+
+/**
+ * The remembered view options, each taken only if it is still a value this component understands.
+ *
+ * Field by field rather than wholesale: the entry outlives the code that wrote it, and an option that
+ * has since changed shape -- or been hand-edited in devtools -- must not be able to put the file list
+ * into a state it has no way back out of.
+ */
+function storedViewOptions() {
+  let stored = null
+  try {
+    stored = JSON.parse(globalThis.localStorage?.getItem(VIEW_OPTIONS_KEY) ?? 'null')
+  } catch {
+    // -> Unreadable is the same as absent: the defaults below stand
+  }
+  if (!stored || typeof stored !== 'object') {
+    return {}
+  }
+  return {
+    ...(['title', 'path'].includes(stored.displayMode) ? { displayMode: stored.displayMode } : {}),
+    ...(typeof stored.isCompact === 'boolean' ? { isCompact: stored.isCompact } : {}),
+    ...(typeof stored.shouldShowFolders === 'boolean'
+      ? { shouldShowFolders: stored.shouldShowFolders }
+      : {}),
+    ...(typeof stored.shouldListFoldersFirst === 'boolean'
+      ? { shouldListFoldersFirst: stored.shouldListFoldersFirst }
+      : {})
+  }
+}
+
+const state = reactive({
+  loading: 0,
+  isFetching: false,
+  /*
+    Which locale's content is listed. Its own state rather than the interface language: the manager is
+    a view of the tree, and the tree holds every translation side by side -- unfiltered, it listed all
+    of them at once. Starts on the locale of the page it was opened from.
+  */
+  locale: pageStore.locale,
+  search: '',
+  /** Drives the search pill's inversion, as HeaderSearch does it. */
+  searchIsFocused: false,
+  currentFolderId: null,
+  currentFileId: null,
+  /**
+   * Whether the folder tree has been opened. Only consulted while it overlays the list — beside it, it
+   * is simply there. Deliberately NOT one of the remembered view options: those describe how a list is
+   * drawn, and this is a panel that is open at the moment.
+   */
+  treeOpen: false,
+  treeNodes: {},
+  treeRoots: [],
+  displayMode: 'title',
+  isCompact: false,
+  shouldShowFolders: true,
+  /** Only consulted while `shouldShowFolders` is on: with no folders, there is nothing to put first. */
+  shouldListFoldersFirst: false,
+  isUploading: false,
+  shouldCancelUpload: false,
+  uploadPercentage: 0,
+  fileList: [],
+  fileListLoading: false,
+  /**
+   * Whether the Recycle Bin is what the centre pane lists, in place of the folder. The folder stays
+   * selected underneath, listing and all, so leaving the bin for it again costs no fetch.
+   */
+  isRecycleBin: false,
+  binLoading: false,
+  /** The deleted pages this reader may recover, as `GET …/pages/deleted` answered, newest first. */
+  binItems: [],
+  /** Keyed by the deletion's version id, which is what every action on a bin entry works from. */
+  binSelectedId: null,
+  /**
+   * Whether the graph view covers the manager. Independent of `isRecycleBin`: it goes over whichever
+   * of the two was showing, and closing it comes back to that.
+   */
+  isGraph: false,
+  /** The listing entry being dragged, from its `dragstart` to its `dragend`. */
+  dragItem: null,
+  /** The folder row in the listing a drag would drop into, which is what lights it up. */
+  dropFolderId: null
+})
+
+// -> Over the defaults just above, which is what the view falls back to on a first visit
+Object.assign(state, storedViewOptions())
+
+/*
+  Written on every change rather than when the overlay closes: the file manager is also opened from
+  the editor's insert flow, which can be dismissed in ways that never reach a teardown here.
+*/
+watch(
+  () => [state.displayMode, state.isCompact, state.shouldShowFolders, state.shouldListFoldersFirst],
+  ([displayMode, isCompact, shouldShowFolders, shouldListFoldersFirst]) => {
+    try {
+      globalThis.localStorage?.setItem(
+        VIEW_OPTIONS_KEY,
+        JSON.stringify({ displayMode, isCompact, shouldShowFolders, shouldListFoldersFirst })
+      )
+    } catch {
+      // -> Full, or storage denied. Not worth a word to the reader: the options still work, they
+      //    just will not be there next time.
+    }
+  }
+)
+
+const thumbStyle = {
+  right: '2px',
+  borderRadius: '5px',
+  backgroundColor: '#000',
+  width: '5px',
+  opacity: 0.15
+}
+const barStyle = {
+  backgroundColor: '#FAFAFA',
+  width: '9px',
+  opacity: 1
+}
+
+// REFS
+
+const fileIpt = ref(null)
+const searchField = ref(null)
+const treeComp = ref(null)
+
+// COMPUTED
+
+const insertMode = computed(() => siteStore.overlayOpts?.insertMode ?? false)
+
+/**
+ * Whether the folder tree is a panel over the list rather than a column beside it.
+ *
+ * 1024 is `WDrawer`'s own default `overlayBelow`, which is what actually decides how the drawer draws
+ * itself — this is the same question asked from the outside, so that the toolbar knows whether to offer a
+ * way in. The two have to agree.
+ */
+const isAtLeastMd = useMinWidth(1024)
+const isTreeOverlay = computed(() => !isAtLeastMd.value)
+
+/**
+ * Whether the details pane is beside the list. It is a 350px column with no overlay form, so below 1440px
+ * there is simply no room for it -- which is also why the Insert button it holds needs a second home; see
+ * the toolbar.
+ */
+const detailsPaneShown = computed(() => screen.gt.md)
+
+/**
+ * The tree drawer's open state: always open where it has a column of its own, and the reader's to decide
+ * where it overlays. The setter is what the drawer's scrim reaches when it is tapped.
+ */
+const treeDrawerOpen = computed({
+  get: () => !isTreeOverlay.value || state.treeOpen,
+  set: (val) => {
+    state.treeOpen = val
+  }
+})
+
+const folderPath = computed(() => {
+  // -> The path comes out of the tree cache, so a selected folder that is not in it -- one whose
+  //    branch was just reloaded, or which has moved out of the locale being listed -- has no path to
+  //    show rather than `/undefined/`, which is what it used to render
+  const folderNode = state.currentFolderId ? state.treeNodes[state.currentFolderId] : null
+  if (!folderNode?.fileName) {
+    return '/'
+  }
+  return folderNode.folderPath
+    ? `/${folderNode.folderPath}/${folderNode.fileName}/`
+    : `/${folderNode.fileName}/`
+})
+
+const usePathTitle = computed(() => state.displayMode === 'path')
+
+/** The search field finds nodes in the graph while it is open, and filters the folder otherwise. */
+const searchPlaceholder = computed(() =>
+  state.isGraph ? t('fileman.graph.search') : t('fileman.searchFolder')
+)
+
+const filteredFiles = computed(() => {
+  if (state.search) {
+    const fuse = new Fuse(state.fileList, {
+      keys: ['title', 'fileName']
+    })
+    return fuse.search(state.search).map((n) => n.item)
+  } else {
+    return state.fileList
+  }
+})
+
+/**
+ * The order the listing is drawn in: folders ahead of everything else when List Folders First is on,
+ * and otherwise exactly as it came. The sort is stable, so the listing's own order -- or a search's
+ * ranking -- still holds within each of the two groups.
+ */
+function listingOrder(a, b) {
+  if (!state.shouldShowFolders || !state.shouldListFoldersFirst) {
+    return 0
+  }
+  return Number(b.type === 'folder') - Number(a.type === 'folder')
+}
+
+/**
+ * The counts in the bar under the list, or null while there is nothing settled to count -- or
+ * nothing to count at all. A kind the folder holds none of is left out rather than reported as zero,
+ * and the Recycle Bin, holding deleted pages and nothing else, never has folders to report.
+ */
+const listCounts = computed(() => {
+  if (state.isRecycleBin ? state.binLoading : state.fileListLoading) {
+    return null
+  }
+  const items = state.isRecycleBin ? state.binItems : state.fileList
+  const folders = state.isRecycleBin ? 0 : items.filter((f) => f.type === 'folder').length
+  const files = items.length - folders
+  const parts = [
+    ...(folders > 0 ? [t('fileman.folderCount', { count: folders }, folders)] : []),
+    ...(files > 0 ? [t('fileman.fileCount', { count: files }, files)] : [])
+  ]
+  return parts.length > 0 ? parts.join(' · ') : null
+})
+
+const files = computed(() => {
+  return filteredFiles.value
+    .filter((f) => {
+      // -> Show Folders Filter
+      if (f.type === 'folder' && !state.shouldShowFolders) {
+        return false
+      }
+      return true
+    })
+    .toSorted(listingOrder)
+    .map((f) => {
+      switch (f.type) {
+        case 'folder': {
+          f.icon = fileTypes.folder.icon
+          f.iconStyle = folderIconStyle(f.hue)
+          f.caption = t('fileman.folderChildrenCount', { count: f.children }, f.children)
+          break
+        }
+        case 'page': {
+          /*
+            A page whose content is not an article reads as its own kind of row: a redirection has a
+            target, a blog has the posts under it. Looked up by editor, which shares a namespace with
+            the file extensions here on purpose -- `folder`, `page` and `redirect` are already in it --
+            so an editor with no icon of its own falls back to the ordinary page.
+          */
+          f.icon = fileTypes[f.pageType]?.icon ?? fileTypes.page.icon
+          f.caption = t(`fileman.${f.pageType}PageType`)
+          break
+        }
+        case 'asset': {
+          f.icon = fileTypes[f.fileExt]?.icon ?? ''
+          f.side = filesize(f.fileSize, { round: 0 })
+          f.imageEdit = fileTypes[f.fileExt]?.imageEdit
+          if (fileTypes[f.fileExt]) {
+            f.caption = t(`fileman.${f.fileExt}FileType`)
+          } else {
+            f.caption = t('fileman.unknownFileType', { type: f.fileExt.toUpperCase() })
+          }
+          break
+        }
+      }
+      return f
+    })
+})
+
+/** The Recycle Bin, narrowed by the same search field the folder listing uses. */
+const deletedPages = computed(() => {
+  if (!state.search) {
+    return state.binItems
+  }
+  const fuse = new Fuse(state.binItems, { keys: ['title', 'path'] })
+  return fuse.search(state.search).map((n) => n.item)
+})
+
+const selectedDeletedPage = computed(
+  () => state.binItems.find((item) => item.versionId === state.binSelectedId) ?? null
+)
+
+/** The details pane for a bin entry, in the same rows a live page gets. */
+const deletedPageDetails = computed(() => {
+  const item = selectedDeletedPage.value
+  if (!item) {
+    return []
+  }
+  return [
+    { label: t('fileman.detailsTitle'), value: item.title },
+    { label: t('fileman.detailsPath'), value: `/${item.path}` },
+    { label: t('fileman.detailsPageType'), value: t(`fileman.${item.editor}PageType`) },
+    { label: t('fileman.detailsDeletedAt'), value: formatDateTime(item.deletedAt) },
+    // -> Left out once the account is gone, rather than shown as an empty row
+    ...(item.deletedBy?.name
+      ? [{ label: t('fileman.detailsDeletedBy'), value: item.deletedBy.name }]
+      : [])
+  ]
+})
+
+/**
+ * Whether this listing entry is an image, which is what decides both the thumbnail beside it and
+ * whether View opens it in place rather than handing it to the browser.
+ */
+function isImageAsset(item) {
+  return item.type === 'asset' && Boolean(item.mimeType?.startsWith('image/'))
+}
+
+const currentFileDetails = computed(() => {
+  if (!state.currentFileId) {
+    return null
+  }
+  const item = state.fileList.find((f) => f.id === state.currentFileId)
+  if (!item || item.type === 'folder') {
+    return null
+  }
+
+  const items = [
+    {
+      label: t('fileman.detailsTitle'),
+      value: item.title
+    }
+  ]
+  let thumbnail = null
+  switch (item.type) {
+    case 'page': {
+      thumbnail = '/_assets/illustrations/fileman-page.svg'
+      // -> Both optional on a page, and left out rather than shown as an empty row when not set
+      if (item.description) {
+        items.push({
+          label: t('fileman.detailsPageDescription'),
+          value: item.description
+        })
+      }
+      if (item.tags.length > 0) {
+        items.push({
+          label: t('fileman.detailsPageTags'),
+          tags: item.tags
+        })
+      }
+      items.push({
+        label: t('fileman.detailsPageType'),
+        value: t(`fileman.${item.pageType}PageType`)
+      })
+      items.push({
+        label: t('fileman.detailsPageEditor'),
+        value: item.pageType
+      })
+      items.push({
+        label: t('fileman.detailsPageUpdated'),
+        value: formatDateTime(item.updatedAt)
+      })
+      items.push({
+        label: t('fileman.detailsPageCreated'),
+        value: formatDateTime(item.createdAt)
+      })
+      break
+    }
+    case 'asset': {
+      // -> Only images get one, and the endpoint answers 404 for anything else
+      thumbnail = isImageAsset(item) ? `/_thumb/${item.id}.webp` : null
+      items.push({
+        label: t('fileman.detailsAssetType'),
+        value: fileTypes[item.fileExt]
+          ? t(`fileman.${item.fileExt}FileType`)
+          : t('fileman.unknownFileType', { type: item.fileExt.toUpperCase() })
+      })
+      items.push({
+        label: t('fileman.detailsAssetSize'),
+        value: filesize(item.fileSize)
+      })
+      // -> Only an image has these, and only one measured on arrival: an upload from before the Sharp
+      //    extension was installed carries none, so the row is left out rather than shown empty
+      if (item.width && item.height) {
+        items.push({
+          label: t('fileman.detailsAssetDimensions'),
+          value: `${item.width} × ${item.height}`
+        })
+      }
+      break
+    }
+  }
+  return {
+    thumbnail,
+    // -> Whether the thumbnail leads anywhere: only an image has a full view to open behind it
+    viewable: item.type === 'asset' && isImageAsset(item),
+    items
+  }
+})
+
+// WATCHERS
+
+watch(
+  () => state.currentFolderId,
+  async (newValue) => {
+    /*
+      Picking a folder is what the tree is open FOR, so it closes behind the choice -- the contents of that
+      folder are in the list underneath, which the panel is covering. Only while it overlays; beside the
+      list it is a column and there is nothing to close.
+    */
+    state.treeOpen = false
+    await loadTree({ parentId: newValue })
+  }
+)
+
+// METHODS
+
+/**
+ * Put the folder tree away when the list behind it is tapped.
+ *
+ * A no-op unless the tree is actually overlaying and open, so an ordinary click on a file — which is what
+ * this handler mostly receives — costs nothing and behaves as it always did.
+ */
+function dismissTreeOverlay(ev) {
+  if (!isTreeOverlay.value || !state.treeOpen) {
+    return
+  }
+  // -> The toolbar's own button is what opened it; closing here would undo that on the way back up
+  if (ev?.target?.closest?.('.fileman-toolbar')) {
+    return
+  }
+  state.treeOpen = false
+}
+
+function close() {
+  siteStore.overlay = null
+}
+
+/**
+ * List a folder picked in the tree -- which is also how the Recycle Bin is left.
+ *
+ * Picking the folder that was already selected under the bin changes nothing the watcher would see,
+ * and needs nothing fetched either: its listing was left as it was when the bin opened.
+ */
+function openFolder(folderId) {
+  state.isRecycleBin = false
+  state.currentFolderId = folderId
+}
+
+function openRecycleBin() {
+  // -> The same as picking a folder, while the tree is a panel: what was asked for is underneath it
+  state.treeOpen = false
+  if (state.isRecycleBin) {
+    return
+  }
+  state.isRecycleBin = true
+  state.binSelectedId = null
+  loadRecycleBin()
+}
+
+/*
+  The search is cleared going either way: what was typed to filter a folder means nothing to the
+  graph, and a graph search left behind would silently filter the folder it returns to.
+*/
+function openGraph() {
+  state.treeOpen = false
+  state.search = ''
+  state.isGraph = true
+}
+
+function closeGraph() {
+  state.search = ''
+  state.isGraph = false
+}
+
+/** A page picked in the graph: the same departure as opening one from the list. */
+function openGraphPage({ locale, path }) {
+  router.push(`${siteStore.localeUrlPrefix(locale)}/${path}`)
+  close()
+}
+
+async function loadRecycleBin() {
+  state.binLoading = true
+  try {
+    state.binItems = await API_CLIENT.get(`sites/${siteStore.id}/pages/deleted`, {
+      searchParams: { locale: state.locale }
+    }).json()
+    if (!state.binItems.some((item) => item.versionId === state.binSelectedId)) {
+      state.binSelectedId = null
+    }
+  } catch (err) {
+    state.binItems = []
+    notify({
+      type: 'negative',
+      message: t('fileman.recycleBinLoadFailed'),
+      caption: apiErrorMessage(err, 'An unexpected error occured.')
+    })
+  } finally {
+    state.binLoading = false
+  }
+}
+
+/** The toolbar's Refresh, which reloads whichever of the two the centre pane is showing. */
+function refreshListing() {
+  if (state.isRecycleBin) {
+    loadRecycleBin()
+  } else {
+    reloadFolder(state.currentFolderId)
+  }
+}
+
+function formatDateTime(value) {
+  if (!value) {
+    return ''
+  }
+  return userStore.formatDateTime(t, value)
+}
+
+function insertItem(item) {
+  if (!item) {
+    item = state.fileList.find((f) => f.id === state.currentFileId)
+  }
+  EVENT_BUS.emit('insertAsset', toRaw(item))
+  close()
+}
+
+async function treeLazyLoad(nodeId, isCurrent, { done, fail }) {
+  await loadTree({ parentId: nodeId, types: isCurrent ? null : ['folder'] })
+  done()
+}
+
+async function loadTree({ parentId = null, parentPath = null, types, initLoad = false }) {
+  if (state.isFetching) {
+    return
+  }
+  state.isFetching = true
+  if (!parentId) {
+    parentId = null
+  }
+  if (parentId === state.currentFolderId) {
+    state.fileListLoading = true
+    state.currentFileId = null
+    state.fileList = []
+  }
+  try {
+    const items = await API_CLIENT.get(`sites/${siteStore.id}/tree`, {
+      searchParams: {
+        locale: state.locale,
+        ...(parentId ? { parentId } : {}),
+        ...(parentPath ? { parentPath } : {}),
+        ...(types?.length > 0 ? { types: types.join(',') } : {}),
+        includeAncestors: initLoad,
+        includeRootFolders: initLoad
+      }
+    }).json()
+    if (items?.length > 0) {
+      const newTreeRoots = []
+      for (const item of items) {
+        switch (item.type) {
+          case 'folder': {
+            // -> Tree Nodes
+            state.treeNodes[item.id] = {
+              folderPath: item.folderPath,
+              fileName: item.fileName,
+              title: item.title,
+              hue: item.hue,
+              children: state.treeNodes[item.id]?.children ?? []
+            }
+
+            // -> Set Ancestors / Tree Roots
+            if (item.folderPath) {
+              let folderParentId = parentId
+              if (!folderParentId) {
+                const parentFolderParts = item.folderPath.split('/')
+                const parentFolder = items.find(
+                  (i) =>
+                    i.folderPath === parentFolderParts.slice(0, -1).join('/') &&
+                    i.fileName === parentFolderParts.at(-1)
+                )
+                folderParentId = parentFolder?.id
+              }
+              if (
+                item.id !== folderParentId &&
+                !state.treeNodes[folderParentId]?.children?.includes(item.id)
+              ) {
+                state.treeNodes[folderParentId]?.children?.push(item.id)
+              }
+            } else {
+              newTreeRoots.push(item.id)
+            }
+
+            // -> File List
+            if (parentId === state.currentFolderId && !item.isAncestor) {
+              state.fileList.push({
+                id: item.id,
+                type: 'folder',
+                title: item.title,
+                fileName: item.fileName,
+                hue: item.hue,
+                children: item.childrenCount || 0
+              })
+            }
+            break
+          }
+          case 'asset': {
+            if (parentId === state.currentFolderId) {
+              state.fileList.push({
+                id: item.id,
+                type: 'asset',
+                title: item.title,
+                fileExt: item.fileExt,
+                fileSize: item.fileSize,
+                mimeType: item.mimeType,
+                width: item.width,
+                height: item.height,
+                folderPath: item.folderPath,
+                fileName: item.fileName,
+                createdAt: item.createdAt,
+                updatedAt: item.updatedAt
+              })
+            }
+            break
+          }
+          case 'page': {
+            if (parentId === state.currentFolderId) {
+              state.fileList.push({
+                id: item.id,
+                type: 'page',
+                title: item.title,
+                pageType: item.editor || 'markdown',
+                description: item.description,
+                tags: item.tags ?? [],
+                folderPath: item.folderPath,
+                fileName: item.fileName,
+                createdAt: item.createdAt,
+                updatedAt: item.updatedAt
+              })
+            }
+            break
+          }
+        }
+      }
+      if (newTreeRoots.length > 0) {
+        state.treeRoots = newTreeRoots
+      }
+    }
+  } catch (err) {
+    notify({
+      type: 'negative',
+      message: 'Failed to load folder tree.',
+      caption: apiErrorMessage(err, 'An unexpected error occured.')
+    })
+  }
+  if (parentId === state.currentFolderId) {
+    nextTick(() => {
+      state.fileListLoading = false
+    })
+  }
+  if (parentId) {
+    treeComp.value.setLoaded(parentId)
+  }
+  state.isFetching = false
+}
+
+/**
+ * Browse another locale.
+ *
+ * Back to the root of it rather than the folder that was open: the tree holds each locale separately,
+ * so the folder being left may not exist in the one being entered — and a folder id from the other
+ * tree would load somebody else's contents under this locale's name.
+ */
+async function switchLocale(locale) {
+  if (locale === state.locale) {
+    return
+  }
+  state.locale = locale
+  state.treeNodes = {}
+  state.treeRoots = []
+  state.currentFolderId = null
+  state.currentFileId = null
+  state.fileList = []
+  // -> The tree marks which folders it has fetched children for, by id. None of them are in the tree
+  //    being entered, so the marks would only ever be wrong about it
+  treeComp.value?.resetLoaded()
+  // -> The bin is listed per locale too, so it follows the picker like the folder listing does
+  if (state.isRecycleBin) {
+    state.binSelectedId = null
+    loadRecycleBin()
+  }
+  await loadTree({ initLoad: true })
+}
+
+function treeContextAction(nodeId, action) {
+  switch (action) {
+    case 'newFolder': {
+      newFolder(nodeId)
+      break
+    }
+    case 'rename': {
+      renameFolder(nodeId)
+      break
+    }
+    case 'move': {
+      moveFolder(nodeId)
+      break
+    }
+    case 'color': {
+      setFolderColor(nodeId)
+      break
+    }
+    case 'duplicate': {
+      duplicateFolder(nodeId)
+      break
+    }
+    case 'del': {
+      delFolder(nodeId)
+      break
+    }
+  }
+}
+
+// --------------------------------------
+// FOLDER METHODS
+// --------------------------------------
+
+function newFolder(parentId) {
+  dialog({
+    component: FolderCreateDialog,
+    componentProps: {
+      parentId,
+      locale: state.locale
+    }
+  }).onOk(() => {
+    loadTree({ parentId })
+  })
+}
+
+function renameFolder(folderId) {
+  dialog({
+    component: FolderRenameDialog,
+    componentProps: {
+      folderId
+    }
+  }).onOk(async () => {
+    treeComp.value.resetLoaded()
+    // // -> Delete current folder and children from cache
+    // const fPath = [state.treeNodes[folderId].folderPath, state.treeNodes[folderId].fileName].filter(p => !!p).join('/')
+    // delete state.treeNodes[folderId]
+    // for (const [nodeId, node] of Object.entries(state.treeNodes)) {
+    //   if (node.folderPath.startsWith(fPath)) {
+    //     delete state.treeNodes[nodeId]
+    //   }
+    // }
+    // -> Reload tree
+    await loadTree({ parentId: folderId, types: ['folder'], initLoad: true }) // Update tree
+    // -> Reload current view (in case current folder is included)
+    await loadTree({ parentId: state.currentFolderId })
+  })
+}
+
+/**
+ * Move a folder, and everything under it, to another parent — or another locale.
+ *
+ * The view follows it: a move is not something to be left looking at the hole it left, and the folder
+ * is where the person who moved it now wants to be.
+ */
+function moveFolder(folderId) {
+  const node = state.treeNodes[folderId]
+  dialog({
+    component: defineAsyncComponent(() => import('@/components/TreeBrowserDialog.vue')),
+    componentProps: {
+      mode: 'moveFolder',
+      itemId: folderId,
+      itemTitle: node?.title ?? '',
+      folderPath: node?.folderPath ?? '',
+      itemFileName: node?.fileName ?? '',
+      locale: state.locale
+    }
+  }).onOk(async (opts) => {
+    /*
+      Blocking, as a copy is: the rows move in one statement, but the copy every storage target holds
+      moves one page and one file at a time -- which on a target that is a repository or a bucket is a
+      write apiece. Same reasoning, same overlay.
+    */
+    loading.show({
+      message: t('fileman.folderMoving'),
+      caption: t('fileman.folderMovingHint')
+    })
+    try {
+      const resp = await requestFolderMove(folderId, {
+        folderPath: opts.folderPath,
+        locale: opts.locale
+      })
+      notify({
+        type: 'positive',
+        message: resp.message
+      })
+      await goToFolder(resp.folder)
+    } catch (err) {
+      notify({
+        type: 'negative',
+        message: 'Failed to move folder.',
+        caption: apiErrorMessage(err, 'An unexpected error occured.')
+      })
+    } finally {
+      // -> In `finally` because `goToFolder` above can throw too, and an overlay left up is a wiki
+      //    nobody can click on
+      loading.hide()
+    }
+  })
+}
+
+/**
+ * The request behind every folder move, answering with the folder where it now is.
+ *
+ * @param folderPath The new parent's path, empty for the root.
+ * @param locale The locale to move it to; it stays in its own when absent.
+ */
+async function requestFolderMove(folderId, { folderPath, locale }) {
+  const resp = await API_CLIENT.put(`sites/${siteStore.id}/tree/folders/${folderId}/path`, {
+    json: { folderPath, locale },
+    // -> Nothing on this side gives up on it, since the server does not either
+    timeout: false
+  }).json()
+  // -> The API client does not throw on 400, so a refused destination comes back as a parsed error
+  if (resp?.ok === false) {
+    throw new Error(resp.message || 'An unexpected error occured.')
+  }
+  return resp
+}
+
+/**
+ * Colour a folder's icon.
+ *
+ * Only the two rows that hold it need repainting, so nothing is refetched: the tree node and the
+ * listing row are the same folder seen twice, and the icon in each reads its colour off them.
+ */
+function setFolderColor(folderId) {
+  const node = state.treeNodes[folderId]
+  dialog({
+    component: defineAsyncComponent(() => import('@/components/FolderColorDialog.vue')),
+    componentProps: {
+      folderId,
+      folderTitle: node?.title ?? '',
+      hue: node?.hue ?? 0
+    }
+  }).onOk((hue) => {
+    if (node) {
+      node.hue = hue
+    }
+    const row = state.fileList.find((f) => f.id === folderId)
+    if (row) {
+      row.hue = hue
+    }
+  })
+}
+
+/** The id of an already-loaded folder, addressed the way a path addresses it. */
+function findFolderIdByPath(path) {
+  if (!path) {
+    return null
+  }
+  const entry = Object.entries(state.treeNodes).find(
+    ([, node]) => (node.folderPath ? `${node.folderPath}/${node.fileName}` : node.fileName) === path
+  )
+  return entry?.[0] ?? null
+}
+
+/**
+ * Open a folder wherever it now is, rebuilding the tree around it.
+ *
+ * Everything cached is dropped rather than patched: a move rewrites the path of every entry under the
+ * folder, so the branch it left and the branch it joined are both wrong, and across locales the whole
+ * tree on screen belongs to a locale the folder is no longer in.
+ *
+ * @param folder The folder as the API answered with it — where it is now, and which locale it is in.
+ */
+async function goToFolder({ id, folderPath, fileName, locale }) {
+  const path = folderPath ? `${folderPath}/${fileName}` : fileName
+  // -> Where the reader is being taken is a folder, so the bin, if it was open, is left for it
+  state.isRecycleBin = false
+  // -> Set before anything is fetched: every request below asks for one locale's tree
+  state.locale = locale
+  state.treeNodes = {}
+  state.treeRoots = []
+  state.currentFileId = null
+  state.fileList = []
+  treeComp.value?.resetLoaded()
+
+  // -> With its ancestors, which is the whole branch the tree has to draw to show where it landed
+  const wasCurrent = state.currentFolderId === id
+  await loadTree({ parentPath: path, initLoad: true })
+  const parts = path.split('/')
+  for (let i = 1; i <= parts.length; i++) {
+    const ancestorId = findFolderIdByPath(parts.slice(0, i).join('/'))
+    if (ancestorId) {
+      treeComp.value?.setOpened(ancestorId)
+    }
+  }
+
+  /*
+    Selecting it is what lists its contents, through the watcher on this -- but only when the value
+    actually changes, and moving the folder somebody was already inside does not change it. Hence the
+    second call, which is that same load done by hand. Both come after the await above, so neither
+    can be dropped by `loadTree`'s guard against overlapping fetches.
+  */
+  state.currentFolderId = id
+  if (wasCurrent) {
+    await loadTree({ parentId: id })
+  }
+}
+
+function delFolder(folderId, mustReload = false) {
+  dialog({
+    component: FolderDeleteDialog,
+    componentProps: {
+      folderId,
+      folderName: state.treeNodes[folderId].title
+    }
+  }).onOk(() => {
+    for (const nodeId in state.treeNodes) {
+      if (state.treeNodes[nodeId].children.includes(folderId)) {
+        state.treeNodes[nodeId].children = state.treeNodes[nodeId].children.filter(
+          (c) => c !== folderId
+        )
+      }
+    }
+    delete state.treeNodes[folderId]
+    if (state.treeRoots.includes(folderId)) {
+      state.treeRoots = state.treeRoots.filter((n) => n !== folderId)
+    }
+    if (mustReload) {
+      loadTree({ parentId: state.currentFolderId })
+    }
+  })
+}
+
+function reloadFolder(folderId) {
+  loadTree({ parentId: folderId })
+  treeComp.value.resetLoaded()
+}
+
+// --------------------------------------
+// PAGE METHODS
+// --------------------------------------
+
+function rerenderPage(item) {
+  dialog({
+    component: defineAsyncComponent(() => import('@/components/RerenderPageDialog.vue')),
+    componentProps: {
+      id: item.id
+    }
+  })
+}
+
+/**
+ * Copy a page, through the same dialog the page view's action rail opens.
+ *
+ * The copy is not written here: what comes back is where it should go, and the store opens the editor
+ * on an unsaved page holding the source's content -- so the author lands in the same place they would
+ * have from the page itself, and nothing exists until they save it.
+ */
+function duplicatePage(item) {
+  dialog({
+    component: defineAsyncComponent(() => import('@/components/TreeBrowserDialog.vue')),
+    componentProps: {
+      mode: 'duplicatePage',
+      itemId: item.id,
+      itemTitle: item.title,
+      folderPath: item.folderPath,
+      itemFileName: item.fileName,
+      locale: state.locale
+    }
+  }).onOk(async (opts) => {
+    try {
+      await pageStore.pageDuplicate({
+        sourcePageId: item.id,
+        path: opts.path,
+        title: opts.title,
+        locale: opts.locale
+      })
+      // -> The editor is now underneath this overlay, as it is after opening a page to edit
+      close()
+    } catch (err) {
+      notify({
+        type: 'negative',
+        message: 'Failed to duplicate page.',
+        caption: apiErrorMessage(err, 'An unexpected error occured.')
+      })
+    }
+  })
+}
+
+/**
+ * Rename a page, move it, or both.
+ *
+ * One action rather than two, through the same dialog the page view's action rail opens: what it
+ * hands back is a title and the full path the page should sit at, and only the path decides which of
+ * the two endpoints that is -- a page whose title changed in place was never moved.
+ */
+function renameMovePage(item) {
+  const currentPath = item.folderPath ? `${item.folderPath}/${item.fileName}` : item.fileName
+  dialog({
+    component: defineAsyncComponent(() => import('@/components/TreeBrowserDialog.vue')),
+    componentProps: {
+      mode: 'renamePage',
+      itemId: item.id,
+      itemTitle: item.title,
+      folderPath: item.folderPath,
+      itemFileName: item.fileName,
+      locale: state.locale
+    }
+  }).onOk(async (opts) => {
+    try {
+      // -> Only the destination decides which of the two endpoints this is, and the destination is a
+      //    locale as well as a path: the same path in another locale is a move, not a rename
+      if (opts.path === currentPath && opts.locale === state.locale) {
+        await pageStore.pageRename({ id: item.id, title: opts.title })
+        notify({
+          type: 'positive',
+          message: 'Page renamed successfully.'
+        })
+      } else {
+        const relinked = await pageStore.pageMove({
+          id: item.id,
+          path: opts.path,
+          title: opts.title,
+          locale: opts.locale,
+          updateLinks: opts.updateLinks
+        })
+        notify({
+          type: 'positive',
+          message: 'Page moved successfully.'
+        })
+        notifyRelinked(relinked, t)
+      }
+      // -> Reload current view
+      await loadTree({ parentId: state.currentFolderId })
+    } catch (err) {
+      notify({
+        type: 'negative',
+        message: 'Failed to rename or move page.',
+        caption: apiErrorMessage(err, 'An unexpected error occured.')
+      })
+    }
+  })
+}
+
+function delPage(pageId, pageName) {
+  dialog({
+    component: defineAsyncComponent(() => import('@/components/PageDeleteDialog.vue')),
+    componentProps: {
+      pageId,
+      pageName
+    }
+  }).onOk(() => {
+    // -> Reload current view
+    loadTree({ parentId: state.currentFolderId })
+  })
+}
+
+// --------------------------------------
+// RECYCLE BIN METHODS
+// --------------------------------------
+
+/** The kind of page a bin entry was, for a page with no icon of its own. */
+function deletedPageTypeIcon(item) {
+  return fileTypes[item.editor]?.icon ?? fileTypes.page.icon
+}
+
+/**
+ * The deletion's version in full -- source included, and where the page was -- which the bin's list
+ * does not carry: a screenful of deleted pages has no business carrying a screenful of their content.
+ */
+function fetchDeletedVersion(item) {
+  return API_CLIENT.get(`sites/${siteStore.id}/versions/${item.versionId}`).json()
+}
+
+/**
+ * Read the page as it was when it went, in the version view -- the one screen that draws a page out
+ * of a version, and where it can also be restored or branched off from.
+ */
+function viewDeletedPage(item) {
+  router.push(`/_version/${item.versionId}`)
+  close()
+}
+
+async function downloadDeletedPage(item) {
+  try {
+    await saveVersionSource(await fetchDeletedVersion(item))
+  } catch (err) {
+    notify({
+      type: 'negative',
+      message: t('history.downloadFailed'),
+      caption: apiErrorMessage(err, 'An unexpected error occured.')
+    })
+  }
+}
+
+async function restoreDeletedItem(item) {
+  let version
+  try {
+    version = await fetchDeletedVersion(item)
+  } catch (err) {
+    notify({
+      type: 'negative',
+      message: t('fileman.restoreFailed'),
+      caption: apiErrorMessage(err, 'An unexpected error occured.')
+    })
+    return
+  }
+  const restored = await restoreDeletedPage(version)
+  if (!restored) {
+    return
+  }
+  await loadRecycleBin()
+  if (restored !== 'stale') {
+    /*
+      The page is back in the tree, possibly with folders that were not there a moment ago -- its own
+      folder was deleted with it, or the reader put it somewhere new. The folders loaded so far are
+      marked stale and the branch under the bin is fetched again, ancestors and roots included.
+    */
+    treeComp.value?.resetLoaded()
+    await loadTree({ parentId: state.currentFolderId, initLoad: true })
+  }
+}
+
+// --------------------------------------
+// ASSET METHODS
+// --------------------------------------
+
+/**
+ * Rename a file, move it to another folder, or both — one dialog and one request, as it is for a
+ * page.
+ */
+function renameMoveAsset(item) {
+  dialog({
+    component: defineAsyncComponent(() => import('@/components/TreeBrowserDialog.vue')),
+    componentProps: {
+      mode: 'renameAsset',
+      itemId: item.id,
+      itemTitle: item.title,
+      folderPath: item.folderPath,
+      itemFileName: item.fileName,
+      locale: state.locale
+    }
+  }).onOk(async (opts) => {
+    try {
+      const resp = await requestAssetMove(item.id, {
+        fileName: opts.fileName,
+        folderPath: opts.folderPath,
+        // -> The destination is a locale as well as a folder, as it is for a page: the same folder
+        //    in another locale is somewhere else
+        locale: opts.locale
+      })
+      notify({
+        type: 'positive',
+        message: resp.message
+      })
+      // -> Reload current view
+      await loadTree({ parentId: state.currentFolderId })
+    } catch (err) {
+      notify({
+        type: 'negative',
+        message: 'Failed to rename or move file.',
+        caption: apiErrorMessage(err, 'An unexpected error occured.')
+      })
+    }
+  })
+}
+
+/**
+ * The request behind every file rename and move. Each of the three is optional, and one left out
+ * stays as it is.
+ */
+async function requestAssetMove(assetId, { fileName, folderPath, locale }) {
+  const resp = await API_CLIENT.patch(`sites/${siteStore.id}/assets/${assetId}`, {
+    json: { fileName, folderPath, locale }
+  }).json()
+  // -> The API client does not throw on 400, so a refused name comes back as a parsed error
+  if (resp?.ok === false) {
+    throw new Error(resp.message || 'An unexpected error occured.')
+  }
+  return resp
+}
+
+/**
+ * Resize an image, over itself or into a new file beside it. Either way the folder is listed again:
+ * a new file has to appear in it, and a replaced one has a new size and thumbnail to show.
+ */
+function resizeImage(item) {
+  dialog({
+    component: defineAsyncComponent(() => import('@/components/AssetResizeDialog.vue')),
+    componentProps: {
+      assetId: item.id,
+      fileName: item.fileName,
+      width: item.width ?? null,
+      height: item.height ?? null
+    }
+  }).onOk(async () => {
+    await loadTree({ parentId: state.currentFolderId })
+  })
+}
+
+function delAsset(assetId, assetName) {
+  dialog({
+    component: defineAsyncComponent(() => import('@/components/AssetDeleteDialog.vue')),
+    componentProps: {
+      assetId,
+      assetName
+    }
+  }).onOk(async () => {
+    // -> Reload current view
+    await loadTree({ parentId: state.currentFolderId })
+  })
+}
+
+// --------------------------------------
+// UPLOAD METHODS
+// --------------------------------------
+
+function uploadFile() {
+  fileIpt.value.click()
+}
+
+async function uploadNewFiles() {
+  if (!fileIpt.value.files?.length) {
+    return
+  }
+
+  state.isUploading = true
+  state.shouldCancelUpload = false
+  state.uploadPercentage = 0
+
+  state.loading++
+
+  nextTick(() => {
+    setTimeout(async () => {
+      try {
+        const filesToUpload = [...fileIpt.value.files]
+        const totalFiles = filesToUpload.length
+        let idx = 0
+        for (const fileToUpload of filesToUpload) {
+          // -> A cancel can only take effect between files: a request already in flight is left to
+          //    finish, since the server has the bytes either way
+          if (state.shouldCancelUpload) {
+            break
+          }
+          idx++
+          state.uploadPercentage = totalFiles > 1 ? Math.round((idx / totalFiles) * 100) : 90
+          // -> The body is the file itself rather than a multipart form. The locale is the one being
+          //    browsed: a file dropped into a French folder belongs to the French tree, and left to
+          //    the server it would have been filed under the site's primary locale instead
+          const resp = await API_CLIENT.post(`sites/${siteStore.id}/assets`, {
+            searchParams: {
+              fileName: fileToUpload.name,
+              locale: state.locale,
+              ...(state.currentFolderId ? { folderId: state.currentFolderId } : {})
+            },
+            headers: {
+              'content-type': fileToUpload.type || 'application/octet-stream'
+            },
+            body: fileToUpload
+          }).json()
+          // -> The API client does not throw on 400, so a refused file comes back as a parsed error
+          if (resp?.ok === false) {
+            throw new Error(resp.message || 'An unexpected error occured.')
+          }
+        }
+        state.uploadPercentage = 100
+        loadTree({ parentId: state.currentFolderId })
+        if (!state.shouldCancelUpload) {
+          notify({
+            type: 'positive',
+            message: t('fileman.uploadSuccess')
+          })
+        }
+      } catch (err) {
+        notify({
+          type: 'negative',
+          message: 'Failed to upload file.',
+          caption: apiErrorMessage(err, 'An unexpected error occured.')
+        })
+      }
+      state.loading--
+      fileIpt.value.value = null
+      setTimeout(() => {
+        state.isUploading = false
+        state.uploadPercentage = 0
+      }, 1500)
+    }, 400)
+  })
+}
+
+function uploadCancel() {
+  state.shouldCancelUpload = true
+}
+
+// --------------------------------------
+// ITEM LIST ACTIONS
+// --------------------------------------
+
+function selectItem(item) {
+  if (item.type === 'folder') {
+    state.currentFolderId = item.id
+    treeComp.value.setOpened(item.id)
+  } else {
+    state.currentFileId = item.id
+  }
+}
+
+function doubleClickItem(item) {
+  if (insertMode.value) {
+    insertItem(item)
+  } else {
+    openItem(item)
+  }
+}
+
+/**
+ * Where a page in this listing lives, in the locale being browsed.
+ *
+ * The prefix is not optional decoration: the manager lists whichever locale the picker is on, so a
+ * path without one addresses the PRIMARY locale's page of that name -- a different page, or none.
+ */
+function pageUrl(item) {
+  const pagePath = item.folderPath ? `${item.folderPath}/${item.fileName}` : item.fileName
+  return `${siteStore.localeUrlPrefix(state.locale)}/${pagePath}`
+}
+
+function openItem(item) {
+  switch (item.type) {
+    case 'folder': {
+      return
+    }
+    case 'page': {
+      router.push(pageUrl(item))
+      close()
+      break
+    }
+    /*
+      The manager stays open behind both of these, unlike a page: the viewer is a look at one file
+      rather than a departure from the folder, and closing it comes back to the same selection.
+    */
+    case 'asset': {
+      if (isImageAsset(item)) {
+        viewImage(item)
+      } else {
+        // -> Nothing here can display it, so the browser is given the chance: it opens what it knows
+        //    -- a PDF, a video -- and downloads the rest, which is what View means for those
+        window.open(assetUrl(item.folderPath, item.fileName), '_blank', 'noopener')
+      }
+      break
+    }
+  }
+}
+
+/**
+ * Open an image at full size, over the manager.
+ */
+function viewImage(item) {
+  dialog({
+    component: defineAsyncComponent(() => import('@/components/AssetPreviewDialog.vue')),
+    componentProps: {
+      assetId: item.id,
+      fileName: item.fileName
+    }
+  })
+}
+
+/** The details pane's thumbnail, which is only offered for a file `viewImage` can show. */
+function viewCurrentFile() {
+  const item = state.fileList.find((f) => f.id === state.currentFileId)
+  if (item && isImageAsset(item)) {
+    viewImage(item)
+  }
+}
+
+async function copyItemURL(item) {
+  try {
+    switch (item.type) {
+      case 'page': {
+        await navigator.clipboard.writeText(`${window.location.origin}${pageUrl(item)}`)
+        break
+      }
+      case 'asset': {
+        // -> Under `/_files/`, which is where a file is served from: the page tree it is listed
+        //    alongside in here is not a place a browser can fetch it from
+        await navigator.clipboard.writeText(
+          `${window.location.origin}${assetUrl(item.folderPath, item.fileName)}`
+        )
+        break
+      }
+      default: {
+        throw new Error('Invalid Item Type')
+      }
+    }
+    notify({
+      type: 'positive',
+      message: t('fileman.copyURLSuccess')
+    })
+  } catch (err) {
+    notify({
+      type: 'negative',
+      message: 'Failed to copy URL to clipboard.',
+      caption: err.message
+    })
+  }
+}
+
+async function editItem(item) {
+  const pagePath = item.folderPath ? `${item.folderPath}/${item.fileName}` : item.fileName
+  // -> `/_edit` is an app route and carries no prefix, so the locale travels as a query the way it
+  //    already does for `/_create` -- without it the editor opens the primary locale's page instead
+  router.push({ path: `/_edit/${pagePath}`, query: { locale: state.locale } })
+  close()
+}
+
+async function downloadItem(item) {
+  try {
+    // -> Fetched rather than linked to: the content route is behind the API client, which is what
+    //    carries the token
+    const blob = await API_CLIENT.get(`sites/${siteStore.id}/assets/${item.id}/content`).blob()
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = item.fileName
+    link.click()
+    URL.revokeObjectURL(url)
+  } catch (err) {
+    notify({
+      type: 'negative',
+      message: 'Failed to download file.',
+      caption: apiErrorMessage(err, 'An unexpected error occured.')
+    })
+  }
+}
+
+function duplicateItem(item) {
+  switch (item.type) {
+    case 'page': {
+      duplicatePage(item)
+      break
+    }
+    case 'folder': {
+      duplicateFolder(item.id)
+      break
+    }
+  }
+}
+
+/**
+ * Copy a folder, and everything under it, somewhere else — under a name of its own.
+ *
+ * The view goes to the copy rather than staying where it was, as a move does: what was asked for is a
+ * new folder, and it is the new folder somebody wants to look at.
+ */
+function duplicateFolder(folderId) {
+  const node = state.treeNodes[folderId]
+  dialog({
+    component: defineAsyncComponent(() => import('@/components/TreeBrowserDialog.vue')),
+    componentProps: {
+      mode: 'duplicateFolder',
+      itemId: folderId,
+      itemTitle: node?.title ?? '',
+      folderPath: node?.folderPath ?? '',
+      itemFileName: node?.fileName ?? '',
+      locale: state.locale
+    }
+  }).onOk(async (opts) => {
+    /*
+      Blocking, and with a word about why: the copy is one request that runs to completion on the
+      server -- a page rendered, indexed and written out per entry -- so a folder of any size is
+      seconds rather than milliseconds, and the manager would otherwise sit there looking idle while
+      it happened, with nothing to stop somebody starting a second one on top of it.
+    */
+    loading.show({
+      message: t('fileman.folderDuplicating'),
+      caption: t('fileman.folderDuplicatingHint')
+    })
+    try {
+      const resp = await API_CLIENT.post(
+        `sites/${siteStore.id}/tree/folders/${folderId}/duplicate`,
+        {
+          json: {
+            folderPath: opts.folderPath,
+            pathName: opts.pathName,
+            title: opts.title,
+            locale: opts.locale
+          },
+          // -> Nothing on this side gives up on it, since the server does not either
+          timeout: false
+        }
+      ).json()
+      // -> The API client does not throw on 400, so a refused name comes back as a parsed error
+      if (resp?.ok === false) {
+        throw new Error(resp.message || 'An unexpected error occured.')
+      }
+      notify({
+        type: 'positive',
+        message: resp.message
+      })
+      await goToFolder(resp.folder)
+    } catch (err) {
+      notify({
+        type: 'negative',
+        message: 'Failed to duplicate folder.',
+        caption: apiErrorMessage(err, 'An unexpected error occured.')
+      })
+    } finally {
+      // -> In `finally` because `goToFolder` above can throw too, and an overlay left up is a wiki
+      //    nobody can click on
+      loading.hide()
+    }
+  })
+}
+
+function delItem(item) {
+  switch (item.type) {
+    case 'asset': {
+      delAsset(item.id, item.title)
+      break
+    }
+    case 'folder': {
+      delFolder(item.id, true)
+      break
+    }
+    case 'page': {
+      delPage(item.id, item.title)
+      break
+    }
+  }
+}
+
+// --------------------------------------
+// DRAG AND DROP
+// --------------------------------------
+
+/**
+ * The type a listing row is dragged as. Its own rather than `text/plain`, so that nothing outside the
+ * manager -- an editor's text area, another tab -- takes a dragged row for something to paste.
+ */
+const DRAG_TYPE = 'application/x-wiki-fileman-item'
+
+/** A loaded folder's own path, as the move endpoints address a destination. */
+function treeNodePath(node) {
+  return node.folderPath ? `${node.folderPath}/${node.fileName}` : node.fileName
+}
+
+/**
+ * Whether the row being dragged may be dropped into a folder (`null` for the root). Asked by the
+ * listing's folder rows and by every row of the tree.
+ *
+ * Every row in the listing sits in the folder being listed, so that one is never a destination. Nor,
+ * for a folder, is the folder itself or anything under it.
+ */
+function canDropOn(folderId) {
+  const item = state.dragItem
+  if (!item || folderId === state.currentFolderId) {
+    return false
+  }
+  const target = folderId ? state.treeNodes[folderId] : null
+  if (folderId && !target) {
+    return false
+  }
+  if (item.type === 'folder') {
+    if (folderId === item.id) {
+      return false
+    }
+    const source = state.treeNodes[item.id]
+    if (!source) {
+      return false
+    }
+    if (target && treeNodePath(target).startsWith(`${treeNodePath(source)}/`)) {
+      return false
+    }
+  }
+  return true
+}
+
+function onItemDragStart(ev, item) {
+  ev.dataTransfer.effectAllowed = 'move'
+  // -> Firefox starts no drag without some data, though nothing here reads it back
+  ev.dataTransfer.setData(DRAG_TYPE, item.id)
+  setDragImage(ev, item)
+  state.dragItem = item
+}
+
+/**
+ * Drag a small chip -- the row's icon and name -- rather than the browser's picture of the whole row,
+ * which is as wide as the list and covered most of the tree it was being dragged into.
+ *
+ * The chip starts below and to the right of the pointer, behind a transparent margin, so that the
+ * folder under the pointer is never under the chip too. It only has to exist while the browser takes
+ * its picture, which it does before the next task runs.
+ */
+function setDragImage(ev, item) {
+  const ghost = document.createElement('div')
+  ghost.className = 'fileman-drag-ghost'
+  const chip = document.createElement('div')
+  chip.className = 'fileman-drag-ghost-chip'
+  // -> The icon the row already drew, colour and all, rather than drawing one again
+  const icon = ev.currentTarget.querySelector('.fileman-filelist-icon .w-icon')
+  if (icon) {
+    chip.append(icon.cloneNode(true))
+  }
+  const label = document.createElement('span')
+  label.textContent = usePathTitle.value ? item.fileName : item.title
+  chip.append(label)
+  ghost.append(chip)
+  document.body.append(ghost)
+  ev.dataTransfer.setDragImage(ghost, 0, 0)
+  setTimeout(() => ghost.remove())
+}
+
+/** The end of every drag, whether it was dropped, dropped somewhere that refused it, or cancelled. */
+function onItemDragEnd() {
+  state.dragItem = null
+  state.dropFolderId = null
+}
+
+/*
+  The listing's half of the drop target, which the tree does for itself (see `TreeNav`). Driven from
+  `dragover` for the same reason: it keeps firing while the pointer is over the row, so the highlight
+  cannot be left behind by a `dragleave` fired on one of the row's children.
+*/
+function onListDragOver(ev, item) {
+  if (item.type !== 'folder' || !canDropOn(item.id)) {
+    return
+  }
+  ev.preventDefault()
+  ev.dataTransfer.dropEffect = 'move'
+  state.dropFolderId = item.id
+}
+
+function onListDragLeave(ev, item) {
+  if (ev.currentTarget.contains(ev.relatedTarget)) {
+    return
+  }
+  if (state.dropFolderId === item.id) {
+    state.dropFolderId = null
+  }
+}
+
+function onListDrop(ev, item) {
+  state.dropFolderId = null
+  if (item.type !== 'folder' || !canDropOn(item.id)) {
+    return
+  }
+  ev.preventDefault()
+  dropOnFolder(item.id)
+}
+
+/**
+ * A row dropped onto a folder: asked about first, then moved.
+ *
+ * The item is captured here, because `dragend` clears it as soon as this returns -- long before the
+ * dialog is answered.
+ */
+function dropOnFolder(folderId) {
+  const item = state.dragItem
+  if (!item || !canDropOn(folderId)) {
+    return
+  }
+  const target = folderId ? state.treeNodes[folderId] : null
+  const folderPath = target ? treeNodePath(target) : ''
+  dialog({
+    component: defineAsyncComponent(() => import('@/components/FileManagerMoveDialog.vue')),
+    componentProps: {
+      itemType: item.type,
+      itemTitle: item.title,
+      folderTitle: target?.title ?? null,
+      folderPath
+    }
+  }).onOk((opts) => {
+    moveItemInto(item, folderId, folderPath, opts)
+  })
+}
+
+/**
+ * Move a listing entry into another folder of the same locale, keeping its name.
+ *
+ * The view stays where it is, unlike the Move To actions: a drop is a quick gesture, often one of
+ * several in a row, and following each item away would mean finding the way back every time.
+ */
+async function moveItemInto(item, folderId, folderPath, { updateLinks = false } = {}) {
+  try {
+    switch (item.type) {
+      case 'page': {
+        const relinked = await pageStore.pageMove({
+          id: item.id,
+          path: folderPath ? `${folderPath}/${item.fileName}` : item.fileName,
+          locale: state.locale,
+          updateLinks
+        })
+        notify({
+          type: 'positive',
+          message: t('fileman.dropMove.pageSuccess')
+        })
+        notifyRelinked(relinked, t)
+        break
+      }
+      case 'asset': {
+        const resp = await requestAssetMove(item.id, { folderPath })
+        notify({
+          type: 'positive',
+          message: resp.message
+        })
+        break
+      }
+      case 'folder': {
+        // -> Blocking, as Move To is, and for its reason: see `moveFolder`
+        loading.show({
+          message: t('fileman.folderMoving'),
+          caption: t('fileman.folderMovingHint')
+        })
+        try {
+          const resp = await requestFolderMove(item.id, { folderPath })
+          notify({
+            type: 'positive',
+            message: resp.message
+          })
+          await relocateTreeBranch(item.id, folderId)
+        } finally {
+          loading.hide()
+        }
+        break
+      }
+    }
+  } catch (err) {
+    notify({
+      type: 'negative',
+      message: t('fileman.dropMove.failed'),
+      caption: apiErrorMessage(err, 'An unexpected error occured.')
+    })
+  }
+  // -> Whatever happened, the listing is fetched again: the row has gone, or a folder beside it now
+  //    holds one more thing -- and a failure may have been a conflict the listing is out of date about
+  await loadTree({ parentId: state.currentFolderId })
+}
+
+/**
+ * Put a moved folder where it now is in the tree, without starting the tree over.
+ *
+ * The folder and everything cached under it is forgotten -- all of it has a new path -- and the
+ * destination's folders are fetched again, which brings the folder back under its new parent. What
+ * was under it is fetched again when it is next opened.
+ */
+async function relocateTreeBranch(folderId, destinationId) {
+  const node = state.treeNodes[folderId]
+  if (node) {
+    const branchPath = treeNodePath(node)
+    for (const [id, other] of Object.entries(state.treeNodes)) {
+      if (id === folderId || treeNodePath(other).startsWith(`${branchPath}/`)) {
+        delete state.treeNodes[id]
+        treeComp.value?.setLoaded(id, false)
+      }
+    }
+  }
+  for (const other of Object.values(state.treeNodes)) {
+    other.children = other.children.filter((c) => c !== folderId)
+  }
+  state.treeRoots = state.treeRoots.filter((c) => c !== folderId)
+  // -> Never the folder being listed, which cannot be a destination: this fetch touches the tree alone
+  await loadTree({ parentId: destinationId, types: ['folder'] })
+}
+
+/**
+ * Ctrl+K reaches THIS search field while the overlay is up.
+ *
+ * HeaderSearch owns the same shortcut and steps aside for an overlay (see the note there), so the two
+ * never both answer it. Bound and unbound with the component, which only exists while the overlay is
+ * open -- the listener's lifetime is the window in which it should win.
+ */
+function handleKeyPress(ev) {
+  if (ev.ctrlKey && ev.key === 'k') {
+    ev.preventDefault()
+    searchField.value?.focus()
+  }
+}
+
+// MOUNTED
+
+onMounted(async () => {
+  window.addEventListener('keydown', handleKeyPress)
+
+  /*
+    The folder whoever opened the manager asked for -- the Image Properties dialog asks for the one the
+    image is in -- and otherwise the folder of the page being viewed. Empty is the site root, which is
+    an answer of its own and not the same as not asking.
+  */
+  const startPath =
+    siteStore.overlayOpts?.folderPath ?? pageStore.path.split('/').slice(0, -1).join('/')
+  const startParts = startPath ? startPath.split('/') : []
+
+  await loadTree({
+    parentPath: startPath,
+    initLoad: true
+  })
+
+  // -> Open tree up to that folder
+  const folderFolderPath = startParts.slice(0, -1).join('/')
+  const folderFileName = startParts.at(-1)
+
+  for (const [id, node] of Object.entries(state.treeNodes)) {
+    const nodePath = node.folderPath ? `${node.folderPath}/${node.fileName}` : node.fileName
+    // -> Whole segments: `guides` is an ancestor of `guides/setup`, not of `guidesextra`
+    if (`${startPath}/`.startsWith(`${nodePath}/`)) {
+      treeComp.value.setOpened(id)
+    }
+  }
+
+  // -> Switch to that folder
+  const currentNode = Object.entries(state.treeNodes).find(
+    ([, n]) => n.folderPath === folderFolderPath && n.fileName === folderFileName
+  )
+  if (currentNode) {
+    state.currentFolderId = currentNode[0]
+  }
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', handleKeyPress)
+})
+</script>
+
+<style lang="scss">
+/*
+  Where the overlay's header stops fitting on one line. Its own threshold: the three toolbars want roughly
+  700px between them, and this leaves a margin over that. Not one of the app's shared breakpoints, though
+  it is the same 900 the site header collapses its actions at -- both are simply where a window stops
+  having room for a row of chrome.
+*/
+$fileman-hdr-wrap-max: 899.98px;
+
+/*
+  The one height shared by the three rows along the bottom -- the Recycle Bin under the tree, the path
+  bar under the list, and the hint under the details -- so they read as a single band across the view.
+  45px is what the two side rows come to on their own: a 1px rule, 10px of padding each way, a 24px
+  icon. A minimum, not a height, so a translation long enough to wrap grows its row instead of being
+  clipped; it also wins over the `height` `WBar` sets without a specificity fight.
+*/
+$fileman-bottom-row-height: 45px;
+
+.fileman {
+  /*
+    THE HEADER ON A NARROW SCREEN
+    =============================
+
+    `.card-header` is a flex row, and its three toolbars are each `w-full`, so with wrapping turned on they
+    would take a line each -- three lines of chrome above a file list. Two is enough:
+
+      line 1   the title, with the help and Close group pushed to its end
+      line 2   the locale button and the search field
+
+    The title and the actions give up `w-full` to share the first line; the search toolbar keeps it and is
+    ordered last, which is what puts it on the second. Close is what this is for -- off the end of the row
+    it was unreachable, and it is the only way out of the overlay.
+  */
+  @media (max-width: $fileman-hdr-wrap-max) {
+    > .card-header {
+      flex-wrap: wrap;
+    }
+
+    &-hdr-title {
+      width: auto;
+      flex: 1 1 auto;
+      /* -> "File Manager" wrapped to two lines rather than letting the row grow */
+      white-space: nowrap;
+    }
+
+    &-hdr-actions {
+      width: auto;
+      flex: 0 0 auto;
+    }
+
+    &-hdr-search {
+      order: 1;
+    }
+  }
+
+  /*
+    The locale button is cut to the same 7px as the search field and Close, where `WBtn`'s flat variant
+    is 3px. Unlayered, because an SFC style block is not a Tailwind layer -- which is what lets it beat
+    the `rounded-[3px]` utility the component carries, the same way `.w-btn.acrylic-btn` in `_base.scss`
+    beats its hover utility. Specificity alone would not do it: both selectors are one class.
+  */
+  &-locale {
+    border-radius: 7px;
+  }
+
+  /*
+    The search field, following `.header-search-field` in HeaderSearch: 40px tall, dark fill on the
+    dark header, inverting to white ink-on-white in use. Stated here rather than borrowing that
+    component's class, so a change to the site header cannot silently restyle this overlay -- and the
+    two have since parted company on both of the things that tie a control to its surroundings.
+
+    The FILL: HeaderSearch sits on the site header, which is black, so its neutral `#212121` reads as
+    a lift out of it. This header is `.card-header` -- `$dark-3` graded towards `$dark-5`, all of them
+    blue-tinted -- and a neutral grey on a blue-grey ground reads as a different, muddier colour
+    rather than a raised surface. One step up the same ramp, `$dark-2`, is the lift without the clash.
+
+    The CORNERS: 7px, which is `WBtn`'s `push` radius, so the field and the Close button at the other
+    end of the header are cut to the same shape. A full pill next to a 7px button read as two
+    unrelated controls that happened to share a row.
+  */
+  &-search {
+    display: flex;
+    flex: 1 1;
+    min-width: 0;
+    align-items: center;
+    gap: 8px;
+    height: 40px;
+    padding: 0 8px 0 12px;
+    border-radius: 7px;
+    background-color: $dark-2;
+    color: rgba(255, 255, 255, 0.85);
+    transition:
+      background-color 0.25s var(--ease-standard),
+      color 0.25s var(--ease-standard);
+
+    // -> Driven by a class rather than `:focus-within`, matching HeaderSearch
+    &.is-focused {
+      background-color: #fff;
+      color: rgba(0, 0, 0, 0.87);
+    }
+
+    &-lead {
+      flex-shrink: 0;
+      font-size: 20px;
+      opacity: 0.7;
+    }
+
+    &-input {
+      flex: 1;
+      min-width: 0;
+      height: 100%;
+      border: 0;
+      background: none;
+      color: inherit;
+      font: inherit;
+      outline: none;
+
+      &::placeholder {
+        color: currentColor;
+        opacity: 0.55;
+      }
+    }
+
+    &-clear {
+      flex-shrink: 0;
+      display: inline-flex;
+      padding: 4px;
+      border-radius: 9999px;
+      border: 0;
+      background: none;
+      color: inherit;
+      opacity: 0.6;
+      cursor: pointer;
+
+      &:hover {
+        opacity: 1;
+      }
+    }
+  }
+
+  /*
+    Each pane states its own ink alongside its fill. Nothing above these sets a text color for dark
+    mode -- the app has no global `body--dark { color }` rule, and the panes are not `w-card`s, which
+    is where that pairing normally lives -- so anything that just inherits (the folder tree's labels,
+    a file's title, the size in the right-hand column) came out black on the dark fill.
+  */
+  &-left {
+    @at-root .body--light & {
+      background-color: $blue-grey-1;
+    }
+    @at-root .body--dark & {
+      background-color: $dark-4;
+      color: #fff;
+    }
+  }
+
+  &-center {
+    @at-root .body--light & {
+      background-color: #fff;
+    }
+    @at-root .body--dark & {
+      background-color: $dark-6;
+      color: #fff;
+    }
+  }
+
+  &-right {
+    @at-root .body--light & {
+      background-color: $grey-1;
+    }
+    @at-root .body--dark & {
+      background-color: $dark-5;
+      color: #fff;
+    }
+  }
+
+  &-hint {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: $fileman-bottom-row-height;
+    padding: 10px 16px;
+    font-size: 12px;
+    line-height: 1.4;
+
+    @at-root .body--light & {
+      border-top: 1px solid rgba(0, 0, 0, 0.08);
+      color: $grey-7;
+    }
+    @at-root .body--dark & {
+      border-top: 1px solid rgba(255, 255, 255, 0.1);
+      color: $grey-5;
+    }
+  }
+
+  &-toolbar {
+    @at-root .body--light & {
+      background-color: $grey-1;
+    }
+    @at-root .body--dark & {
+      background-color: $dark-5;
+    }
+  }
+
+  /*
+    The Recycle Bin, pinned under the tree. Drawn as one of the tree's own rows -- the same padding,
+    the same full-width band on hover and while it is open -- with a rule above it, since it is not a
+    place IN the tree and should not read as its last folder.
+  */
+  &-bin {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: $fileman-bottom-row-height;
+    width: 100%;
+    padding: 10px 12px;
+    font: inherit;
+    text-align: left;
+    color: inherit;
+    cursor: pointer;
+    transition: background-color 0.4s ease;
+
+    /*
+      -> A shade under the drawer at rest, because the path bar beside it is the drawer's own fill and
+         the two would otherwise run together as one strip along the bottom
+    */
+    @at-root .body--light & {
+      border-top: 1px solid rgba(0, 0, 0, 0.08);
+      background-color: rgba(0, 0, 0, 0.04);
+    }
+    @at-root .body--dark & {
+      border-top: 1px solid rgba(255, 255, 255, 0.1);
+      background-color: rgba(0, 0, 0, 0.2);
+    }
+
+    &:hover,
+    &:focus-visible,
+    &.is-active {
+      @at-root .body--light & {
+        background-color: rgba(0, 0, 0, 0.09);
+      }
+      @at-root .body--dark & {
+        background-color: rgba(255, 255, 255, 0.1);
+      }
+    }
+
+    &-label {
+      flex: 1 1 auto;
+    }
+  }
+
+  /*
+    Placed by grid LINE rather than by area, so it spans the drawers, the page and the footer at once;
+    see `WLayout` for the grid. Above the tree drawer, which is its own stacking context.
+  */
+  &-graph {
+    grid-row: 2 / 4;
+    grid-column: 1 / 4;
+    z-index: 5;
+    min-width: 0;
+  }
+
+  &-toolbar-title {
+    display: flex;
+    align-items: center;
+    font-weight: 500;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  &-path {
+    min-height: $fileman-bottom-row-height;
+
+    // -> The same rule the Recycle Bin draws along its top, so the bottom band has one edge across it
+    @at-root .body--light & {
+      background-color: $blue-grey-1 !important;
+      border-top: 1px solid rgba(0, 0, 0, 0.08);
+    }
+    @at-root .body--dark & {
+      background-color: $dark-4 !important;
+      border-top: 1px solid rgba(255, 255, 255, 0.1);
+    }
+  }
+
+  &-main {
+    height: 100%;
+  }
+
+  &-loadinglist {
+    padding: 16px;
+    font-style: italic;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+
+    > span {
+      margin-top: 16px;
+    }
+  }
+
+  &-emptylist {
+    padding: 16px;
+    font-style: italic;
+    font-size: 1.5em;
+    font-weight: 300;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+
+    > img {
+      opacity: 0.25;
+      width: 200px;
+    }
+
+    @at-root .body--light & {
+      color: $grey-6;
+    }
+    @at-root .body--dark & {
+      color: $grey-7;
+
+      > img {
+        filter: invert(1);
+      }
+    }
+  }
+
+  &-filelist {
+    padding: 8px 12px;
+
+    > .w-item {
+      padding: 4px 6px;
+      border-radius: 8px;
+
+      &.active {
+        background-color: var(--color-primary);
+        color: #fff;
+
+        .fileman-filelist-label .w-item-label--caption {
+          color: rgba(255, 255, 255, 0.7);
+        }
+
+        .fileman-filelist-side .text-caption {
+          color: rgba(255, 255, 255, 0.7);
+        }
+      }
+
+      // -> The folder a dragged item would land in, outlined the way the tree outlines one
+      &.is-drop-target {
+        box-shadow: inset 0 0 0 2px var(--color-primary);
+      }
+
+      // -> The row being dragged, faded in place while the chip stands in for it
+      &.is-dragging {
+        opacity: 0.4;
+      }
+    }
+
+    &.is-compact {
+      > .w-item {
+        padding: 0 6px;
+        min-height: 36px;
+      }
+
+      .fileman-filelist-icon {
+        padding-right: 6px;
+        min-width: 0;
+      }
+    }
+  }
+  /*
+    The thumbnail reads as something to press: it is the way into the full view, and a picture with no
+    affordance on it is one nobody clicks. `zoom-in` rather than `pointer` says which way it leads.
+  */
+  &-details-thumb {
+    cursor: zoom-in;
+
+    img {
+      transition: box-shadow 0.2s var(--ease-standard);
+    }
+
+    &:hover img,
+    &:focus-visible img {
+      box-shadow: 0 0 0 2px var(--color-primary);
+    }
+  }
+  &-details-row {
+    display: flex;
+    flex-direction: column;
+    padding: 5px 0;
+
+    label {
+      font-size: 0.7rem;
+      font-weight: 500;
+
+      @at-root .body--light & {
+        color: $grey-6;
+      }
+      @at-root .body--dark & {
+        color: $blue-grey-4;
+      }
+    }
+    // -> The row's own value only: a tag chip draws its label in a span too, white on its own fill
+    > span {
+      font-size: 0.85rem;
+
+      @at-root .body--light & {
+        color: $grey-8;
+      }
+      @at-root .body--dark & {
+        color: $blue-grey-2;
+      }
+    }
+
+    & + .fileman-details-row {
+      margin-top: 5px;
+    }
+  }
+
+  &-progressbar {
+    width: 100%;
+    flex: 1;
+    height: 12px;
+    border-radius: 3px;
+
+    @at-root .body--light & {
+      background-color: $blue-grey-2;
+    }
+    @at-root .body--dark & {
+      background-color: $dark-4 !important;
+    }
+
+    > div {
+      height: 12px;
+      background-color: $positive;
+      border-radius: 3px 0 0 3px;
+      background-image: linear-gradient(
+        -45deg,
+        rgba(255, 255, 255, 0.3) 25%,
+        transparent 25%,
+        transparent 50%,
+        rgba(255, 255, 255, 0.3) 50%,
+        rgba(255, 255, 255, 0.3) 75%,
+        transparent 75%,
+        transparent
+      );
+      background-size: 50px 50px;
+      background-position: 0 0;
+      animation: fileman-progress 2s linear infinite;
+      box-shadow: 0 0 5px 0 $positive;
+      font-size: 9px;
+      letter-spacing: 2px;
+      font-weight: 700;
+      color: #fff;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      overflow: hidden;
+      transition: all 1s ease;
+    }
+  }
+}
+
+/*
+  What a dragged row looks like under the pointer (`setDragImage`). Outside `.fileman`, because it is
+  appended to <body>. Off-screen rather than hidden: the browser takes its picture from the element as
+  drawn, and one that is not drawn gives it nothing. The padding is the transparent gap between the
+  pointer and the chip.
+*/
+.fileman-drag-ghost {
+  position: fixed;
+  top: -1000px;
+  left: -1000px;
+  padding: 14px 0 0 14px;
+
+  &-chip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 260px;
+    padding: 4px 10px;
+    border-radius: 7px;
+    font-size: 13px;
+    opacity: 0.85;
+
+    @at-root .body--light & {
+      background-color: #fff;
+      color: $grey-9;
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+    }
+    @at-root .body--dark & {
+      background-color: $dark-3;
+      color: #fff;
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+    }
+
+    // -> The row's own icon, cloned at whichever size the list drew it -- compact or not
+    > .w-icon {
+      flex-shrink: 0;
+      width: 20px;
+      height: 20px;
+      font-size: 20px;
+    }
+
+    > span {
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }
+  }
+}
+
+@keyframes fileman-progress {
+  0% {
+    background-position: 0 0;
+  }
+  100% {
+    background-position: -50px -50px;
+  }
+}
+</style>

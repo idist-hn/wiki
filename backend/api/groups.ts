@@ -1,0 +1,774 @@
+import { audit } from '../helpers/audit.ts'
+import { CustomError, isRedirectTarget } from '../helpers/common.ts'
+import { elevatedGroupGuard } from '../helpers/userGuards.ts'
+import { LIST_GROUPS_PERMISSIONS, SYSTEM_PERMISSION, isElevated } from '../models/groups.ts'
+import type { FastifyInstance } from 'fastify'
+import type { GroupPatch, GroupRule } from '../models/groups.ts'
+
+interface GroupUpdateBody {
+  name?: string
+  redirectOnLogin?: string
+  redirectOnFirstLogin?: string
+  redirectOnLogout?: string
+  permissions?: string[]
+  rules?: GroupRule[]
+}
+
+/**
+ * Groups API Routes
+ */
+async function routes(app: FastifyInstance) {
+  /**
+   * LIST ALL GROUPS
+   */
+  app.get(
+    '/',
+    {
+      /*
+        No route-level `permissions`: most of the callers are global-permission holders and the hook
+        could answer for them, but `manage:navigation` is a PAGE RULE now and the hook reads the
+        group-wide list only. Both kinds are checked in the handler instead, so the answer is the
+        same for everyone who needs it.
+      */
+      schema: {
+        summary: 'List all groups',
+        description:
+          'Every group by id and name, with its member count. Nothing about what a group may do or who is in it — that is `GET /groups/{groupId}`.',
+        tags: ['Groups'],
+        response: {
+          200: {
+            description: 'List of all groups',
+            type: 'array',
+            items: { $ref: 'GroupCore#' }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      /*
+        Everything that has to NAME a group without being able to read one.
+
+        The global half: `manage:sites` because an approval rule names the groups that may suggest an
+        edit and the groups that review one; `read:users` and `manage:users` because the user editor
+        shows which groups an account belongs to; the group permissions themselves.
+
+        The page-rule half: `manage:navigation`, because a menu item can be limited to groups and the
+        navigation editor has to offer them. Asked as "anywhere" rather than against a path, since
+        this request names no page — see `groups.grantsAnywhere`.
+
+        Safe on this route and this route only: the listing is `GroupCore`, which carries no
+        permissions, no rules and no members. Reading one group in full, or its members, keeps needing
+        `read:groups`, and changing one keeps needing `manage:groups`.
+      */
+      const actor = WIKI.models.groups.actorForRequest(req)
+      const allowed =
+        [
+          'read:groups',
+          'write:groups',
+          'manage:groups',
+          'manage:sites',
+          'read:users',
+          'manage:users'
+        ].some((permission) => actor.permissions.includes(permission)) ||
+        WIKI.models.groups.grantsAnywhere(actor, 'manage:navigation')
+      if (!allowed) {
+        return reply.forbidden('You are not allowed to list groups.')
+      }
+      /*
+        `isElevated` rather than the permissions themselves: this listing is deliberately thin and is
+        granted to callers who may not read a group in full, but every one of those callers has a
+        control to draw that must not offer a group the server will refuse.
+      */
+      return (await WIKI.models.groups.getAllGroups()).map((group) => ({
+        ...group,
+        isElevated: isElevated(group.permissions ?? [])
+      }))
+    }
+  )
+
+  /**
+   * LOOK UP GROUPS
+   */
+  app.get<{ Querystring: { query?: string; limit?: number } }>(
+    '/lookup',
+    {
+      config: {
+        permissions: LIST_GROUPS_PERMISSIONS
+      },
+      schema: {
+        summary: 'Find groups by name, for a picker',
+        description:
+          'Groups whose name contains the query, each with its id and name and nothing else — not what it may do, not who is in it, not how many.\n\nThe guests group is never listed. `list:groups` is the permission for exactly this, and the group permissions above it also answer it.',
+        tags: ['Groups'],
+        querystring: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', maxLength: 255 },
+            limit: { type: 'integer', minimum: 1, maximum: 50, default: 10 }
+          }
+        },
+        response: {
+          200: {
+            description: 'Matching groups, by name',
+            type: 'array',
+            items: { $ref: 'GroupLookup#' }
+          }
+        }
+      }
+    },
+    async (req) => {
+      return WIKI.models.groups.lookup({ query: req.query.query ?? '', limit: req.query.limit })
+    }
+  )
+
+  /**
+   * CREATE GROUP
+   */
+  app.post<{ Body: { name: string } }>(
+    '/',
+    {
+      config: {
+        permissions: ['write:groups', 'manage:groups']
+      },
+      schema: {
+        summary: 'Create a new group',
+        description:
+          'Creates a non-system group, seeded with the same starting permissions and default rule as the built-in `Users` group.',
+        tags: ['Groups'],
+        body: {
+          type: 'object',
+          required: ['name'],
+          properties: {
+            name: {
+              type: 'string',
+              minLength: 1,
+              maxLength: 255
+            }
+          },
+          examples: [{ name: 'Editors' }]
+        },
+        response: {
+          200: {
+            description: 'Group created successfully',
+            type: 'object',
+            properties: {
+              ok: {
+                type: 'boolean'
+              },
+              message: {
+                type: 'string'
+              },
+              id: {
+                type: 'string',
+                format: 'uuid'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const invalid = await WIKI.models.groups.validateName(req.body.name)
+      if (invalid) {
+        throw new CustomError('groupCreateInvalidName', invalid)
+      }
+
+      try {
+        const id = await WIKI.models.groups.createGroup(req.body.name)
+
+        await audit(req, 'admin', 'createGroup', { groupId: id, name: req.body.name })
+
+        return {
+          ok: true,
+          message: 'Group created successfully.',
+          id
+        }
+      } catch (err: any) {
+        WIKI.logger.warn(err)
+        return reply.internalServerError()
+      }
+    }
+  )
+
+  /**
+   * GET SINGLE GROUP
+   */
+  app.get<{ Params: { groupId: string } }>(
+    '/:groupId',
+    {
+      config: {
+        permissions: ['read:groups', 'write:groups', 'manage:groups']
+      },
+      schema: {
+        summary: 'Get a single group',
+        description: 'Returns the group with its full permissions and page rules.',
+        tags: ['Groups'],
+        params: {
+          type: 'object',
+          properties: {
+            groupId: {
+              type: 'string',
+              format: 'uuid'
+            }
+          },
+          required: ['groupId']
+        },
+        response: {
+          200: {
+            description: 'Group info',
+            type: 'object',
+            $ref: 'Group#'
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const group = await WIKI.models.groups.getGroupById(req.params.groupId)
+      if (!group) {
+        return reply.notFound('Group does not exist.')
+      }
+      return group
+    }
+  )
+
+  /**
+   * UPDATE GROUP
+   */
+  app.put<{ Params: { groupId: string }; Body: GroupUpdateBody }>(
+    '/:groupId',
+    {
+      config: {
+        permissions: ['write:groups', 'manage:groups']
+      },
+      schema: {
+        summary: 'Update a group',
+        description:
+          'Updates any subset of the group fields. Omitted fields are left unchanged. The permissions of the root administrators group cannot be modified.',
+        tags: ['Groups'],
+        params: {
+          type: 'object',
+          properties: {
+            groupId: {
+              type: 'string',
+              format: 'uuid'
+            }
+          },
+          required: ['groupId']
+        },
+        body: {
+          type: 'object',
+          properties: {
+            name: {
+              type: 'string',
+              minLength: 1,
+              maxLength: 255
+            },
+            redirectOnLogin: {
+              type: 'string',
+              maxLength: 255
+            },
+            redirectOnFirstLogin: {
+              type: 'string',
+              maxLength: 255
+            },
+            redirectOnLogout: {
+              type: 'string',
+              maxLength: 255
+            },
+            permissions: {
+              type: 'array',
+              items: {
+                type: 'string'
+              }
+            },
+            rules: {
+              type: 'array',
+              items: { $ref: 'GroupRule#' }
+            }
+          },
+          /*
+            -> One of each kind: page permissions are granted by a rule, never by `permissions`, which
+               holds the global ones alone -- a page permission named there grants nothing
+          */
+          examples: [
+            {
+              name: 'Editors',
+              permissions: [],
+              rules: [
+                {
+                  id: '6f1c2d3e-4a5b-4c6d-8e7f-9a0b1c2d3e4f',
+                  name: 'Edit the docs',
+                  roles: ['read:pages', 'write:pages'],
+                  match: 'START',
+                  mode: 'ALLOW',
+                  path: 'docs',
+                  tags: [],
+                  locales: [],
+                  sites: []
+                }
+              ]
+            },
+            {
+              name: 'Support',
+              permissions: ['access:admin', 'read:users']
+            }
+          ]
+        },
+        response: {
+          200: {
+            description: 'Group updated successfully',
+            type: 'object',
+            properties: {
+              ok: {
+                type: 'boolean'
+              },
+              message: {
+                type: 'string'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const group = await WIKI.models.groups.getGroupById(req.params.groupId)
+      if (!group) {
+        return reply.notFound('Group does not exist.')
+      }
+
+      // -> Each is navigated to by a member's browser; see `isRedirectTarget` for why that narrows
+      //    them. Empty is how a group defers to the site.
+      for (const key of ['redirectOnLogin', 'redirectOnFirstLogin', 'redirectOnLogout'] as const) {
+        const value = req.body[key]
+        if (value !== undefined && value !== '' && !isRedirectTarget(value)) {
+          throw new CustomError(
+            'groupUpdateInvalidRedirect',
+            `${key} must be a path on this wiki or an http(s) URL.`
+          )
+        }
+      }
+
+      // -> Collect only the fields actually provided
+      const patch: GroupPatch = {}
+      if (req.body.name !== undefined) {
+        patch.name = req.body.name
+      }
+      if (req.body.redirectOnLogin !== undefined) {
+        patch.redirectOnLogin = req.body.redirectOnLogin
+      }
+      if (req.body.redirectOnFirstLogin !== undefined) {
+        patch.redirectOnFirstLogin = req.body.redirectOnFirstLogin
+      }
+      if (req.body.redirectOnLogout !== undefined) {
+        patch.redirectOnLogout = req.body.redirectOnLogout
+      }
+      if (req.body.permissions !== undefined) {
+        patch.permissions = req.body.permissions
+      }
+      if (req.body.rules !== undefined) {
+        patch.rules = req.body.rules
+      }
+
+      if (Object.keys(patch).length < 1) {
+        throw new CustomError('groupUpdateEmpty', 'No group fields provided to update.')
+      }
+
+      // -> A rename is held to the same rules as a new name, this group excepted: resending the name
+      //    it already has is how a client that edits the whole group at once saves anything else
+      if (patch.name !== undefined) {
+        const invalidName = await WIKI.models.groups.validateName(patch.name, group.id)
+        if (invalidName) {
+          throw new CustomError('groupUpdateInvalidName', invalidName)
+        }
+      }
+
+      // -> The root administrators group must keep its permissions, or the instance becomes
+      //    unmanageable with no way to grant `manage:system` back. Resending the current set is
+      //    allowed, so that a client editing other fields can still submit the whole group.
+      if (patch.permissions && group.id === WIKI.config.auth.rootAdminGroupId) {
+        const isUnchanged =
+          patch.permissions.length === group.permissions.length &&
+          patch.permissions.every((p) => group.permissions.includes(p))
+        if (!isUnchanged) {
+          throw new CustomError(
+            'groupUpdateRootAdminPermissions',
+            'Cannot modify the permissions of the root administrators group.'
+          )
+        }
+      }
+
+      /*
+        Who may rewrite the global permission list of a group, which is the question the Permissions
+        tab asks and the one thing separating the two group-editing rungs.
+
+        `write:groups` may not touch it at all: it creates and arranges groups, names them, writes
+        their page rules and moves people in and out of the ordinary ones -- but what a group is
+        ALLOWED to do instance-wide is not its to decide, since granting `manage:users` to a group it
+        belongs to would be a way of granting itself anything. The list is compared rather than
+        merely refused when present, so a client that round-trips the whole group back unchanged --
+        which is exactly what the editor does on every save -- still saves the fields it may.
+
+        `manage:groups` may rewrite the list, except for `manage:system` itself: granting that hands
+        over the instance, and revoking it locks the real administrators out.
+      */
+      if (patch.permissions && !WIKI.models.groups.holdsSystemPermission(req)) {
+        const callerPermissions = req.apiKey?.permissions ?? req.session?.permissions ?? []
+        const unchanged =
+          group.permissions.length === patch.permissions.length &&
+          group.permissions.every((permission) => patch.permissions!.includes(permission))
+        if (!callerPermissions.includes('manage:groups')) {
+          if (!unchanged) {
+            throw new CustomError(
+              'groupUpdatePermissionsForbidden',
+              'Only a user who holds manage:groups or manage:system can change what a group is allowed to do. Every other change to this group is allowed.',
+              403
+            )
+          }
+        } else {
+          const held = group.permissions.includes(SYSTEM_PERMISSION)
+          if (held !== patch.permissions.includes(SYSTEM_PERMISSION)) {
+            throw new CustomError(
+              'groupUpdateSystemPermission',
+              `Only a user who holds the ${SYSTEM_PERMISSION} permission can grant or revoke it. Every other change to this group is allowed.`,
+              403
+            )
+          }
+        }
+      }
+
+      // -> Rule IDs must be unique within the group, as they address the rule client-side
+      if (patch.rules) {
+        const ruleIds = patch.rules.map((r) => r.id)
+        if (new Set(ruleIds).size !== ruleIds.length) {
+          throw new CustomError('groupUpdateDuplicateRuleId', 'Group rule IDs must be unique.')
+        }
+      }
+
+      try {
+        await WIKI.models.groups.updateGroup(group.id, patch)
+        /*
+          The permissions and the rules are recorded in full rather than as "changed", because they
+          ARE the answer to who may do what — and reconstructing the set somebody was granted at a
+          point in time is the question an audit log gets asked about a group.
+        */
+        await audit(req, 'admin', 'updateGroup', {
+          groupId: group.id,
+          name: patch.name ?? group.name,
+          changedFields: Object.keys(patch),
+          ...(patch.permissions !== undefined ? { permissions: patch.permissions } : {}),
+          ...(patch.rules !== undefined ? { rules: patch.rules } : {})
+        })
+
+        return {
+          ok: true,
+          message: 'Group updated successfully.'
+        }
+      } catch (err: any) {
+        WIKI.logger.warn(err)
+        return reply.internalServerError()
+      }
+    }
+  )
+
+  /**
+   * DELETE GROUP
+   */
+  app.delete<{ Params: { groupId: string } }>(
+    '/:groupId',
+    {
+      config: {
+        permissions: ['manage:groups']
+      },
+      schema: {
+        summary: 'Delete a group',
+        description:
+          'Deletes the group and removes all of its user assignments. System groups cannot be deleted.',
+        tags: ['Groups'],
+        params: {
+          type: 'object',
+          properties: {
+            groupId: {
+              type: 'string',
+              format: 'uuid'
+            }
+          },
+          required: ['groupId']
+        },
+        response: {
+          204: {
+            description: 'Group deleted successfully'
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const group = await WIKI.models.groups.getGroupById(req.params.groupId)
+      if (!group) {
+        return reply.notFound('Group does not exist.')
+      }
+      if (group.isSystem) {
+        return reply.conflict('Cannot delete a system group.')
+      }
+
+      // -> Deleting the group removes every member from it, so it is the membership guard's question
+      const systemGroupRefusal = elevatedGroupGuard(req, group, 'delete the group')
+      if (systemGroupRefusal) {
+        throw systemGroupRefusal
+      }
+
+      try {
+        await WIKI.models.groups.deleteGroup(group.id)
+
+        await audit(req, 'admin', 'deleteGroup', { groupId: group.id, name: group.name })
+
+        return reply.code(204).send()
+      } catch (err: any) {
+        WIKI.logger.warn(err)
+        return reply.internalServerError()
+      }
+    }
+  )
+
+  /**
+   * LIST GROUP USERS
+   */
+  app.get<{
+    Params: { groupId: string }
+    Querystring: { filter?: string; page?: number; limit?: number }
+  }>(
+    '/:groupId/users',
+    {
+      config: {
+        permissions: ['read:groups', 'write:groups', 'manage:groups']
+      },
+      schema: {
+        summary: 'List the users assigned to a group',
+        description: 'Returns a page of group members, ordered by name.',
+        tags: ['Groups'],
+        params: {
+          type: 'object',
+          properties: {
+            groupId: {
+              type: 'string',
+              format: 'uuid'
+            }
+          },
+          required: ['groupId']
+        },
+        querystring: {
+          type: 'object',
+          properties: {
+            filter: {
+              type: 'string',
+              description: 'Case-insensitive substring matched against the name and email.',
+              maxLength: 255
+            },
+            page: { type: 'integer', minimum: 1, default: 1 },
+            limit: { type: 'integer', minimum: 1, maximum: 100, default: 20 }
+          }
+        },
+        response: {
+          200: {
+            description: 'List of group members',
+            type: 'object',
+            properties: {
+              page: { type: 'integer' },
+              limit: { type: 'integer' },
+              total: { type: 'integer' },
+              users: {
+                type: 'array',
+                items: { $ref: 'UserCore#' }
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const group = await WIKI.models.groups.getGroupById(req.params.groupId)
+      if (!group) {
+        return reply.notFound('Group does not exist.')
+      }
+
+      const page = req.query.page ?? 1
+      const limit = req.query.limit ?? 20
+      const { total, users } = await WIKI.models.groups.getGroupUsers(group.id, {
+        filter: req.query.filter,
+        page,
+        limit
+      })
+
+      return { page, limit, total, users }
+    }
+  )
+
+  /**
+   * ASSIGN USER TO GROUP
+   */
+  app.post<{ Params: { groupId: string; userId: string } }>(
+    '/:groupId/users/:userId',
+    {
+      config: {
+        permissions: ['write:groups', 'manage:groups']
+      },
+      schema: {
+        summary: 'Assign a user to a group',
+        description:
+          'System users (the guest account) cannot be assigned: their group membership is fixed at install time.',
+        tags: ['Groups'],
+        params: {
+          type: 'object',
+          properties: {
+            groupId: {
+              type: 'string',
+              format: 'uuid'
+            },
+            userId: {
+              type: 'string',
+              format: 'uuid'
+            }
+          },
+          required: ['groupId', 'userId']
+        },
+        response: {
+          200: {
+            description: 'User assigned successfully',
+            type: 'object',
+            properties: {
+              ok: {
+                type: 'boolean'
+              },
+              message: {
+                type: 'string'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const group = await WIKI.models.groups.getGroupById(req.params.groupId)
+      if (!group) {
+        return reply.notFound('Group does not exist.')
+      }
+      const user = await WIKI.models.users.getById(req.params.userId)
+      if (!user) {
+        return reply.notFound('User does not exist.')
+      }
+
+      const systemGroupRefusal = elevatedGroupGuard(req, group)
+      if (systemGroupRefusal) {
+        throw systemGroupRefusal
+      }
+
+      /*
+        The guests group and the guest account belong to each other and to nothing else — the group is
+        what anonymous visitors hold, and the account is who they are. `guestMembershipViolation` is
+        the one definition of that, shared with `setUserGroups`, which is what the user editor and
+        provider enrolment go through.
+      */
+      const violation = WIKI.models.groups.guestMembershipViolation(group.id, user)
+      if (violation) {
+        return reply.conflict(violation)
+      }
+
+      const assigned = await WIKI.models.groups.assignUserToGroup(group.id, req.params.userId)
+      if (!assigned) {
+        return reply.conflict('User is already assigned to this group.')
+      }
+
+      await audit(req, 'admin', 'assignUserToGroup', {
+        groupId: group.id,
+        groupName: group.name,
+        targetUserId: user.id,
+        targetName: user.name,
+        targetEmail: user.email
+      })
+
+      return {
+        ok: true,
+        message: 'User assigned to group successfully.'
+      }
+    }
+  )
+
+  /**
+   * UNASSIGN USER FROM GROUP
+   */
+  app.delete<{ Params: { groupId: string; userId: string } }>(
+    '/:groupId/users/:userId',
+    {
+      config: {
+        permissions: ['write:groups', 'manage:groups']
+      },
+      schema: {
+        summary: 'Unassign a user from a group',
+        description:
+          'Removes the user from the group. The last remaining user cannot be removed from the root administrators group, and system users (the guest account) cannot be unassigned at all.',
+        tags: ['Groups'],
+        params: {
+          type: 'object',
+          properties: {
+            groupId: {
+              type: 'string',
+              format: 'uuid'
+            },
+            userId: {
+              type: 'string',
+              format: 'uuid'
+            }
+          },
+          required: ['groupId', 'userId']
+        },
+        response: {
+          204: {
+            description: 'User unassigned successfully'
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const group = await WIKI.models.groups.getGroupById(req.params.groupId)
+      if (!group) {
+        return reply.notFound('Group does not exist.')
+      }
+      if (!(await WIKI.models.groups.isUserInGroup(group.id, req.params.userId))) {
+        return reply.notFound('User is not assigned to this group.')
+      }
+
+      const systemGroupRefusal = elevatedGroupGuard(req, group)
+      if (systemGroupRefusal) {
+        throw systemGroupRefusal
+      }
+
+      // -> Removing the guest account from the guests group would strip anonymous visitors of the
+      //    permissions that group carries, with no way to put it back. `unassignUserFromGroup`
+      //    refuses that pair as well; this answers it as a conflict rather than as a failure.
+      const user = await WIKI.models.users.getById(req.params.userId)
+      if (user?.isSystem) {
+        return reply.conflict('Cannot unassign a system user from a group.')
+      }
+
+      // -> Emptying the root administrators group would lock everyone out of system management
+      if (group.id === WIKI.config.auth.rootAdminGroupId) {
+        if ((await WIKI.models.groups.countUsersInGroup(group.id)) <= 1) {
+          return reply.conflict('Cannot remove the last user from the root administrators group.')
+        }
+      }
+
+      await WIKI.models.groups.unassignUserFromGroup(group.id, req.params.userId)
+
+      await audit(req, 'admin', 'unassignUserFromGroup', {
+        groupId: group.id,
+        groupName: group.name,
+        targetUserId: req.params.userId,
+        targetName: user?.name ?? null,
+        targetEmail: user?.email ?? null
+      })
+
+      return reply.code(204).send()
+    }
+  )
+}
+
+export default routes

@@ -1,0 +1,763 @@
+import { defineStore } from 'pinia'
+
+import { sortBy } from 'es-toolkit/array'
+
+import { useCommonStore } from './common'
+import { useFlagsStore } from './flags'
+import { useUserStore } from './user'
+
+/**
+ * Turn the site's active locale CODES into the descriptors the UI reads.
+ *
+ * The API stores and returns `locales.active` as bare codes -- `['en']` -- because that is what the
+ * admin screen writes back and what the server validates against its installed set. Everything that
+ * DISPLAYS a locale, though, wants a name for it: the sidebar's locale menu, the language filter on
+ * the search screen, and the check in App.vue that a requested locale is one this site offers. They
+ * were each reading `.code` / `.language` / `.nativeName` off a string, so every one of them rendered
+ * blank -- the locale menu showed an empty row rather than "English".
+ *
+ * The descriptors come from the server -- `bootstrap` hands the installed list over with the site,
+ * so it costs no request of its own -- because half of what they say cannot be worked out from a
+ * code here: whether the short form is `fr` or `fr-FR` depends on which OTHER locales exist, and an
+ * administrator can rename either. `Intl` still answers for a code the server did not, which is a
+ * locale the site has active and the wiki no longer has installed.
+ */
+function describeLocales(codes, installed) {
+  const known = new Map((installed ?? []).map((lc) => [lc.code, lc]))
+  // -> `languageDisplay: 'standard'` names the language first -- "Portuguese (Brazil)" rather than
+  //    Intl's default "Brazilian Portuguese" -- matching how the server names them
+  const nameOptions = { type: 'language', languageDisplay: 'standard' }
+  const localized = new Intl.DisplayNames(undefined, nameOptions)
+
+  return (codes ?? []).map((code) => {
+    if (known.has(code)) {
+      return known.get(code)
+    }
+    let name = code
+    let nativeName = code
+    try {
+      name = localized.of(code) ?? code
+      nativeName = new Intl.DisplayNames([code], nameOptions).of(code) ?? code
+    } catch {
+      // -> An unregistered or malformed tag throws rather than returning nothing; show the code
+    }
+    return {
+      code,
+      // -> The bare language, for the two-letter badge beside each entry
+      language: code.split('-')[0],
+      name,
+      nativeName,
+      displayCode: code,
+      displayName: nativeName
+    }
+  })
+}
+
+/**
+ * The editors whose pages have no article of their own.
+ *
+ * The client's copy of `BODYLESS_EDITORS` in `backend/models/pages.ts`, which is what decides on the
+ * server whether an empty content column is an error and — through `isBodylessEditor` — which pages
+ * under a blog count as its posts. The two have to agree: an editor this list calls bodyless while
+ * the server does not is one the blog offers to write a post with and then never lists.
+ *
+ * Longer than the server's by the two behind the experimental flag, which have no editor there to
+ * have an opinion about them yet. Both plainly belong here: a discussion and a set of API docs are
+ * not somebody being put in front of a blank article, which is the whole of what this divides.
+ */
+const BODYLESS_EDITORS = ['blog', 'feedback', 'channel', 'api', 'redirect']
+
+export const useSiteStore = defineStore('site', {
+  state: () => ({
+    id: null,
+    hostname: '',
+    company: '',
+    contentLicense: '',
+    footerExtra: '',
+    /**
+     * The notice an administrator can raise above the contents of every page — an outage, a freeze,
+     * a wiki being moved. `content` is markdown, rendered by `SiteBanner.vue` at display time rather
+     * than stored as HTML: it is site configuration, and never goes through the page renderer.
+     */
+    banner: {
+      isEnabled: false,
+      title: '',
+      content: ''
+    },
+    dark: false,
+    title: '',
+    description: '',
+    logoText: true,
+    /**
+     * The extensions this site's content is written in, lowercase and without the dot. A path ending
+     * in one of them addresses the page underneath it — `/foo/bar.md` is `/foo/bar` — which the
+     * router acts on for links inside pages and the server acts on for requests that reach it.
+     */
+    pageExtensions: [],
+    /**
+     * Whether a link to a page that does not exist is drawn red. The render marks those links whatever
+     * this says (`is-broken-link`, set on the server); this only decides whether the page view adds
+     * the class to its contents that colours them.
+     */
+    colorizeBrokenLinks: true,
+    /** Whether a version an AI assistant wrote is marked as such. Instance-wide, set on Admin → MCP. */
+    showAiBadge: true,
+    /** What a page being created starts with, before its author changes anything (Admin → General). */
+    defaults: {
+      tocDepth: { min: 1, max: 2 }
+    },
+    search: '',
+    searchLastQuery: '',
+    searchIsLoading: false,
+    printView: false,
+    pageDataTemplates: [],
+    showSideNav: true,
+    showSidebar: true,
+    overlay: null,
+    overlayOpts: {},
+    features: {
+      /*
+        The one default here that is not the conservative one, and deliberately: the rest read false
+        until the server answers because showing a feature that turns out to be off is worse than the
+        other way round, while a site config blob written before this key existed has to mean "on" --
+        that is what `pageLinks.isAllowed` decides on the server, and the two have to agree.
+      */
+      backlinks: true,
+      browse: false,
+      collaborativeEditing: false,
+      // -> On, for the reason `backlinks` is: the server reads a missing key as on
+      glossary: true,
+      glossaryAutoLink: true,
+      lastEditedBy: true,
+      listFolderChildren: false,
+      liveNotes: false,
+      // -> On, for the reason `backlinks` is: the server reads a missing key as on, and the badge
+      //    must not disagree with it
+      notifications: true,
+      ratingsMode: 'off',
+      reasonForChange: 'required',
+      search: false
+    },
+    /**
+     * How this site handles comments, as the server describes it -- `models/comments.ts`.
+     *
+     * `provider` empty is a site with comments turned off, which is also what a provider that is
+     * selected but not finished being configured looks like from here. `isBuiltIn` decides which of
+     * the two things the page view draws: the Talk tab beside the article, or the third-party markup
+     * in `code` mounted under it. Nothing of the stored configuration reaches this -- the built-in
+     * provider's holds an Akismet key, and the server never serializes it.
+     */
+    comments: {
+      provider: '',
+      isBuiltIn: false,
+      code: { head: '', main: '', body: '' },
+      cooldownSeconds: 0,
+      maxLength: 8000
+    },
+    /**
+     * What this site does with uploads. Set in the admin area's General section; only the parts the
+     * app itself acts on are carried here, which is where a pasted file goes -- the conflict behavior
+     * is the server's business alone.
+     */
+    uploads: {
+      pastedDestination: ''
+    },
+    /** How this site handles signing in. Set in the admin area's Login section. */
+    auth: {
+      /**
+       * Skip the login screen and go straight to the first strategy, where that one signs in at a
+       * provider rather than with a form here.
+       */
+      autoLogin: false,
+      /**
+       * Send a visitor who is not logged in straight to the login screen instead of showing them
+       * the unauthorized page. For a wiki that is closed to the public, that screen is a dead end
+       * with a login button on it, and this skips the step.
+       */
+      bypassUnauthorized: false
+    },
+    editors: {
+      asciidoc: false,
+      blog: false,
+      excalidraw: false,
+      feedback: false,
+      markdown: false,
+      redirect: false,
+      visual: false
+    },
+    /** Every installed locale, as this wiki refers to it. Empty until the app has bootstrapped. */
+    installedLocales: [],
+    locales: {
+      primary: 'en',
+      showMenu: true,
+      active: [
+        {
+          code: 'en',
+          language: 'en',
+          name: 'English',
+          nativeName: 'English'
+        }
+      ]
+    },
+    /**
+     * Every tag any page of this site carries, most used first — the suggestions a tag field offers
+     * and the list the search page filters by. Derived from the pages rather than stored, so it goes
+     * out of date whenever one is saved; see `fetchTags` and `staleTags`.
+     */
+    tags: [],
+    /** Whether `tags` holds a list that is known to be current. */
+    tagsLoaded: false,
+    theme: {
+      dark: false,
+      injectCSS: '',
+      injectHead: '',
+      injectBody: '',
+      colorPrimary: '#1976D2',
+      colorSecondary: '#02C39A',
+      colorAccent: '#f03a47',
+      colorHeader: '#000',
+      colorSidebar: '#1976D2',
+      codeBlocksTheme: '',
+      contentWidth: 'full',
+      sidebarPosition: 'left',
+      tocPosition: 'right',
+      showPrintBtn: true,
+      showPageProgress: true,
+      pageTransitions: true
+    },
+    sideDialogShown: false,
+    sideDialogComponent: '',
+    docsBase: 'https://docs.js.wiki',
+    nav: {
+      currentId: null,
+      items: [],
+      /*
+        The menus a reader went through to reach the one on screen, by opening a `menu` item -- each as
+        `{ currentId, items }`, the page's own menu first. Empty whenever the sidebar shows the menu the
+        page resolves to, which is what "Go back" being offered depends on. Not remembered: a page
+        load, or a reload, starts again from the page's own menu.
+      */
+      stack: []
+    },
+    /*
+      How the sidebar's menus are drawn, from the site's `navigation` settings -- the display half of
+      them; the automations are the server's business alone. Off until the site says otherwise.
+    */
+    navigation: {
+      showParentLink: false
+    },
+    /*
+      Where "Go up" leads from the base menu on screen -- `{ locale, path }`, or null where there is
+      nowhere -- and which menu that was asked of, so it is asked again only when that changes.
+    */
+    navParent: {
+      navId: null,
+      parent: null
+    }
+  }),
+  getters: {
+    /** How a locale is referred to — `fr` for `fr-FR` — falling back to the code until read. */
+    localeAlias: (state) => (code) =>
+      state.installedLocales.find((lc) => lc.code === code)?.displayCode ?? code,
+    /**
+     * The `dir` a locale's text is written in, for the elements that hold a page's own content.
+     *
+     * Asked of the PAGE's locale, not of the interface's: an Arabic page on a wiki read in English is
+     * still read right to left, while the chrome around it stays the way the interface language runs.
+     * A locale the wiki does not have installed reads as `ltr`, since nothing says otherwise.
+     */
+    localeDir: (state) => (code) =>
+      state.installedLocales.find((lc) => lc.code === code)?.isRTL ? 'rtl' : 'ltr',
+    /**
+     * The segments a locale-prefixed URL may start with, mapped to the locale each names.
+     *
+     * Every code a locale answers to, not only the short one it is addressed by now: an alias an
+     * administrator changed leaves the links people have already saved pointing at the old segment,
+     * and a wiki that 404s them has broken them. Mirrors `localePrefixesFor` on the server.
+     *
+     * Recognised whatever `forcePrefix` says. That setting decides only whether an UNPREFIXED path is
+     * sent to the primary locale; a prefix is how any other locale is addressed at all, so a site with
+     * it off still has to answer `/fr/...`. The cost is that a site with a locale active cannot also
+     * have a page whose first path segment is that locale's short code.
+     */
+    localePrefixes: (state) => {
+      const prefixes = new Map()
+      for (const lc of state.locales.active) {
+        for (const segment of [lc.displayCode, lc.derivedCode, lc.code]) {
+          if (segment) {
+            prefixes.set(segment, lc.code)
+          }
+        }
+      }
+      return prefixes
+    },
+    overlayIsShown: (state) => Boolean(state.overlay),
+    sideNavIsDisabled: (state) => Boolean(state.theme.sidebarPosition === 'off'),
+    scrollStyle: (state) => {
+      const userStore = useUserStore()
+      let isDark = false
+      if (userStore.appearance === 'site') {
+        isDark = state.theme.dark
+      } else if (userStore.appearance === 'dark') {
+        isDark = true
+      }
+      return {
+        thumb: {
+          right: '2px',
+          borderRadius: '5px',
+          backgroundColor: isDark ? '#FFF' : '#000',
+          width: '5px',
+          opacity: isDark ? 0.25 : 0.15
+        },
+        bar: {
+          backgroundColor: isDark ? '#000' : '#FAFAFA',
+          width: '9px',
+          opacity: isDark ? 0.25 : 1
+        }
+      }
+    },
+    /**
+     * The leading segment a page URL in this locale carries, empty where it needs none.
+     *
+     * The one place that answers it: the router reads a prefix back with `localePrefixes`, and
+     * everything that builds a page URL — a breadcrumb, the way out of the editor, the logo, the
+     * locale selector — has to write the same one. The short code, as the prefix and the storage
+     * folder both are.
+     *
+     * A locale that is not the site's primary always carries one, `forcePrefix` or not: there is no
+     * other way to address it. The primary carries one only when the setting is on, which is what
+     * that setting is — with it off, `/notes/one` is the canonical address of the primary locale's
+     * page and prefixing it would be noise on the single-locale wikis that are most of them.
+     */
+    localeUrlPrefix() {
+      return (code) =>
+        this.locales.forcePrefix || code !== this.locales.primary
+          ? `/${this.localeAlias(code)}`
+          : ''
+    },
+    /**
+     * The editors a page on this site may be written with, as the ids `pages.editor` stores — the
+     * order they are offered in, which is the order a reader meets them.
+     *
+     * Two questions at once, and both have to be asked or the list is fiction: whether the site has
+     * the editor turned on (`editors`, the admin area's Editors screen), and whether it is
+     * implemented at all — `channel` and `api` are names with no editor behind them yet, so both are
+     * behind the experimental flag. On a wiki with the flag off that leaves Markdown, Visual,
+     * AsciiDoc, Drawing, Blog, Feedback Board and Redirection, in that order: Markdown is what most pages are written
+     * with, so it is the one offered first.
+     *
+     * Redirection is in the list on the same footing as the rest. It used to be unconditional, on the
+     * reasoning that a redirection authors nothing and so has nothing to turn off — but what the
+     * switch decides is whether the site OFFERS one, which is a question a wiki that does not want
+     * loose redirections lying about has every reason to answer no. Turning it off leaves the
+     * redirections a site already has working and editable; only `New Redirection` goes.
+     *
+     * Markdown and Visual are two views of the same markdown source, which is what lets a page move
+     * between them — see `interchangeableEditors` on the server.
+     *
+     * `PageNewMenu` draws its items from this, so what a page can be created with and what a search
+     * can be filtered by cannot drift apart.
+     */
+    activeEditors() {
+      const flagsStore = useFlagsStore()
+      const experimental = flagsStore.experimental
+      return [
+        ...(this.editors.markdown ? ['markdown'] : []),
+        ...(this.editors.visual ? ['visual'] : []),
+        ...(this.editors.asciidoc ? ['asciidoc'] : []),
+        /*
+          Last of the ones that write an article, because it writes a different KIND of one: the three
+          above are three syntaxes for a page of prose and a drawing is not prose at all, so it sits
+          beside them rather than among them.
+        */
+        ...(this.editors.excalidraw ? ['excalidraw'] : []),
+        /*
+          After the two that write pages and before the one that writes none: a blog's front page is
+          a page somebody creates deliberately and rarely, so it does not belong at the top of the
+          menu, and it is not the afterthought a redirection is.
+        */
+        ...(this.editors.blog ? ['blog'] : []),
+        // -> A blog's sibling, for the same reasons, and beside it
+        ...(this.editors.feedback ? ['feedback'] : []),
+        ...(experimental ? ['channel', 'api'] : []),
+        ...(this.editors.redirect ? ['redirect'] : [])
+      ]
+    },
+    /**
+     * The active editors that put an author in front of a blank article.
+     *
+     * `activeEditors` minus the ones that write a settings document instead — a blog's front page is
+     * a listing of the posts under it, a redirection is a target. Derived from that list rather than
+     * written out again, so an editor a site has switched off is missing from both and the order is
+     * the one the menu already uses.
+     *
+     * Two callers, and they want it for the same reason. A blog's **New Post** button offers exactly
+     * these, since a post is an article and `models/blogs.ts` does not count anything else as one.
+     * And `PageNewMenu` draws its divider where this list ends.
+     */
+    articleEditors() {
+      return this.activeEditors.filter((editor) => !BODYLESS_EDITORS.includes(editor))
+    },
+    /** Whether `code` is one of the locales this site has enabled. */
+    isActiveLocale: (state) => (code) => state.locales.active.some((lc) => lc.code === code),
+    /**
+     * The locale the reader is reading in, as a locale this site actually has.
+     *
+     * The interface locale, which is the one the locale selector ticks and the only thing that
+     * answers the question on a screen that is not a page — `/_tags` and `/_search` carry no locale
+     * in their URLs, so a reader's own choice is all there is to go on. The site's primary where
+     * that choice is not a locale of this site, since every wiki has a primary and a reader has to
+     * be somewhere.
+     */
+    readerLocale() {
+      const commonStore = useCommonStore()
+      return this.isActiveLocale(commonStore.locale) ? commonStore.locale : this.locales.primary
+    },
+    /**
+     * The locale a listing screen opens narrowed to — the tag browser, the search filters — or null
+     * for every locale, which is where a site with one locale lands.
+     *
+     * The reader's own locale, because a list of every translation of everything is mostly pages
+     * they cannot read. Null on a single-locale site, where the control is not drawn at all and a
+     * filter nothing on screen can undo is a trap — it would also quietly hide pages left in a
+     * locale the site has since dropped. Null too where the reader's locale is not one of this
+     * site's, since opening on an empty list says a wiki is empty when it is only foreign.
+     */
+    defaultLocaleFilter() {
+      const commonStore = useCommonStore()
+      return this.locales.active.length > 1 && this.isActiveLocale(commonStore.locale)
+        ? commonStore.locale
+        : null
+    },
+    /**
+     * Where home is for the reader — `/` on a single-locale wiki, `/fr/` for somebody reading the
+     * French half of a wiki whose primary locale is English.
+     *
+     * The one place that answers it, because a bare `/` does not: that is the PRIMARY locale's home
+     * whoever asks, so every screen that fell back to it sent a French reader to the English wiki.
+     */
+    readerHomePath() {
+      return `${this.localeUrlPrefix(this.readerLocale)}/`
+    }
+  },
+  actions: {
+    /**
+     * @param {object} [opts]
+     * @param {boolean} [opts.insertMode] Pick something for the editor rather than browse.
+     * @param {?string} [opts.folderPath] The folder to open on, slash-separated and empty for the
+     *        site root. Absent, the manager opens on the folder of the page being viewed.
+     */
+    openFileManager(opts) {
+      this.$patch({
+        overlay: 'FileManager',
+        overlayOpts: {
+          insertMode: opts?.insertMode ?? false,
+          folderPath: opts?.folderPath ?? null
+        }
+      })
+    },
+    /**
+     * @param {object} [opts]
+     * @param {?string} [opts.termId] The term to open on. Absent, the list with nothing selected.
+     * @param {?string} [opts.name] Or the term by name or alias, as a `?glossary=` link names it.
+     * @param {?string} [opts.locale] The locale to open in. Absent, the one the interface is in.
+     */
+    openGlossary(opts) {
+      this.$patch({
+        overlay: 'Glossary',
+        overlayOpts: {
+          termId: opts?.termId ?? null,
+          name: opts?.name ?? null,
+          locale: opts?.locale ?? null
+        }
+      })
+    },
+    async loadSite(hostname) {
+      try {
+        // -> The locale descriptors come alongside rather than after, so the selector's label is
+        //    right on the first paint instead of flicking from `fr-FR` to `fr`
+        const [siteInfo, locales] = await Promise.all([
+          API_CLIENT.get(`sites/${hostname}`).json(),
+          // -> Not worth failing a page load over; `describeLocales` falls back to `Intl`
+          API_CLIENT.get('locales')
+            .json()
+            .catch(() => null)
+        ])
+        if (!siteInfo) {
+          throw new Error('Invalid Site')
+        }
+        if (locales) {
+          this.installedLocales = locales.filter((lc) => lc.isInstalled)
+        }
+        this.applySiteInfo(siteInfo)
+      } catch (err) {
+        console.warn(err.message)
+        throw err
+      }
+    },
+    /**
+     * Take in a site configuration that arrived with something else — `bootstrap` hands it over with
+     * the flags and the session, which is how an app load gets all three in one request.
+     */
+    applySiteInfo(siteInfo) {
+      this.$patch({
+        id: siteInfo.id,
+        hostname: siteInfo.hostname,
+        title: siteInfo.title,
+        description: siteInfo.description,
+        logoText: siteInfo.logoText,
+        pageExtensions: siteInfo.pageExtensions ?? [],
+        colorizeBrokenLinks: siteInfo.colorizeBrokenLinks ?? true,
+        showAiBadge: siteInfo.showAiBadge === true,
+        defaults: {
+          ...this.defaults,
+          ...siteInfo.defaults
+        },
+        company: siteInfo.company,
+        contentLicense: siteInfo.contentLicense,
+        footerExtra: siteInfo.footerExtra,
+        banner: {
+          ...this.banner,
+          ...siteInfo.banner
+        },
+        features: {
+          ...this.features,
+          ...siteInfo.features
+        },
+        comments: {
+          ...this.comments,
+          ...siteInfo.comments
+        },
+        auth: {
+          ...this.auth,
+          ...siteInfo.auth
+        },
+        uploads: {
+          ...this.uploads,
+          ...siteInfo.uploads
+        },
+        navigation: {
+          showParentLink: Boolean(siteInfo.navigation.showParentLink)
+        },
+        /*
+          Flattened to one boolean apiece: what this store is asked is whether an editor is on, and
+          the `config` blob beside each `isActive` belongs to the editor rather than to the site. A
+          key the site config has never been saved with reads as off, the same answer `features` and
+          `theme` get from being spread over the state defaults below -- an editor a site has never
+          been asked about is not one it offers.
+        */
+        editors: {
+          asciidoc: siteInfo.editors.asciidoc?.isActive ?? false,
+          blog: siteInfo.editors.blog?.isActive ?? false,
+          excalidraw: siteInfo.editors.excalidraw?.isActive ?? false,
+          feedback: siteInfo.editors.feedback?.isActive ?? false,
+          markdown: siteInfo.editors.markdown?.isActive ?? false,
+          redirect: siteInfo.editors.redirect?.isActive ?? false,
+          visual: siteInfo.editors.visual?.isActive ?? false
+        },
+        // -> Spread over the state defaults, as `features` and `theme` above do, so a key the
+        //    site config has never been saved with reads as its default rather than undefined
+        locales: {
+          ...this.locales,
+          ...siteInfo.locales,
+          active: sortBy(describeLocales(siteInfo.locales.active, this.installedLocales), [
+            'displayName'
+          ])
+        },
+        tags: [],
+        tagsLoaded: false,
+        theme: {
+          ...this.theme,
+          ...siteInfo.theme
+        }
+      })
+    },
+    /**
+     * Load the site's tags, unless a current list is already held.
+     *
+     * Cached because it is not a cheap answer — the server counts every tag over every page the
+     * asker may read, page rules and all — and because the surfaces that want it (a tag field, the
+     * search filter, the header's popular tags) are opened over and over in one session.
+     */
+    async fetchTags(forceRefresh = false) {
+      if (this.tagsLoaded && !forceRefresh) {
+        return
+      }
+      try {
+        const tags = await API_CLIENT.get(`sites/${this.id}/tags`).json()
+        this.$patch({
+          tags: tags ?? [],
+          tagsLoaded: true
+        })
+      } catch (err) {
+        console.warn(err.message)
+        throw err
+      }
+    },
+    /**
+     * Say that the tag list is out of date, so the next thing that wants it asks the server again.
+     *
+     * A tag is not a record anybody creates: it exists because a page carries it, so saving a page is
+     * what brings one into being — and the list cached here was fetched before that happened. Without
+     * this, a tag invented in the page properties panel was missing from every tag field for the rest
+     * of the session, and only a full reload of the application brought it back.
+     *
+     * The tags themselves are left in place rather than emptied: what is held is the last known list,
+     * which is a better thing to show than nothing while the next fetch is in flight.
+     *
+     * Deleting a page, or a folder of them, moves this list too and does not say so. That direction is
+     * survivable in a way this one is not: a tag no page carries any more is a suggestion that leads to
+     * an empty search, where a tag that cannot be suggested at all cannot be picked.
+     */
+    staleTags() {
+      this.tagsLoaded = false
+    },
+    /**
+     * Load the sidebar menu a page resolves to.
+     *
+     * @param id The page's `navigationId`, which addresses either a tree entry that overrides the menu
+     *           or the site itself for the one every page inherits
+     */
+    async fetchNavigation(id) {
+      // -> The menu's "Go up" is asked for alongside it and drawn with it: shown a moment after the
+      //    items, it would push every one of them down as it arrived
+      const [items, navParent] = await Promise.all([
+        API_CLIENT.get(`sites/${this.id}/navigation/${id}`)
+          .json()
+          .catch((err) => {
+            // -> An empty sidebar is the right outcome for a menu nobody has set up, rather than an
+            //    error in front of a reader who cannot act on it
+            console.warn(err.message)
+            return null
+          }),
+        this.fetchNavigationParent(id)
+      ])
+      this.$patch((state) => {
+        state.nav = { currentId: id, items: items ?? [], stack: [] }
+        if (navParent) {
+          state.navParent = navParent
+        }
+      })
+    },
+    /**
+     * Show the menu a page resolves to, putting away any menu opened on the way.
+     *
+     * Asked on every page load, not only when the page's menu changes: following a link out of an
+     * opened menu lands on a page that very often resolves to that same menu, and it is shown then as
+     * the page's own -- without "Go back".
+     */
+    async showPageNavigation(id) {
+      const base = this.nav.stack[0]
+      if (base?.currentId === id) {
+        this.$patch({ nav: { currentId: base.currentId, items: base.items, stack: [] } })
+        await this.refreshNavigation()
+      } else if (this.nav.stack.length > 0 || id !== this.nav.currentId) {
+        await this.fetchNavigation(id)
+      } else {
+        // -> The same menu as the page before, which may still have changed since it was read
+        await this.refreshNavigation()
+      }
+      await this.loadNavigationParent()
+    },
+    /**
+     * Where "Go up" leads from the page's own menu, asked of the server once per menu.
+     *
+     * Only the server can say: the link goes to whatever is above the page or folder owning the menu,
+     * which for an inherited menu is not where the reader is, and only while the reader may open it.
+     * Not asked at all while the site has the link switched off, and asked on the next page load once
+     * it is switched on. Quiet on failure: no link is a menu without one.
+     */
+    async loadNavigationParent() {
+      const id = this.nav.currentId
+      const navParent = await this.fetchNavigationParent(id)
+      if (navParent && this.nav.currentId === id) {
+        this.navParent = navParent
+      }
+    },
+    /**
+     * Ask the server where "Go up" leads from a menu, as the `navParent` to hold for it -- or null
+     * where there is nothing to ask (the link is off, or that menu's answer is already held) or the
+     * request failed.
+     */
+    async fetchNavigationParent(id) {
+      if (!this.navigation.showParentLink || !id || this.navParent.navId === id) {
+        return null
+      }
+      try {
+        const resp = await API_CLIENT.get(`sites/${this.id}/navigation/${id}/parent`).json()
+        return { navId: id, parent: resp?.parent ?? null }
+      } catch (err) {
+        console.warn(err.message)
+        return null
+      }
+    },
+    /**
+     * Read the menu on screen again, and redraw it only if it has changed.
+     *
+     * A menu changes under a reader who is still looking at it: an editor rearranges it, or one of the
+     * site's navigation automations adds, moves or relabels a link as a page or folder changes -- from
+     * this browser or anybody else's. Asked on every page load and after every write this browser
+     * makes to pages or the tree (the `contentChanged` event), so it costs one small request each time,
+     * and nothing at all on screen while the answer is the same.
+     *
+     * Only the page's own menu, never one opened from a `menu` item: that is somewhere the reader went,
+     * and swapping it under them would undo the step. Dropped if the sidebar moved on meanwhile, and
+     * quiet on failure -- the menu already on screen is still a menu.
+     */
+    async refreshNavigation() {
+      const id = this.nav.currentId
+      if (!id || this.nav.stack.length > 0) {
+        return
+      }
+      try {
+        const items = (await API_CLIENT.get(`sites/${this.id}/navigation/${id}`).json()) ?? []
+        if (this.nav.currentId !== id || this.nav.stack.length > 0) {
+          return
+        }
+        if (JSON.stringify(items) !== JSON.stringify(this.nav.items)) {
+          this.$patch({ nav: { items } })
+        }
+      } catch (err) {
+        console.warn(err.message)
+      }
+    },
+    /**
+     * Open the menu a `menu` item points at, in place of the one on screen.
+     *
+     * Fetched as a reader fetches any menu, so items limited to other groups are left out. Dropped if
+     * the sidebar moved on while it was in flight -- a page loaded, or another menu opened.
+     */
+    async openNavigationMenu(id) {
+      const from = this.nav.currentId
+      try {
+        const items = await API_CLIENT.get(`sites/${this.id}/navigation/${id}`).json()
+        if (this.nav.currentId !== from) {
+          return
+        }
+        this.$patch({
+          nav: {
+            currentId: id,
+            items: items ?? [],
+            stack: [...this.nav.stack, { currentId: this.nav.currentId, items: this.nav.items }]
+          }
+        })
+      } catch (err) {
+        console.warn(err.message)
+      }
+    },
+    /** Go back to the menu the one on screen was opened from. */
+    closeNavigationMenu() {
+      const previous = this.nav.stack.at(-1)
+      if (!previous) {
+        return
+      }
+      this.$patch({
+        nav: {
+          currentId: previous.currentId,
+          items: previous.items,
+          stack: this.nav.stack.slice(0, -1)
+        }
+      })
+    }
+  }
+})

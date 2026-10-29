@@ -1,0 +1,44 @@
+// Quasar SCSS (& Sass) Variables
+// --------------------------------------------------
+// To customize the look and feel of this app, you can override
+// the Sass/SCSS variables found in Quasar's source Sass/SCSS files.
+
+// Check documentation for full list of Quasar variables
+
+// Your own variables (that are declared here) and Quasar's own
+// ones will be available out of the box in your .vue/.scss/.sass files
+
+// It's highly recommended to change the default colors
+// to match your app's branding.
+// Tip: Use the "Theme Builder" on Quasar's documentation website.
+
+$primary: #1976d2;
+$secondary: #02c39a;
+$accent: #f03a47;
+
+$dark: #0d1117;
+
+$positive: #02c39a;
+$negative: #f03a47;
+$info: #3e6990;
+$warning: #f99d4d;
+
+$header: #000;
+$sidebar: $primary;
+
+/*
+  The width of the two rails that frame every editor: the page actions rail down the right of every
+  page (`PageActionsCol.vue`), and the insert rail down the left of each editor -- Markdown, AsciiDoc
+  and Visual. One value because they are one piece of chrome at either edge of the same screen, and
+  the preview panes' measure is worked out from both. Also the height of the actions rail's buttons
+  (`h-12`), so the rail is a column of squares, and room for the insert rail's 40px buttons with a
+  little either side.
+*/
+$rail-width: 48px;
+
+$dark-6: #070a0d;
+$dark-5: #0d1117;
+$dark-4: #161b22;
+$dark-3: #1e232a;
+$dark-2: #292f39;
+$dark-1: #343b48;

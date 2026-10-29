@@ -1,0 +1,2569 @@
+/*
+  THE RENDERED PAGE
+  =================
+
+  Everything a page's own markup can produce, and nothing else: every selector in this file is nested
+  under `.page-contents`, which is the only element the render is injected into -- the article column
+  in the page view, and the preview pane in the markdown editor. Both carry that class, so the two
+  cannot drift apart.
+
+  The app's Tailwind base layer strips margins, list markers and heading sizes from every element, so
+  this file is not a set of tweaks over browser defaults: it is the whole typographic system for
+  content, and it has to be, or a rendered page comes out as undifferentiated 14px text.
+
+  Written against what `renderers/markdown.js` actually emits (and what `models/rendering.ts` does to
+  it server-side), which is: heading anchors, `pre.codeblock` with highlight.js token classes, an
+  optional line-number gutter, optional per-line highlights and an optional header bar carrying a
+  title, task lists, footnotes, multi-line tables, admonitions, twemoji images, and whatever classes an
+  author attaches through `markdown-it-attrs` (`id`, `class` and `target` are the ones the renderer
+  allows through).
+
+  Maths and diagrams are not in that list: they are blocks now -- `block-mathjax`, `block-diagram`,
+  `block-plantuml` -- and a block styles itself inside its own shadow root, which nothing here reaches.
+  The exceptions are the two blocks whose content is a page's own markup rather than something the
+  block draws -- `block-steps` under LISTS, and `block-tab` in the print section -- and that is exactly
+  why they are here: their content is styled by this file, which is the whole point of both of them.
+
+  The measurements follow what the documentation platforms have converged on -- 16px body text, headings
+  at 600 with far more space above than below, ruled h1/h2, tinted code, a table headed by a dark bar
+  in a panel of its own, a left-ruled quote -- because those conventions are what makes a long page scannable, not because any one of them
+  is copied.
+
+  Colours go through custom properties declared on the root block, for three reasons: dark mode is
+  then one override block rather than a rule per element, an author's own CSS can retint content
+  without rewriting selectors, and the brand colours stay indirected through `--color-primary` so a
+  re-themed site follows.
+*/
+
+/*
+  The Sass breakpoint variables, loaded explicitly. `vite.config.js` injects this module into every SFC
+  through `additionalData`, but that reaches only the files Vite itself hands to Sass -- a partial pulled
+  in by `@use` from `app.scss` is resolved by Sass, and arrives without it.
+*/
+@use 'palette' as *;
+
+.page-contents {
+  /* -- Palette ----------------------------------------------------------------- */
+
+  /* Ink at three strengths: body, secondary (quotes, captions), and incidental (gutters, markers) */
+  --content-ink: #26292e;
+  --content-ink-muted: #5b616b;
+  --content-ink-faint: #8a9099;
+
+  --content-link: var(--color-primary);
+  /* A link to a page that does not exist yet -- see `.is-broken-link` under LINKS */
+  --content-link-broken: var(--color-red-8);
+  /* The page's own title, in the site's colour -- see the gradient rule under `h1` */
+  --content-h1: var(--color-primary);
+  /*
+    The rule under it stays the brand colour itself in BOTH themes: the lightening the title's text
+    needs to stay legible would leave the rule washed out, and a 2px band has no legibility problem to
+    solve -- it only has to read as the site's colour.
+  */
+  --content-h1-rule: var(--color-primary);
+
+  /*
+    How far the rule under an h1 reaches back into the padding of whatever is holding the content, so
+    that it starts at the sidebar rather than at the text. Both surfaces pad by 1rem -- the article
+    column's `p-4` and the preview pane's own padding -- and a surface that pads differently overrides
+    this one property rather than the rule.
+  */
+  --content-bleed: 1rem;
+
+  /*
+    A code panel's padding, held as properties rather than written out at each place that has to line up
+    with it: the row layer behind the code reaches back over it exactly, and a titled block's header bar
+    pads to the same edge from outside the panel. The left one is per panel and lives on `pre`, since the
+    line-number gutter widens it.
+  */
+  --code-pad-y: 0.9rem;
+  --code-pad-x: 1.1rem;
+
+  /* Rules: the hairline between table cells and around panels, and a heavier one for a quote's bar */
+  --content-rule: rgba(0, 0, 0, 0.12);
+  --content-rule-strong: rgba(0, 0, 0, 0.26);
+  /*
+    The grey under a section heading. Stronger than `--content-rule`, because it is only at full
+    strength at its left end -- a hairline's weight would leave nothing visible once it starts fading.
+  */
+  --content-h2-rule: rgba(0, 0, 0, 0.42);
+
+  /*
+    Two surfaces. `code` is the panel behind a code block -- opaque, because the preview pane sits on
+    grey and a translucent tint would disappear into it -- and `alt` is the wash behind an inline code
+    span or a row header inside a table body, translucent so it works on either. The head of a table is
+    no longer one of them; see `--content-table-head` below.
+  */
+  --content-surface-code: #f4f6f8;
+  --content-surface-alt: rgba(0, 0, 0, 0.04);
+
+  /*
+    The head of a table, drawn as a title bar: the graded near-black the app's own dialog headers use
+    (`.card-header` in `_base.scss`), so a table reads as a panel with a bar on top rather than as a
+    grid with tinted text in its first row. Literal values, because this file takes no SCSS palette.
+
+    The near end of the grade -- the one the radial starts from, at bottom right -- is a step up the
+    app's dark ramp from what `.card-header` starts at: `$dark-2` here against its `$dark-3`. Against a
+    white page the whole bar reads darker than it measures, and at `$dark-3` the grade had nowhere to go
+    but flat. On a dark page it does not need the help, so the dark block puts `$dark-3` back.
+
+    The far end and the ink are the same in both themes, because a bar this dark is already the chrome
+    it is meant to be on either.
+  */
+  --content-table-head: #292f39;
+  --content-table-head-grade: #0d1117;
+  /*
+    Dimmed rather than pure white: the head labels the columns, and at full strength white on
+    near-black it reads louder than the content it introduces.
+  */
+  --content-table-head-ink: rgba(255, 255, 255, 0.82);
+  /* -> The grid lines INSIDE the bar, which `--content-rule` cannot draw: a 12%-black hairline is
+        invisible on near-black */
+  --content-table-head-rule: rgba(255, 255, 255, 0.12);
+  /*
+    The body's two row colours. The plain row is tinted too, faintly: on the white article column an
+    untinted row IS the page, and a table whose rows are half page and half band reads as stripes drawn
+    on the article rather than as a panel of its own. Washes rather than fixed greys, so the pair holds
+    together on the editor's grey preview pane as well as on a white page.
+  */
+  --content-table-row: rgba(0, 0, 0, 0.03);
+  --content-table-row-alt: rgba(0, 0, 0, 0.06);
+  /*
+    And a shadow under the whole thing, so the panel sits ON the page rather than being drawn into it.
+    Two layers: a tight one that reads as the edge lifting, and a wide soft one that reads as the drop.
+    Kept faint -- a table is content, not a dialog, and it appears as often as every few paragraphs.
+  */
+  --content-table-shadow: 0 1px 2px rgba(0, 0, 0, 0.05), 0 3px 10px rgba(0, 0, 0, 0.05);
+
+  --content-mark: #fdf1a0;
+
+  /*
+    The rows of a `{.links-list}`: the wash each one sits on, and the tint it takes under the pointer.
+    Washes rather than fixed greys, for the same reason the table's rows are ones -- the editor's
+    preview pane sits on grey, where a fixed near-white row would read as a lit strip.
+
+    The hover tint is mixed from the site's colour, so it answers the bar that appears beside it rather
+    than being a blue that happens to sit near one.
+  */
+  --content-links-row: rgba(0, 0, 0, 0.045);
+  --content-links-row-hover: color-mix(in srgb, var(--color-primary) 8%, transparent);
+  /*
+    And the light down the top of a row, over whichever of the two it is carrying. A separate layer
+    rather than a two-stop wash, because the wash is the half that changes: a gradient cannot be
+    transitioned to another gradient, so a row built out of one would jump to its hover colour while
+    everything else on the page fades.
+  */
+  --content-links-sheen: rgba(255, 255, 255, 0.8);
+  /*
+    And the drop under it, so a row sits ON the page rather than being a tint drawn into it. One tight
+    layer where the table has two: these come five and ten at a time down a page, and the wide soft
+    half of a table's shadow repeated that often reads as a smudge behind the whole list.
+  */
+  --content-links-shadow: 0 1px 3px rgba(0, 0, 0, 0.14);
+  /* Under an image framed with `decor-shadow`: deeper than a table's, since a photograph is not a tint */
+  --content-image-shadow: 0 2px 4px rgba(0, 0, 0, 0.08), 0 6px 18px rgba(0, 0, 0, 0.14);
+
+  /* The box behind the tick of a done task-list item; the tick itself is white in both themes */
+  --content-tick: #5b616b;
+  /* -> And the empty box of an item still to do, white whatever surface the content sits on */
+  --content-tick-empty: #fff;
+
+  /*
+    The chain a steps block is drawn as (`block-steps`): the disc each step is numbered in, and the
+    line running from one disc to the next. The site's own colour, with the number on it in white.
+    Full strength, and the one place in content that spends the brand colour on a filled shape: the
+    discs are what a reader follows down a procedure, and at a tint they read as something the page
+    has greyed out rather than as its spine.
+
+    This is the disc's own colour -- the flat one under the grade the rule lays over it, and the far
+    end that grade arrives at. The lit end is `--color-primary-light`, which is the same mix the dark
+    theme lightens its links with, so a re-themed site carries both ends of it.
+
+    The line is that same colour at 60%, and derived from it rather than stated separately so the two
+    cannot drift into different blues: they are one shape, and a line in a second colour would read as
+    the discs being threaded onto something rather than as the run between them. Quieter than the
+    discs because it is the space between the steps -- at full strength it reads as a rule down the
+    margin, competing with the numbering it exists to join up.
+
+    One value for both themes, like the tick's white and the open tab's edge in `block-tabs`: a filled
+    shape is not writing, and does not need the lightening that keeps a link legible on a dark page.
+    It follows a re-themed site, `--color-primary` being the indirection every other brand colour here
+    goes through.
+  */
+  --content-step: var(--color-primary);
+  --content-step-line: color-mix(in srgb, var(--content-step) 60%, transparent);
+  /*
+    And the glow around a disc: the brand colour again, thrown a few pixels past the edge. One tight
+    layer and no offset -- this is light coming off the disc rather than the disc being lifted above
+    the page, which is what the table's and the links-list's two-layer drops below it are for.
+
+    Half strength and eight pixels is as far as it goes on a white page -- past that the halo starts to
+    read as a second ring around the disc, and the run of them down a long procedure turns into a row
+    of lamps rather than a chain of numbers. The dark theme takes it further; see the note there.
+  */
+  --content-step-glow: 0 0 8px color-mix(in srgb, var(--content-step) 50%, transparent);
+
+  /* Admonition hues: the bar and the wash behind it, per severity */
+  --content-info: #1867c0;
+  --content-info-wash: rgba(24, 103, 192, 0.08);
+  --content-success: #0f7b53;
+  --content-success-wash: rgba(15, 123, 83, 0.08);
+  --content-warning: #a35a00;
+  --content-warning-wash: rgba(163, 90, 0, 0.09);
+  --content-danger: #c02636;
+  --content-danger-wash: rgba(192, 38, 54, 0.08);
+  /*
+    A fifth hue, for `[!IMPORTANT]`: it sits between "worth knowing" and "watch out", which is exactly
+    the gap the other four leave. Purple because GitHub uses purple, and a reader who knows the marker
+    from there should recognise the colour here.
+  */
+  --content-important: #6f42c1;
+  --content-important-wash: rgba(111, 66, 193, 0.08);
+
+  /*
+    Code tokens, after GitHub's syntax themes.
+
+    The FALLBACK, for a site that has chosen no code theme: `App.vue` injects the highlight.js theme
+    picked under Admin → Theme, scoped to this same element, and being injected later it takes
+    precedence over everything below at equal weight. Without either, a code block would render as
+    uncoloured monospace, which is what it did before both halves existed.
+  */
+  --content-code-comment: #6a737d;
+  --content-code-keyword: #cf222e;
+  --content-code-string: #0a3069;
+  --content-code-number: #0550ae;
+  --content-code-title: #7c3aed;
+  --content-code-type: #953800;
+  --content-code-attr: #0550ae;
+  --content-code-meta: #57606a;
+  --content-code-addition: #1a7f37;
+  --content-code-addition-wash: rgba(26, 127, 55, 0.12);
+  --content-code-deletion: #cf222e;
+  --content-code-deletion-wash: rgba(207, 34, 46, 0.12);
+
+  color: var(--content-ink);
+  /*
+    Scaled by the reader's own Content Text Size setting (Profile -> Info), which `App.vue` sets as a
+    class on <body>. Only the article: the interface around it keeps its size, which is what makes
+    this different from zooming the browser. Headings and most of what is inside the article are set
+    in `em` and follow on their own; the few in `rem` that are TEXT (code, a code block's title) take
+    the same factor, while those that are furniture -- the heading anchor, the step discs, the copy
+    tooltip -- stay the size of the interface they belong to.
+  */
+  --content-scale: 1;
+  font-size: calc(1rem * var(--content-scale));
+
+  @at-root .body--text-large & {
+    --content-scale: 1.125;
+  }
+  @at-root .body--text-larger & {
+    --content-scale: 1.25;
+  }
+  /*
+    1.6, not the 1.7 the documentation platforms tend to set: at this measure the looser leading read
+    as gappy rather than airy, with the lines of a paragraph no longer holding together as a block.
+  */
+  line-height: 1.6;
+  /* -> A pasted URL or a long identifier wraps rather than widening the whole column */
+  overflow-wrap: break-word;
+
+  /*
+    Content never stacks above the app's own chrome. A block's internals are free to use whatever
+    z-indexes they need -- leaflet alone puts its panes at 400 and its controls at 800, and a shadow
+    root is not a stacking context, so those numbers land in whichever context the page provides.
+    Against the header's 20 the map won, and the search panel hanging off the header was drawn behind
+    it. Isolating here gives every block a ceiling of this element's own place in the page, whatever
+    it does inside.
+  */
+  isolation: isolate;
+
+  /*
+    The dark palette, and only where there is a lit screen to read it on.
+
+    `@media not print` rather than a print block that puts each of these back one at a time: this is
+    two dozen tokens and it grows, and the print block below would have to shadow every one of them --
+    at a higher specificity, since `.body--dark .page-contents` outranks this block -- or quietly print
+    whichever it had missed. It missed most of them: a page printed from the dark theme came out with
+    invisible table and code rules (white at 16% opacity, on white paper), the lighter link blue, and
+    the GitHub-dark syntax colours.
+
+    So the condition is stated once, here, where it is also the true one: this palette is for a screen
+    that emits light. Paper does not, and what it falls back to is the light palette declared above,
+    which is the one the print block below was written against.
+  */
+  @at-root .body--dark & {
+    @media not print {
+      --content-ink: rgba(255, 255, 255, 0.87);
+      --content-ink-muted: rgba(255, 255, 255, 0.62);
+      --content-ink-faint: rgba(255, 255, 255, 0.42);
+
+      /* -> The mid-tone brand blue is too dim on a dark surface; see `--color-primary-light` */
+      --content-link: var(--color-primary-light);
+      --content-link-broken: var(--color-red-3);
+      --content-h1: var(--color-primary-light);
+
+      --content-rule: rgba(255, 255, 255, 0.16);
+      --content-rule-strong: rgba(255, 255, 255, 0.32);
+      --content-h2-rule: rgba(255, 255, 255, 0.45);
+
+      /* Matches the app's own `dark-4` panel, so code sits a step above the page rather than below it */
+      --content-surface-code: #161b22;
+      --content-surface-alt: rgba(255, 255, 255, 0.07);
+
+      /*
+        The head keeps its colours -- see the light block -- but the shadow under the table cannot: a 5%
+        black drop is invisible on a dark page. Deepened, and no wider, so it still reads as the panel
+        being lifted rather than as a glow around it.
+      */
+      --content-table-shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 3px 10px rgba(0, 0, 0, 0.32);
+
+      /* -> Lifted off the page rather than sunk into it, which is the same intent as the light theme's
+            pair: the dark page is already darker than anything a row could be tinted towards */
+      --content-table-row: rgba(255, 255, 255, 0.02);
+      --content-table-row-alt: rgba(255, 255, 255, 0.055);
+
+      /* -> Back to `.card-header`'s own near end: on a dark page the bar reads as dark as it measures,
+            and the extra step the light theme needs would leave the head sitting above the page */
+      --content-table-head: #1e232a;
+
+      --content-mark: #6b5d13;
+
+      /* -> Lifted off the dark page, and mixed from the lighter blue for the same reason links are */
+      --content-links-row: rgba(255, 255, 255, 0.05);
+      --content-links-row-hover: color-mix(in srgb, var(--color-primary-light) 14%, transparent);
+      /* -> Barely there: on a dark page the same light that reads as a rounded top edge reads as a bar */
+      --content-links-sheen: rgba(255, 255, 255, 0.045);
+      /* -> Deepened, and no wider, for the reason the table's is: a 7% black drop is invisible here */
+      --content-links-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+      --content-image-shadow: 0 2px 4px rgba(0, 0, 0, 0.4), 0 6px 18px rgba(0, 0, 0, 0.45);
+
+      /*
+        Lighter than the light theme's, because the box has to be seen against a dark page -- but held
+        well below the white of the tick on it, which is what makes the tick readable.
+      */
+      --content-tick: rgba(255, 255, 255, 0.38);
+      /* -> A white box would be a lit square on a dark page; the empty one is just its outline */
+      --content-tick-empty: transparent;
+
+      /*
+        The glow, which is the one thing here that has to be MORE than its light-theme self.
+
+        A glow is only ever the difference between it and what it sits on, and on a dark page the
+        mid-tone brand blue has almost none to spend: at the light theme's strength it was a halo
+        nobody could see. So it takes the lighter mix, for the same reason links and the page title do
+        -- and then goes up rather than down, because it is spreading light on a surface that gives it
+        room, where on white it was competing with a page already at full brightness.
+
+        The disc itself keeps the plain brand colour, as a filled shape it is read against rather than
+        through.
+      */
+      --content-step-glow: 0 0 10px color-mix(in srgb, var(--color-primary-light) 70%, transparent);
+
+      --content-info: #6ab0ff;
+      --content-info-wash: rgba(106, 176, 255, 0.12);
+      --content-success: #4ecf9a;
+      --content-success-wash: rgba(78, 207, 154, 0.12);
+      --content-warning: #f3b661;
+      --content-warning-wash: rgba(243, 182, 97, 0.12);
+      --content-danger: #ff8b8b;
+      --content-danger-wash: rgba(255, 139, 139, 0.12);
+      --content-important: #c4a7ff;
+      --content-important-wash: rgba(196, 167, 255, 0.12);
+
+      --content-code-comment: #8b949e;
+      --content-code-keyword: #ff7b72;
+      --content-code-string: #a5d6ff;
+      --content-code-number: #79c0ff;
+      --content-code-title: #d2a8ff;
+      --content-code-type: #ffa657;
+      --content-code-attr: #79c0ff;
+      --content-code-meta: #8b949e;
+      --content-code-addition: #56d364;
+      --content-code-addition-wash: rgba(46, 160, 67, 0.15);
+      --content-code-deletion: #ffa198;
+      --content-code-deletion-wash: rgba(248, 81, 73, 0.15);
+    }
+  }
+
+  /* -> The page's own margins are the container's business; the first and last block give theirs up */
+  > :first-child {
+    margin-top: 0;
+  }
+  > :last-child {
+    margin-bottom: 0;
+  }
+
+  // ---------------------------------------------------------------------------
+  // HEADINGS
+  // ---------------------------------------------------------------------------
+
+  /*
+    Space belongs ABOVE a heading, several times what sits below it: that asymmetry is what visibly
+    binds a heading to its own section instead of leaving it floating between two.
+
+    The margins are in `em`, so each level's gap scales with its own size -- which is what keeps the
+    run of them descending (h1 40px, h2 34px, h3 30px, and so on down) rather than a deeper heading
+    ending up with more room above it than the one it sits under.
+  */
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    margin: 1.5em 0 0.6em;
+    font-weight: 600;
+    line-height: 1.3;
+    /*
+      Anchors are what the contents sidebar and every `#heading` link aim at, and the article scrolls
+      in its own column inside a fixed shell -- so a heading brought into view needs to stop clear of
+      the column's top edge rather than flush against it.
+    */
+    scroll-margin-top: 1.25rem;
+  }
+
+  /*
+    A rule under the two top levels, which is what makes the sections of a long page findable. Both
+    fade out to the right; the title's is the site's colour and the section's a grey, and the title's
+    is the thicker of the two, so the two levels stay apart at a glance.
+
+    Drawn as a pseudo-element rather than a border, because a border can be neither a gradient nor
+    wider than its own box -- and the title's is both. Each level supplies its own weight and colour
+    through the two properties below, so the mechanism is stated once.
+  */
+  h1,
+  h2 {
+    position: relative;
+    /* -> Close under the text: the rule belongs to the heading, not to the space after it */
+    padding-bottom: 0.1em;
+
+    &::after {
+      content: '';
+      position: absolute;
+      inset-inline-end: 0;
+      bottom: 0;
+      /* -> Only a top-level title reaches past the text column; see the override below */
+      inset-inline-start: 0;
+      height: var(--content-heading-rule-weight);
+      background-image: linear-gradient(to right, var(--content-heading-rule-color), transparent);
+    }
+  }
+
+  /*
+    Fading out towards the end of the line, which on a right-to-left page is the left -- a gradient has
+    no logical direction to say that with.
+
+    An attribute test rather than `:dir(rtl)`, which the build lowers to a list of `:lang()` selectors:
+    a guess from the language, where what decides is the direction the element was given. Both shapes,
+    because the attribute is on this element in the page view and on the one around it in the visual
+    editor, where ProseMirror owns the element carrying the class.
+  */
+  &[dir='rtl'],
+  [dir='rtl'] & {
+    h1::after,
+    h2::after {
+      background-image: linear-gradient(to left, var(--content-heading-rule-color), transparent);
+    }
+  }
+
+  h1 {
+    --content-heading-rule-weight: 2px;
+    --content-heading-rule-color: var(--content-h1-rule);
+
+    /* -> Less than the 1.5em its size would give it, which at 32px was a gap of over 50px */
+    margin-top: 1.25em;
+    color: var(--content-h1);
+    font-size: 2em;
+    letter-spacing: -0.015em;
+
+    /*
+      A step down on a phone, where 32px of display type is a fifth of the column's width and a long
+      title wraps to three lines before the article has started.
+
+      28px rather than further: it has to stay clearly above the 1.5em (24px) of the h2 under it, or the
+      two top levels stop reading as two -- and only this level moves, so the rest of the ramp descends
+      from a shorter first step rather than being redrawn.
+    */
+    @media (max-width: $breakpoint-xs-max) {
+      font-size: 1.75em;
+    }
+  }
+
+  h2 {
+    --content-heading-rule-weight: 1px;
+    --content-heading-rule-color: var(--content-h2-rule);
+
+    /* -> A shade under the shared 1.5em, so it stays clear of the h1 above it in the ramp */
+    margin-top: 1.4em;
+    font-size: 1.5em;
+    letter-spacing: -0.01em;
+
+    /*
+      Down with the h1 on a phone, and by the same proportion, so the two top levels keep the distance
+      between them: 28px over 22px reads as a title over its sections, where 28 over 24 had them almost
+      level.
+
+      It closes to within 2px of the h3 below, which is further than the ramp would otherwise allow --
+      but a section heading is the one level that is also RULED, and a grey rule fading out across the
+      column separates it from a plain heading far more than two points of type ever did.
+    */
+    @media (max-width: $breakpoint-xs-max) {
+      font-size: 1.375em;
+    }
+  }
+
+  /*
+    The title's rule alone starts at the sidebar rather than at the text, reaching `--content-bleed`
+    back through the container's padding -- and only when the title is the page's own, not one nested
+    in a quote or a list item.
+  */
+  > h1::after {
+    inset-inline-start: calc(-1 * var(--content-bleed));
+  }
+
+  h3 {
+    font-size: 1.25em;
+  }
+  h4 {
+    font-size: 1.0625em;
+  }
+  h5 {
+    font-size: 1em;
+  }
+  /*
+    The pilcrow that copies a link to a heading, added by `helpers/renderedContent.js`.
+
+    At the far right of the heading's box rather than trailing its text: a marker that moves with the
+    words is hard to aim at and drags the eye along the line, where a fixed right edge is somewhere the
+    pointer can go straight to. The heading reserves its width as padding, which the button then sits
+    in, so a long heading's text cannot run underneath it.
+
+    Hidden with `opacity` so it stays reachable by keyboard, and revealed on focus as well as on hover.
+  */
+  h1[data-heading-anchor],
+  h2[data-heading-anchor],
+  h3[data-heading-anchor],
+  h4[data-heading-anchor],
+  h5[data-heading-anchor],
+  h6[data-heading-anchor] {
+    position: relative;
+    /* -> In `rem` to match the button it reserves room for, which no longer scales with the heading */
+    padding-inline-end: 2.25rem;
+  }
+
+  .heading-anchor {
+    position: absolute;
+    /*
+      Centred on the heading's own box, which for a heading on one line -- nearly all of them -- is the
+      middle of its text. Aligning to the first line instead needs that line's height, and neither unit
+      that looks like it would give it does: `em` and `lh` in here both resolve against the BUTTON, so
+      they follow the glyph's size rather than the heading's.
+    */
+    top: 50%;
+    inset-inline-end: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    /*
+      Sized in `rem`, so the control is the same on an h1 as on an h6: scaling it with the heading made
+      it a heavy mark on a title and an unaimable one further down.
+    */
+    width: 2rem;
+    height: 2rem;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--content-ink-faint);
+    /* -> The pilcrow reads small for its point size, so it is set larger than the body text, not smaller */
+    font-size: 1.375rem;
+    font-weight: 400;
+    /* -> The heading's own tracking would space a single glyph away from its box */
+    letter-spacing: normal;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0;
+    transform: translateY(-50%);
+    transition:
+      opacity 0.15s var(--ease-standard),
+      color 0.15s var(--ease-standard);
+
+    &:hover {
+      color: var(--content-link);
+    }
+
+    &.is-copied {
+      color: var(--content-success);
+      opacity: 1;
+    }
+
+    /*
+      Its own tooltip, since the pilcrow says nothing on its own about what pressing it does. Built as a
+      pseudo-element rather than with `WTooltip`, which is a component and so out of reach of a control
+      assembled in script -- the look is copied from it. It opens to the LEFT because the button sits at
+      the right edge of the column, where a bubble would otherwise be clipped by the scroll container.
+    */
+    &::after {
+      content: attr(data-tooltip);
+      position: absolute;
+      top: 50%;
+      inset-inline-end: calc(100% + 4px);
+      padding: 0.125rem 0.5rem;
+      border-radius: 4px;
+      background-color: rgb(0 0 0 / 0.85);
+      color: #fff;
+      font-size: 0.75rem;
+      line-height: 1.4;
+      white-space: nowrap;
+      opacity: 0;
+      transform: translateY(-50%);
+      transition: opacity 0.15s var(--ease-standard);
+      pointer-events: none;
+    }
+
+    &:hover::after,
+    &:focus-visible::after {
+      opacity: 1;
+    }
+  }
+
+  [data-heading-anchor]:hover > .heading-anchor,
+  .heading-anchor:focus-visible {
+    opacity: 1;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .heading-anchor {
+      transition-duration: 0.01ms;
+    }
+  }
+
+  /* The last level reads as a label rather than a title; there is no room left to go smaller */
+  h6 {
+    font-size: 0.875em;
+    color: var(--content-ink-muted);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+
+  // ---------------------------------------------------------------------------
+  // TEXT
+  // ---------------------------------------------------------------------------
+
+  p {
+    margin: 0 0 1.15em;
+  }
+
+  strong,
+  b {
+    font-weight: 600;
+  }
+
+  small {
+    font-size: 0.875em;
+    color: var(--content-ink-muted);
+  }
+
+  mark {
+    padding: 0.05em 0.15em;
+    border-radius: 2px;
+    background-color: var(--content-mark);
+    color: inherit;
+  }
+
+  del {
+    color: var(--content-ink-muted);
+  }
+
+  ins,
+  u {
+    text-decoration-color: var(--content-rule-strong);
+    text-underline-offset: 2px;
+  }
+
+  /* Marked up by the renderer's `abbr` plugin: the definition is in the title, so say it is there */
+  abbr[title] {
+    text-decoration: underline dotted;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 3px;
+    cursor: help;
+  }
+
+  sub,
+  sup {
+    font-size: 0.75em;
+    line-height: 0;
+  }
+
+  /* Inserted by the editor's keyboard-key button, and by hand in HTML */
+  kbd {
+    display: inline-block;
+    min-width: 1.6em;
+    padding: 0.1em 0.4em;
+    border: 1px solid var(--content-rule-strong);
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    background-color: var(--content-surface-alt);
+    color: var(--content-ink);
+    font-family: var(--font-mono);
+    font-size: 0.8125em;
+    line-height: 1.5;
+    text-align: center;
+    white-space: nowrap;
+  }
+
+  // ---------------------------------------------------------------------------
+  // LINKS
+  // ---------------------------------------------------------------------------
+
+  /*
+    The same `--color-primary` the page title is drawn in -- literally the same token, resolving to the
+    same value in both themes. What made a link look like a paler blue than the title is stroke weight:
+    the title is 600 at 32px and a link is body text, so the same hue covers far fewer pixels and lets
+    more of the page through. A medium weight puts the two back on equal footing without touching the
+    colour, which is what keeps a re-themed site's links and titles in step.
+  */
+  a {
+    color: var(--content-link);
+    font-weight: 500;
+    text-decoration: none;
+
+    &:hover,
+    &:focus-visible {
+      text-decoration: underline;
+      text-decoration-thickness: 1px;
+      text-underline-offset: 2px;
+    }
+
+    /*
+      The reader's Underline Links setting (Profile -> Info): a link marked by colour alone is the one
+      thing a colour vision deficiency cannot be adjusted around. Under `:where()` so the class adds no
+      specificity -- the links that are deliberately not underlined because their shape already says
+      what they are (a footnote number, a row of a links list) keep saying so.
+    */
+    :where(.body--underline-links) & {
+      text-decoration: underline;
+      text-decoration-thickness: 1px;
+      text-underline-offset: 2px;
+    }
+
+    /*
+      A link that leaves the wiki says so.
+
+      Marked with the class the renderer attaches (see `renderers/markdown.js`), because whether an href
+      is off-site is a question about its host, which no selector can ask. The mark is a masked SVG so
+      it takes the link's own colour and needs no icon font -- the app ships none.
+    */
+    &.is-external-link::after {
+      content: '';
+      display: inline-block;
+      /* -> Sized in `em`, so it keeps its proportion to the words wherever the link sits */
+      width: 0.8em;
+      height: 0.8em;
+      margin-inline-start: 0.25em;
+      background-color: currentColor;
+      /* -> Subordinate to the words: a marker, not a second link */
+      opacity: 0.7;
+      mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M14 3v2h3.59l-9.83 9.83l1.41 1.41L19 6.41V10h2V3m-2 16H5V5h7V3H5c-1.11 0-2 .9-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7h-2z'/%3E%3C/svg%3E");
+      mask-repeat: no-repeat;
+      mask-size: contain;
+      vertical-align: baseline;
+    }
+
+    /*
+      A glossary term (`helpers/glossaryLinker.js`): linked automatically, or written by hand as
+      `?glossary=<term>`. Drawn as `abbr[title]` above is -- the words in the paragraph's own ink, a
+      dotted line under them saying there is a definition here -- rather than as a link, which a
+      paragraph full of terms would otherwise turn into. The line takes the link colour, so it reads as
+      somewhere to go; solid under the pointer or the keyboard, as a link's underline appears.
+
+      After the Underline Links rule, and more specific than it: a term is underlined either way, and
+      dotted is what tells it apart from the links around it.
+    */
+    &.glossary-term {
+      color: inherit;
+      font-weight: inherit;
+      text-decoration: underline dotted;
+      text-decoration-color: var(--content-link);
+      text-decoration-thickness: 1px;
+      text-underline-offset: 3px;
+      cursor: help;
+
+      &:hover,
+      &:focus-visible {
+        text-decoration-style: solid;
+      }
+    }
+
+    /*
+      A link to a page that does not exist -- a red link, which is how a wiki shows what still needs
+      writing.
+
+      The class is on the anchor in every stored render, put there by the server whenever the page is
+      saved or the page it points at comes or goes (`pageLinks.syncBrokenLinks`). Whether it is drawn
+      is the site's Colorize Broken Links setting, which is `has-red-links` on the container: kept
+      apart so the setting can change without a single render being rewritten.
+    */
+    @at-root .page-contents.has-red-links a.is-broken-link {
+      color: var(--content-link-broken);
+    }
+
+    /* -> A link wrapping code keeps the link's colour, not the code span's */
+    code {
+      color: inherit;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // LISTS
+  // ---------------------------------------------------------------------------
+
+  ul,
+  ol {
+    margin: 0 0 1.15em;
+    padding-inline-start: 1.6em;
+  }
+
+  ul {
+    list-style: disc;
+  }
+  ol {
+    list-style: decimal;
+  }
+
+  /* Depth is legible from the marker as well as the indent, as an outline should be */
+  ul ul {
+    list-style: circle;
+  }
+  ul ul ul {
+    list-style: square;
+  }
+  ol ol {
+    list-style: lower-alpha;
+  }
+  ol ol ol {
+    list-style: lower-roman;
+  }
+
+  li {
+    margin-top: 0.35em;
+
+    &::marker {
+      color: var(--content-ink-faint);
+    }
+
+    /* A nested list belongs to the item above it, so it sits closer than a sibling item does */
+    > ul,
+    > ol {
+      margin: 0.35em 0 0;
+    }
+
+    /*
+      A one-paragraph item is tight against its marker; a multi-paragraph item spaces its own
+      paragraphs. Markdown produces either shape depending on whether the list is "loose".
+    */
+    > p {
+      margin: 0;
+
+      + p {
+        margin-top: 0.6em;
+      }
+    }
+  }
+
+  /*
+    Task lists lose their markers: the checkbox IS the marker. The box is the renderer's own disabled
+    input, so it is coloured rather than replaced -- `accent-color` is all that takes, and it needs no
+    icon font, which is what the treatment this replaces depended on.
+  */
+  .contains-task-list {
+    padding-inline-start: 0;
+    list-style: none;
+
+    .contains-task-list {
+      padding-inline-start: 1.6em;
+    }
+  }
+
+  /*
+    Laid out inline rather than as a flex row: a task item can contain a nested list, and as a flex
+    child that list would sit BESIDE the text instead of under it.
+
+    Drawn here rather than left to the browser, and NOT with `accent-color`: the renderer marks these
+    inputs disabled, and a disabled checkbox ignores `accent-color` entirely -- Chrome paints it its
+    own washed-out grey, which is the pale tick this replaces. `appearance: none` is what gets the
+    box back under this stylesheet's control; the tick then has to be drawn too, since the one the
+    browser supplies goes with the appearance.
+  */
+  .task-list-item-checkbox {
+    /*
+      The prefixed form is for Safari before 15.4, which is the last engine that will not take the
+      unprefixed one -- and which without it draws its own rounded box UNDER these rules, so the
+      border and the fill land on a control that is still the platform's.
+    */
+    -webkit-appearance: none;
+    appearance: none;
+    /* -> So the box measures 1em in every engine rather than 1em plus whatever the UA pads it by */
+    box-sizing: border-box;
+    width: 1em;
+    height: 1em;
+    /* -> Firefox gives a checkbox 3px of its own margin, Chrome 3px 3px 3px 4px */
+    margin: 0 0.5em 0 0;
+    padding: 0;
+    border: 1px solid var(--content-rule-strong);
+    border-radius: 3px;
+    /* -> White rather than the surface behind it, so the box reads as empty and not as unfilled */
+    background-color: var(--content-tick-empty);
+    /* -> Disabled by the renderer, so it must not read as something to try to click */
+    cursor: default;
+    /* -> Safari and Firefox both dim a disabled control; here it is a mark, not a dead input */
+    opacity: 1;
+    vertical-align: -0.1em;
+
+    /*
+      A done item: a filled box with the tick laid over it. White in both themes -- the dark theme
+      lightens the box rather than the tick, so this one mark works on either.
+    */
+    &:checked {
+      border-color: transparent;
+      background-color: var(--content-tick);
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='none' stroke='%23fff' stroke-width='3.2' stroke-linecap='round' stroke-linejoin='round' d='M5 12.5l4.5 4.5L19 7'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: center;
+      background-size: 0.8em 0.8em;
+      /* -> Print drops background fills, and a done item that prints as an empty box says the opposite */
+      print-color-adjust: exact;
+      -webkit-print-color-adjust: exact;
+    }
+  }
+
+  /*
+    The renderer leaves the raw marker behind the checkbox -- `<input><span>x</span> text` -- so the
+    box would otherwise be followed by a literal "x" or a stray space. The box says the same thing.
+  */
+  .task-list-item > .task-list-item-checkbox + span {
+    display: none;
+  }
+
+  /*
+    A LIST OF LINKS, from `{.links-list}` on a bulleted list -- carried over from 2.x, where it is what
+    the guide pages are built out of:
+
+        - [The Basics *New to Wiki.js? Learn how to use it and create your first page.*](/guide/intro)
+        - [Using Editors *Learn how to use the various editors.*](/editors)
+        {.links-list}
+
+    Each item becomes a row rather than a bullet: the title in the link's colour, the emphasis after it
+    read as a description and set upright in the body colour, with a rule between the two. The class
+    reaches the list through `markdown-it-attrs`, which is why nothing in the renderer knows about this.
+
+    Bulleted lists only. `{.links-list}` sticks to an ordered list just as readily, and there it would
+    be a numbered list of links with its numbers taken away -- which is a list the author asked for and
+    would no longer be looking at.
+  */
+  ul.links-list {
+    margin: 1.5em 0;
+    padding-inline-start: 0;
+    list-style: none;
+
+    > li {
+      margin-top: 4px;
+      border-radius: 4px;
+      /*
+        The bar down the start edge, grey at rest and the link's colour under the pointer -- so what hovering
+        does is colour something already there rather than add a bar and shunt the words sideways.
+      */
+      border-inline-start: 3px solid var(--content-rule);
+      background-color: var(--content-links-row);
+      /* -> The light down the top of the row; see `--content-links-sheen` */
+      background-image: linear-gradient(to bottom, var(--content-links-sheen), transparent 65%);
+      box-shadow: var(--content-links-shadow);
+      transition:
+        background-color 0.15s var(--ease-standard),
+        border-color 0.15s var(--ease-standard);
+
+      &:hover,
+      &:focus-within {
+        border-inline-start-color: var(--content-link);
+        background-color: var(--content-links-row-hover);
+      }
+    }
+
+    /*
+      The padding is the link's, so the whole row is the target rather than just the words in it. A
+      loose list -- one written with blank lines between its items -- wraps each item in a paragraph
+      first, which is why the link is reached through both shapes.
+    */
+    > li > a,
+    > li > p > a {
+      display: block;
+      padding: 0.6em 0.9em;
+      font-weight: 600;
+
+      &:hover,
+      &:focus-visible {
+        text-decoration: none;
+      }
+    }
+
+    /* -> An item still being typed, with no link in it yet, is a row all the same */
+    > li:not(:has(> a, > p > a)) {
+      padding: 0.6em 0.9em;
+      color: var(--content-ink-muted);
+    }
+
+    /*
+      The description. Upright and in the body colour: it is a second voice in the row, not emphasis
+      within the title -- and italic at this length is what makes the difference between a caption and
+      a line of small print.
+    */
+    em {
+      margin-inline-start: 0.5em;
+      padding-inline-start: 0.75em;
+      border-inline-start: 1px solid var(--content-rule);
+      color: var(--content-ink-muted);
+      font-style: normal;
+      font-weight: 400;
+    }
+
+    /*
+      On a phone the two halves stack. The rule between them goes with the arrangement it was drawn
+      for: down the left of a wrapped description it would read as a quote inside the row.
+    */
+    @media (max-width: $breakpoint-xs-max) {
+      em {
+        margin-inline-start: 0;
+        padding-inline-start: 0;
+        border-inline-start: 0;
+        font-size: 0.9375em;
+      }
+
+      /*
+        -> A line break rather than a block, so that what follows the description on the row -- the
+           marker on an external link is the one thing that does -- stays on its last line instead of
+           dropping to one of its own.
+      */
+      em::before {
+        content: '\a';
+        white-space: pre;
+      }
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    ul.links-list > li {
+      transition-duration: 0.01ms;
+    }
+  }
+
+  /*
+    Steps: a list inside `::block-steps`.
+
+    Every item is numbered in a disc of its own with a line running from one disc down to the next, so
+    that a procedure reads as one path through the page rather than as a list that happens to be
+    numbered. The block is the whole of the syntax -- the content is an ordinary markdown list, which
+    is what lets a step hold anything a list item can hold: paragraphs, a code sample, an admonition,
+    another block.
+
+    Here rather than in `blocks/block-steps`, which draws none of this and has no shadow root at all.
+    The list belongs to the author and is page content like any other, so it is styled by this file --
+    and a list slotted into a shadow root would be out of reach anyway, since its `<li>` elements sit
+    two levels below the host and `::slotted()` reaches only one. The same reasoning `block-tab`'s
+    print rules give, and the same arrangement.
+
+    Ordered or unordered: the numbering is the block's own counter either way, since what is being
+    said is that these are steps and there is a first one. Only the outermost list, so a list nested
+    inside a step is an ordinary list and keeps its markers.
+  */
+  block-steps {
+    /*
+      The disc is exactly one line tall -- `line-height` is 1.6 on this element and the body text is
+      1rem -- which is what puts it on the first line of its step by construction, rather than by a
+      nudge that would have to be re-measured every time the leading moved.
+    */
+    --content-step-size: 1.6rem;
+
+    display: block;
+
+    > ol,
+    > ul {
+      /*
+        Half a disc of indent, so the discs hang off the start edge of the text column the way a
+        marker does, and the step's own content lines up close to where a list's would (1.7rem
+        against a list's 1.6em). The markers themselves go: the number is on the disc.
+      */
+      margin-inline-start: calc(var(--content-step-size) / 2);
+      padding-inline-start: 0;
+      list-style: none;
+      counter-reset: wiki-step;
+    }
+
+    > ol > li,
+    > ul > li {
+      position: relative;
+      /*
+        A step is spaced by what it leaves BELOW it rather than above, so that the gap between two
+        steps is inside the first of them -- which is the length the line has to run down. The
+        margin an item would otherwise carry goes, for the same reason: it would be a gap in the
+        line, outside either step and drawable by neither.
+      */
+      margin-top: 0;
+      padding-bottom: 1.4em;
+      padding-inline-start: calc(var(--content-step-size) / 2 + 0.9rem);
+      counter-increment: wiki-step;
+    }
+
+    > ol > li:last-child,
+    > ul > li:last-child {
+      padding-bottom: 0;
+    }
+
+    /* The disc, straddling the line the steps hang off */
+    > ol > li::before,
+    > ul > li::before {
+      content: counter(wiki-step);
+      position: absolute;
+      top: 0;
+      inset-inline-start: calc(var(--content-step-size) / -2);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: var(--content-step-size);
+      height: var(--content-step-size);
+      border-radius: 50%;
+      /*
+        Lit from the top left, the way a small round thing catches light -- which is what makes a disc
+        read as a bead on the line rather than as a flat dot printed over it. The flat colour stays
+        underneath: a gradient is a background IMAGE, so anything that drops one (a very old engine, a
+        forced-colours mode) still gets a disc in the brand colour rather than a white hole with a
+        white number in it.
+      */
+      background-color: var(--content-step);
+      background-image: linear-gradient(
+        to bottom right,
+        var(--color-primary-light),
+        var(--content-step)
+      );
+      box-shadow: var(--content-step-glow);
+      /* -> White in both themes, the way a done task item's tick is: it is read against the disc it
+            sits on and never against the page */
+      color: #fff;
+      /*
+        In `rem`, so that the digits are the same size on every disc: a step that opens with a heading
+        or with small print would otherwise number itself in that step's font size. Tabular figures
+        so 9 and 10 sit in the same place on their discs.
+      */
+      font-size: 0.8rem;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /*
+      And the line between one disc and the next, drawn from the bottom of this step's disc to the
+      bottom of the step itself -- which is exactly where the next disc starts, the steps having no
+      margin between them. Not as a border down the side of the item, which is the shorter way to say
+      it and would show through the disc: the fill is a wash, so whatever is behind it is still there
+      to be seen.
+
+      A border rather than a background, so that it prints -- see the note on `h1::after` further
+      down: a print dialog leaves background graphics off by default. Half a hairline outwards,
+      which is what centres it under the discs above and below it.
+    */
+    > ol > li::after,
+    > ul > li::after {
+      content: '';
+      position: absolute;
+      top: var(--content-step-size);
+      bottom: 0;
+      inset-inline-start: -0.5px;
+      border-inline-start: 1px solid var(--content-step-line);
+    }
+
+    /* -> Nothing below the last step for a line to reach */
+    > ol > li:last-child::after,
+    > ul > li:last-child::after {
+      content: none;
+    }
+  }
+
+  /*
+    Definition lists, from the `term` / `: definition` notation (`markdown-it-deflist`).
+
+    Drawn as a term in the heading weight with its definitions indented under it, which is the
+    treatment every documentation platform has settled on -- and deliberately NOT with a rule down
+    the left of the definition: in this stylesheet a left bar means a quote, and the links-list
+    description a few rules up gives up its own rule on a phone for exactly that reason.
+
+    The indent is the one `ul` and `ol` use and the spacing is `li`'s, so a definition list sitting
+    between two ordinary lists lines up with them rather than reading as a different kind of thing.
+  */
+  dl {
+    margin: 0 0 1.15em;
+  }
+
+  dt {
+    margin-top: 1em;
+    font-weight: 600;
+
+    /* -> The first term opens the list; the space above it belongs to whatever came before */
+    &:first-child {
+      margin-top: 0;
+    }
+  }
+
+  dd {
+    /* -> Also what separates two definitions of the same term, which markdown allows */
+    margin: 0.35em 0 0 1.6em;
+
+    /*
+      A one-paragraph definition is tight; a multi-paragraph one spaces its own paragraphs. Markdown
+      produces either shape depending on whether the list is "loose", exactly as it does for `li`.
+    */
+    > p {
+      margin: 0;
+
+      + p {
+        margin-top: 0.6em;
+      }
+    }
+
+    /* A list inside a definition belongs to it, so it sits closer than a sibling would */
+    > ul,
+    > ol {
+      margin: 0.35em 0 0;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // QUOTES AND ADMONITIONS
+  // ---------------------------------------------------------------------------
+
+  /*
+    A quote is a bar and a colour change, nothing more -- a box would compete with the code blocks and
+    admonitions that are meant to stand out.
+  */
+  blockquote {
+    margin: 1.5em 0;
+    padding-block: 0.15em;
+    padding-inline: 1.15em 0;
+    border-inline-start: 3px solid var(--content-rule-strong);
+    color: var(--content-ink-muted);
+
+    > :last-child {
+      margin-bottom: 0;
+    }
+
+    /*
+      Who the quote is from -- `> [name=John Doe]`, which `renderers/modules/blockquote-author.js`
+      turns into this line at the top of the quote: a dash, a person icon and the name. Close above the
+      text it attributes rather than a paragraph's distance from it, and fainter than the quote itself,
+      all of it: a byline sits behind the words it introduces. The name keeps its weight, which is what
+      still picks it out of the line.
+
+      The icon is matched as either form it takes: the `<iconify-icon>` the renderer writes, which the
+      editor's preview draws, and the `<svg>` the server swaps it for on save -- sized the way the
+      generic icon rules below size each, the element by its `font-size` and the drawing by its box.
+
+      Sat on the BASELINE rather than centred on the line. `mdi:user` is drawn in rows 4 to 20 of its
+      24, a small head over broad shoulders, so a centred box put the shoulders below the baseline and
+      the whole icon read as sitting lower than the name beside it. Dropping the box by the sixth of
+      it that is empty below the drawing puts the shoulders on the baseline, with the head at about
+      cap height. The figure is that icon's own geometry; another icon would want its own.
+    */
+    > .blockquote-author {
+      margin-bottom: 0.35em;
+      color: var(--content-ink-faint);
+      font-size: 0.9em;
+
+      // -> Closer to the dash than to the name: the dash and the icon read as one mark
+      > iconify-icon,
+      > svg.icon {
+        margin-inline: 0.15em 0.4em;
+      }
+
+      // -> `em` in `vertical-align` is the element's own font size, which here is the icon's size
+      > iconify-icon {
+        font-size: 1.15em;
+        vertical-align: calc(-1em / 6);
+      }
+
+      // -> An `<svg>` keeps the line's font size, so the drop is worked out from the box instead
+      > svg.icon {
+        width: 1.15em;
+        height: 1.15em;
+        vertical-align: calc(-1.15em / 6);
+      }
+    }
+
+    .blockquote-author-name {
+      font-weight: 600;
+    }
+  }
+
+  /*
+    Admonitions, from `{.is-info}` and friends on a blockquote -- and from a GitHub-style `> [!NOTE]`,
+    which `renderers/modules/github-alerts.js` turns into the very same classes plus a label.
+
+    A wash, a heavier bar and an icon: colour alone would leave the kinds indistinguishable to a
+    reader who cannot separate the hues, and the icon is a masked SVG rather than a glyph so it needs
+    no webfont -- the app dropped those, which is why the markers here used to render as tofu.
+  */
+  /*
+    Matched on the quote itself and on a quote CONTAINING the class, because where the class lands
+    depends on how it was attached: raw HTML puts it on the blockquote, while an attribute written in
+    markdown attaches to whichever node the plugin resolves it against -- often the paragraph inside.
+  */
+  blockquote {
+    &.is-info,
+    &:has(> .is-info),
+    &.is-success,
+    &:has(> .is-success),
+    &.is-important,
+    &:has(> .is-important),
+    &.is-warning,
+    &:has(> .is-warning),
+    &.is-danger,
+    &:has(> .is-danger) {
+      position: relative;
+      padding-block: 0.9em;
+      padding-inline: 3.1em 1.1em;
+      border-inline-start-width: 4px;
+      /* -> Square where the bar is, round on the far side */
+      border-radius: 6px;
+      border-start-start-radius: 0;
+      border-end-start-radius: 0;
+      color: var(--content-ink);
+
+      &::before {
+        content: '';
+        position: absolute;
+        /*
+          Centred on the CAP BAND of the first line, not on the line box that holds it.
+
+          A line box is ascent plus descent, and a title like "Note" or "Caution" inks only the part
+          between the cap line and the baseline -- so an icon centred on the line came out a pixel high,
+          and at this size that reads as its bottom edge running flush with the baseline while its top
+          towers over the capitals. Which is why the warning triangle looked right and nothing else did:
+          its mass is all at the base, so a bottom-flush box still reads as balanced.
+
+          `0.9em` is the padding above the first line, `0.79em` the middle of the cap band within it
+          (half-leading plus ascent, less half the cap height, for the app's Roboto at 1.6 line-height),
+          and `0.625em` half the icon.
+        */
+        top: calc(0.9em + 0.79em - 0.625em);
+        inset-inline-start: 1.1em;
+        width: 1.25em;
+        height: 1.25em;
+        background-color: currentColor;
+        mask-repeat: no-repeat;
+        mask-size: contain;
+      }
+
+      /* -> The icon takes the severity's colour; the prose stays at full contrast to read well */
+      > :last-child {
+        margin-bottom: 0;
+      }
+
+      /*
+        The label a GitHub-style alert opens with -- "Note", "Tip" -- standing in for the marker the
+        author typed. In the severity's own colour, since it is naming the severity, and close above
+        the text it introduces rather than a paragraph's distance from it.
+      */
+      > .alert-title {
+        margin-bottom: 0.3em;
+        color: var(--alert-hue);
+        font-weight: 600;
+      }
+
+      code {
+        background-color: var(--content-surface-alt);
+      }
+    }
+
+    &.is-info,
+    &:has(> .is-info) {
+      --alert-hue: var(--content-info);
+
+      border-inline-start-color: var(--content-info);
+      background-color: var(--content-info-wash);
+
+      &::before {
+        color: var(--content-info);
+        mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M13 9h-2V7h2m0 10h-2v-6h2m-1-9A10 10 0 0 0 2 12a10 10 0 0 0 10 10a10 10 0 0 0 10-10A10 10 0 0 0 12 2'/%3E%3C/svg%3E");
+      }
+    }
+
+    &.is-success,
+    &:has(> .is-success) {
+      --alert-hue: var(--content-success);
+
+      border-inline-start-color: var(--content-success);
+      background-color: var(--content-success-wash);
+
+      &::before {
+        color: var(--content-success);
+        mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10s10-4.5 10-10S17.5 2 12 2m-2 15l-5-5l1.41-1.41L10 14.17l7.59-7.59L19 8z'/%3E%3C/svg%3E");
+      }
+    }
+
+    /* -> `mdi:message-alert`, the same speech bubble GitHub marks an important note with */
+    &.is-important,
+    &:has(> .is-important) {
+      --alert-hue: var(--content-important);
+
+      border-inline-start-color: var(--content-important);
+      background-color: var(--content-important-wash);
+
+      &::before {
+        color: var(--content-important);
+        mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M13 11h-2V5h2m0 10h-2v-2h2m7-11H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2'/%3E%3C/svg%3E");
+      }
+    }
+
+    &.is-warning,
+    &:has(> .is-warning) {
+      --alert-hue: var(--content-warning);
+
+      border-inline-start-color: var(--content-warning);
+      background-color: var(--content-warning-wash);
+
+      &::before {
+        color: var(--content-warning);
+        mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M13 14h-2V9h2m0 9h-2v-2h2M1 21h22L12 2z'/%3E%3C/svg%3E");
+      }
+    }
+
+    &.is-danger,
+    &:has(> .is-danger) {
+      --alert-hue: var(--content-danger);
+
+      border-inline-start-color: var(--content-danger);
+      background-color: var(--content-danger-wash);
+
+      &::before {
+        color: var(--content-danger);
+        mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M19 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2m-3.4 14L12 13.4L8.4 17L7 15.6l3.6-3.6L7 8.4L8.4 7l3.6 3.6L15.6 7L17 8.4L13.4 12l3.6 3.6z'/%3E%3C/svg%3E");
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // CODE
+  // ---------------------------------------------------------------------------
+
+  /* An inline span is a wash and a size step down -- 0.875em, so it sits on the text's own baseline */
+  code {
+    padding: 0.15em 0.4em;
+    border-radius: 4px;
+    background-color: var(--content-surface-alt);
+    font-family: var(--font-mono);
+    font-size: 0.875em;
+  }
+
+  /* A heading's code is already emphasised; a wash inside one only muddies it */
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    code {
+      padding: 0;
+      background: none;
+      font-size: 0.9em;
+    }
+
+    /* -> A link in a heading takes the heading's weight; 500 inside 600 would read as a dip */
+    a {
+      font-weight: inherit;
+    }
+  }
+
+  /*
+    Every preformatted block, whether the renderer produced it or an author wrote the `<pre>` by hand.
+    It keeps its border in both themes: the preview pane in the editor sits on grey, where a tinted
+    panel with no edge would dissolve into the page.
+  */
+  pre {
+    /* -> The one the gutter widens; see `pre.codeblock.line-numbers` */
+    --code-pad-left: var(--code-pad-x);
+
+    margin: 1.5em 0;
+    padding: var(--code-pad-y) var(--code-pad-x) var(--code-pad-y) var(--code-pad-left);
+    border: 1px solid var(--content-rule);
+    border-radius: 8px;
+    background-color: var(--content-surface-code);
+    color: var(--content-ink);
+    font-family: var(--font-mono);
+    font-size: calc(0.8125rem * var(--content-scale));
+    /* -> Tracks the body's leading; code at 13px needs a little more of it, not much */
+    line-height: 1.55;
+    /* -> Code does not wrap: a wrapped line is a different line, and indentation stops meaning anything */
+    overflow-x: auto;
+    tab-size: 2;
+    /*
+      Left to right on a right-to-left page too: code is written that way in every language, and
+      mirrored, the indentation lands on the wrong side and the punctuation at the end of a line is
+      reordered to the start of it. Everything inside -- the gutter, the copy button, a highlighted
+      line's bleed -- is placed in physical terms on the strength of this.
+    */
+    direction: ltr;
+
+    /* -> The panel is the block's own; the code inside it drops the inline span's wash and padding */
+    > code {
+      display: block;
+      padding: 0;
+      border-radius: 0;
+      background: none;
+      color: inherit;
+      font-size: inherit;
+    }
+  }
+
+  /*
+    The copy button, added to each block by `helpers/renderedContent.js`.
+
+    Out of the way until the pointer is over the block, and revealed by keyboard focus as well -- it
+    stays in the tab order the whole time, so `opacity` rather than `visibility` is what hides it: a
+    reader who cannot use a pointer would otherwise have no way to reach it at all.
+  */
+  pre.codeblock[data-code-copy] {
+    position: relative;
+  }
+
+  /*
+    The button takes its colours from the block it sits on, not from the site's theme.
+
+    `inherit` is all it takes, and it needs no filter: a highlight.js theme paints `.hljs`, which is the
+    `pre` itself, so the panel's colour and its ink are already on this button's parent -- dark panel,
+    light icon; light panel, dark icon; and a mid-tone theme handled as correctly as either. Inverting
+    what is behind the button (`backdrop-filter: invert()`) could only ever approximate that, and would
+    hue-shift anything that is not near-black or near-white.
+
+    That also means the code theme and the site theme can disagree freely -- a dark code theme on a
+    light page keeps a dark button -- which is what makes it read as part of the block.
+  */
+  .code-copy {
+    position: absolute;
+    top: 0.4rem;
+    right: 0.4rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.75rem;
+    height: 1.75rem;
+    padding: 0;
+    /* -> Derived from the block's ink, so the edge shows on a panel of any colour */
+    border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
+    border-radius: 5px;
+    background-color: inherit;
+    color: inherit;
+    cursor: pointer;
+    opacity: 0;
+    transition:
+      opacity 0.15s var(--ease-standard),
+      box-shadow 0.15s var(--ease-standard);
+
+    /*
+      Hover lifts it off the panel with a wash of the panel's own ink, laid inside the box: a second
+      background colour would have to be a fixed value, and any fixed value is wrong for some theme.
+    */
+    &:hover {
+      box-shadow: inset 0 0 0 2rem color-mix(in srgb, currentColor 12%, transparent);
+    }
+
+    /* -> Mixed toward the panel's ink rather than a flat green, so it stays legible on any theme */
+    &.is-copied {
+      color: color-mix(in srgb, #2ea043 70%, currentColor);
+      opacity: 1;
+    }
+  }
+
+  pre.codeblock:hover > .code-copy,
+  .code-copy:focus-visible {
+    opacity: 1;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .code-copy {
+      transition-duration: 0.01ms;
+    }
+  }
+
+  /*
+    The row layer: one empty <span> per line of code, inside `.line-numbers-rows`.
+
+    Two things are drawn off these rows, and neither can be drawn off the code itself. The line numbers
+    come from a counter, so the digits are never part of the text and a copied selection stays clean.
+    And the wash behind a line named by a fence's `linesHighlight` is a row's own background -- because
+    highlighting a line by wrapping it would mean splitting the highlighted HTML on its newlines and
+    re-balancing whatever highlight.js left open across them (one multi-line comment is one span),
+    where a row already lands on its line by geometry alone.
+
+    So the layer is emitted for a block of more than one line, which is where a gutter is worth having,
+    and for a single-line block that named a line to highlight. `line-numbers` on the panel is what
+    says the digits are wanted; everything here is about the rows.
+
+    It bleeds out to the panel's own edges -- back over the padding on the left, gutter included, and
+    past the longest line on the right -- so a highlight is the full width of the block. The bleed lands
+    exactly on the padding box, which is where the panel clips, so nothing escapes it.
+  */
+  pre.codeblock {
+    position: relative;
+
+    > code {
+      /*
+        A stacking context, so that a row is painted behind the code and still above the panel: the
+        layer sits at a negative depth inside it, which puts it over this element's own background --
+        none -- and under its text, while the panel's background belongs to the `pre` outside.
+      */
+      position: relative;
+      z-index: 0;
+      /*
+        Sized to the longest line rather than to the panel, so that a row is as wide as the code and a
+        line's highlight is still behind it once the block has been scrolled sideways. At least the
+        panel's width, so that a short block's rows still reach its right edge.
+      */
+      width: max-content;
+      min-width: 100%;
+    }
+
+    .line-numbers-rows {
+      position: absolute;
+      top: 0;
+      left: calc(-1 * var(--code-pad-left));
+      right: calc(-1 * var(--code-pad-x));
+      z-index: -1;
+      /* -> One below the first line, since a row increments before it draws; see `linesStart` */
+      counter-reset: codeline var(--code-line-start, 0);
+      user-select: none;
+      pointer-events: none;
+
+      > span {
+        position: relative;
+        display: block;
+        /*
+          Held to a line of the code it sits behind. A row has no content of its own -- the number is
+          drawn by a counter and takes itself out of the flow -- so nothing else would give it a height,
+          and a row of no height would leave every row after it on the wrong line.
+        */
+        height: 1lh;
+        counter-increment: codeline;
+      }
+
+      /*
+        A highlighted line, washed with the block's own ink rather than with a colour of its own, for
+        the reason the copy button takes its colours the same way: a highlight.js theme paints `.hljs`,
+        so the panel can be any colour at all, and a mix of what is already written on it is the one
+        wash that reads on every one of them. The bar down the left edge is the same mix at strength --
+        at this subtlety the wash alone is easy to miss on a busy line.
+      */
+      > span.is-highlighted {
+        background-color: color-mix(in srgb, currentColor 10%, transparent);
+        box-shadow: inset 2px 0 0 color-mix(in srgb, currentColor 45%, transparent);
+      }
+    }
+  }
+
+  /*
+    The gutter proper: the digits, and the rule that holds them off the code. All that separates a
+    numbered block from one that only has rows because it highlights a line.
+  */
+  pre.codeblock.line-numbers {
+    --code-pad-left: 3.6rem;
+
+    .line-numbers-rows {
+      /*
+        Drawn once down the whole layer rather than once per row, and as the LAST thing in it -- a
+        highlighted row's wash is a background and would otherwise paint over the rule, breaking the
+        gutter's line wherever a line is marked.
+
+        Mixed from the panel's own ink rather than taken from `--content-rule`, for the reason the copy
+        button takes its colours that way: a highlight.js theme paints `.hljs`, so a panel can be any
+        colour, and the page's hairline is invisible on a dark one. Against the default palette the two
+        land within a shade of each other; over a highlighted row this one still reads.
+      */
+      &::after {
+        content: '';
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        left: 3.1rem;
+        border-left: 1px solid color-mix(in srgb, currentColor 22%, transparent);
+      }
+
+      > span::before {
+        content: counter(codeline);
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 3.1rem;
+        padding-right: 0.5rem;
+        color: var(--content-ink-faint);
+        text-align: right;
+      }
+    }
+  }
+
+  /*
+    A fence given a `title="..."`, drawn as a bar across the top of the block.
+
+    The bar is a sibling of the `<pre>` rather than a child of it, because the panel is the thing that
+    scrolls: a header inside it would slide sideways with the code and be indented by the gutter's
+    padding. So a titled block is a box holding the two, and the box carries the border, the radius and
+    the margin the panel gives up.
+
+    That box wears `hljs` as well, which is what keeps it the same colour as the code it is holding: the
+    theme chosen under Admin -> Theme is injected as bare `.hljs` rules (see `applyCodeBlocksTheme` in
+    `App.vue`) and sets a background and an ink, so a panel is only `--content-surface-code` until an
+    administrator picks something else. Reaching for the token here instead would leave the bar light
+    over a dark panel on any site that has. The token is the fallback for both, exactly as before, and
+    the bar's own wash is mixed from the ink it ends up with.
+  */
+  .codeblock-titled {
+    /* -> The title is a file name, and reads with the code under it -- see `pre` */
+    direction: ltr;
+    margin: 1.5em 0;
+    border: 1px solid var(--content-rule);
+    border-radius: 8px;
+    /* -> Clips the panel's square corners to this box's radius */
+    overflow: hidden;
+    background-color: var(--content-surface-code);
+    color: var(--content-ink);
+
+    > .codeblock-title {
+      padding: 0.45rem var(--code-pad-x);
+      border-bottom: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+      background-color: color-mix(in srgb, currentColor 7%, transparent);
+      font-family: var(--font-mono);
+      font-size: calc(0.75rem * var(--content-scale));
+      font-weight: 600;
+      line-height: 1.5;
+      /* -> A file path with no spaces in it is the commonest title there is */
+      overflow-wrap: anywhere;
+    }
+
+    /* -> The box is the block's outline now; the panel keeps only its padding and its scrolling */
+    > pre.codeblock {
+      margin: 0;
+      border: 0;
+      border-radius: 0;
+    }
+  }
+
+  /*
+    Diagram sources -- a mermaid, plantuml or kroki fence -- reach the page as code, and are drawn
+    later or not at all. A quiet dashed panel says "this is a diagram that has not been drawn" rather
+    than pretending to be a code sample.
+  */
+  pre.codeblock-kroki,
+  pre.codeblock-mermaid,
+  pre.codeblock-plantuml {
+    border-style: dashed;
+    border-color: var(--content-rule-strong);
+    background-color: var(--content-surface-alt);
+    color: var(--content-ink-muted);
+  }
+
+  /*
+    Inline math, `` $`x^2`$ ``, until its block has loaded. Its TeX is the element's text, and an
+    element the browser does not know yet is just an inline span of it, so a sentence would flash its
+    source before the formula replaces it. Hidden rather than removed, so the line does not reflow
+    twice. Only here: a reader with JavaScript off gets the prerendered copy, which is not under
+    `.page-contents`, and so is still shown the source. Nor in an editor's preview when the block is
+    switched off for the site: that one stays undefined on purpose, and shows the source saving leaves.
+  */
+  block-katex[inline]:not(:defined, [data-block-disabled]),
+  block-mathjax[inline]:not(:defined, [data-block-disabled]) {
+    visibility: hidden;
+  }
+
+  /* -- highlight.js tokens ------------------------------------------------------ */
+
+  .hljs-comment,
+  .hljs-quote {
+    color: var(--content-code-comment);
+    font-style: italic;
+  }
+
+  .hljs-keyword,
+  .hljs-selector-tag,
+  .hljs-literal,
+  .hljs-doctag,
+  .hljs-name,
+  .hljs-subst {
+    color: var(--content-code-keyword);
+  }
+
+  .hljs-string,
+  .hljs-regexp,
+  .hljs-template-tag,
+  .hljs-template-variable,
+  .hljs-addition {
+    color: var(--content-code-string);
+  }
+
+  .hljs-number,
+  .hljs-symbol,
+  .hljs-bullet,
+  .hljs-link {
+    color: var(--content-code-number);
+  }
+
+  .hljs-title,
+  .hljs-section,
+  .hljs-title.function_,
+  .hljs-selector-id {
+    color: var(--content-code-title);
+  }
+
+  .hljs-type,
+  .hljs-class .hljs-title,
+  .hljs-title.class_,
+  .hljs-built_in,
+  .hljs-builtin-name,
+  .hljs-params {
+    color: var(--content-code-type);
+  }
+
+  .hljs-attr,
+  .hljs-attribute,
+  .hljs-variable,
+  .hljs-selector-attr,
+  .hljs-selector-class,
+  .hljs-selector-pseudo {
+    color: var(--content-code-attr);
+  }
+
+  .hljs-meta,
+  .hljs-comment .hljs-doctag,
+  .hljs-tag {
+    color: var(--content-code-meta);
+  }
+
+  /* A diff's added and removed lines are marked by the line, not by the token */
+  .hljs-addition {
+    display: inline-block;
+    width: 100%;
+    background-color: var(--content-code-addition-wash);
+    color: var(--content-code-addition);
+  }
+  .hljs-deletion {
+    display: inline-block;
+    width: 100%;
+    background-color: var(--content-code-deletion-wash);
+    color: var(--content-code-deletion);
+  }
+
+  .hljs-emphasis {
+    font-style: italic;
+  }
+  .hljs-strong {
+    font-weight: 600;
+  }
+
+  // ---------------------------------------------------------------------------
+  // TABLES
+  // ---------------------------------------------------------------------------
+
+  /*
+    A wide table scrolls itself rather than widening the article.
+
+    `display: block` is what makes that possible -- a table box cannot scroll -- and the rows and cells
+    still lay out as a table inside it through anonymous table boxes. `width: max-content` keeps the
+    table its natural width up to the column's, so a narrow table does not stretch.
+
+    That block box is also what lets the table round its corners at all: `border-radius` is defined to
+    have no effect on a table with collapsed borders, but this is a block that HAPPENS to contain a
+    table, so the radius applies to it -- and the scrolling already makes it a clipping box, so the
+    head's fill and the last row are cut to the arc with nothing else to arrange.
+  */
+  table {
+    display: block;
+    width: max-content;
+    max-width: 100%;
+    margin: 1.5em 0;
+    /* -> The perimeter, so the corners can be round; the cells draw only the grid inside it */
+    border: 1px solid var(--content-rule);
+    border-radius: 8px;
+    border-collapse: collapse;
+    box-shadow: var(--content-table-shadow);
+    font-size: 0.9375em;
+    overflow-x: auto;
+  }
+
+  /*
+    Interior rules only. A cell border all the way round would double the table's own at the perimeter,
+    and at the corners it would be a straight line cut off by the radius -- a notch rather than a curve.
+  */
+  th,
+  td {
+    padding: 0.5em 0.8em;
+    border-inline-end: 1px solid var(--content-rule);
+    border-bottom: 1px solid var(--content-rule);
+    text-align: start;
+    vertical-align: top;
+  }
+
+  tr > :last-child {
+    border-inline-end: 0;
+  }
+
+  /* -> `tbody:last-child`, because a MultiMarkdown table can have several: only the bottom of the last
+        one is the bottom of the table, and the others need their rule to keep the grid closed */
+  tbody:last-child tr:last-child > * {
+    border-bottom: 0;
+  }
+
+  /*
+    A multi-line cell holds block content -- its text arrives wrapped in a paragraph, and may be a list
+    or a fence -- and the outer margins of that content are the cell's padding's business, exactly as
+    they are the container's at the top level. Without this a multi-line row stands 1.15em taller than
+    the single-line rows around it.
+  */
+  th > :first-child,
+  td > :first-child {
+    margin-top: 0;
+  }
+  th > :last-child,
+  td > :last-child {
+    margin-bottom: 0;
+  }
+
+  th {
+    background-color: var(--content-surface-alt);
+    font-weight: 600;
+  }
+
+  /*
+    The head as a title bar. The gradient goes on the row group, not on each cell: `at bottom right` of
+    a cell is a wash per column, which reads as banding across the head instead of one bar under the
+    heading. Cells then have to give up the `th` wash above, or they would tint over it.
+
+    Only `thead` -- a row header inside the body (author HTML; markdown has no syntax for one) keeps
+    the plain wash, since a dark bar down the side of a table is a different thing altogether.
+  */
+  thead {
+    background-color: var(--content-table-head);
+    background-image: radial-gradient(
+      at bottom right,
+      var(--content-table-head),
+      var(--content-table-head-grade)
+    );
+  }
+
+  thead th {
+    border-inline-end-color: var(--content-table-head-rule);
+    border-bottom-color: var(--content-table-head-rule);
+    background-color: transparent;
+    color: var(--content-table-head-ink);
+  }
+
+  /*
+    Banding: BOTH row colours are stated, so the table is a tinted panel with a band in it rather than
+    a white page with every other row tinted. On a white article column an untinted row was the page
+    itself, which left the table's own extent to the border alone.
+
+    Faint enough that the band still guides the eye across a wide row without striping the page, and
+    the two are a step apart rather than a contrast -- the head is what the eye lands on.
+  */
+  tbody > tr > td {
+    background-color: var(--content-table-row);
+  }
+
+  tbody > tr:nth-child(even) > td {
+    background-color: var(--content-table-row-alt);
+  }
+
+  /*
+    `{.table-leading-col}`, written on the line under a table -- which is where `markdown-it-attrs` reads
+    a block's attributes from -- for a table whose first column says what its row IS rather than holding
+    one of its values: a setting name, a key, a term. It is set in the head's own weight, so the column
+    reads as the label for its row that it is.
+
+    Inline code comes with it and needs no rule of its own: `code` declares no weight, so a `` `key` ``
+    in that column inherits this one -- which matters, because a label like that is usually written as
+    code in the first place.
+  */
+  table.table-leading-col > tbody > tr > :first-child {
+    font-weight: 600;
+  }
+
+  /*
+    `{.table-code-nohighlight}`, attached the same way, for a table where nearly every cell holds inline
+    code -- a table of settings, of keys, of tag names. The wash is there to pick a code span out of a
+    sentence; a column of them is not a sentence, and forty chips in a grid read as noise over the row
+    colours rather than as emphasis. The monospace face is what says "code" there.
+
+    The padding goes with the wash, as it does inside a heading: it exists to keep the tint off the
+    glyphs, and left behind on its own it is a gap in the middle of a phrase with nothing to explain it.
+  */
+  table.table-code-nohighlight code {
+    padding: 0;
+    background: none;
+  }
+
+  /*
+    `{.table-vertical-middle}`, again on the line under the table. Cells top-align by default, which is
+    what a row of prose wants -- the first lines of each cell line up and the row reads across. A row of
+    single lines next to one tall cell does not: an image, a `^^` rowspan or one long wrapped sentence
+    leaves the short cells hanging at the top of the row with the gap under them.
+  */
+  table.table-vertical-middle > tbody > tr > * {
+    vertical-align: middle;
+  }
+
+  caption {
+    padding-bottom: 0.5em;
+    color: var(--content-ink-muted);
+    font-size: 0.875em;
+    text-align: start;
+  }
+
+  // ---------------------------------------------------------------------------
+  // FIGURES, IMAGES AND DIAGRAMS
+  // ---------------------------------------------------------------------------
+
+  img {
+    max-width: 100%;
+    height: auto;
+    border-radius: 4px;
+    /* -> An image is a block when it is the whole paragraph, and inline when it sits in a sentence */
+    vertical-align: middle;
+  }
+
+  /*
+    A drawing, which is a whole page rather than a picture in one -- the Excalidraw editor exports it
+    at save time and it is the entire render (`editor/excalidraw/index.js`).
+
+    The export carries no `width` or `height`, deliberately: Excalidraw writes the drawing's own
+    dimensions onto the element, which in an article is a picture that refuses to shrink on a narrow
+    screen. The `viewBox` it also writes is what carries the shape, so giving the width to CSS scales
+    the drawing rather than cropping it. Centred, because a drawing that is narrower than the column
+    reads as a figure and not as a paragraph that stops early.
+  */
+  svg.excalidraw-render {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    height: auto;
+    margin-inline: auto;
+
+    /*
+      Dark mode, the way Excalidraw itself does it: the picture is inverted rather than recoloured,
+      because a drawing is strokes and fills an author chose and there is no way to know which of them
+      meant "ink" and which meant "a red box". This is `THEME_FILTER` from Excalidraw, and it is here
+      rather than in the export because there is ONE stored render and two themes to show it in -- see
+      `exportSceneSvg`, which is deliberately always light and must stay that way for this to be right.
+    */
+    @at-root .body--dark & {
+      filter: invert(93%) hue-rotate(180deg);
+    }
+  }
+
+  /*
+    An image in a list item stays in the sentence. Tailwind's preflight declares `img { display:
+    block }`, so without this the image takes a line of its own and the item's own words go under it,
+    which reads as a broken item rather than as an illustrated one.
+
+    `align-left` / `align-right` / `align-center` still win on specificity, so an author who asks for
+    one of those in a list still gets it.
+  */
+  li img {
+    display: inline-block;
+  }
+
+  /* The alignment classes an author can attach through `markdown-it-attrs` */
+  img,
+  figure {
+    &.align-left {
+      float: left;
+      margin: 0.3em 1.2em 0.8em 0;
+    }
+    &.align-right {
+      float: right;
+      margin: 0.3em 0 0.8em 1.2em;
+    }
+    &.align-center {
+      display: block;
+      float: none;
+      margin-inline: auto;
+    }
+  }
+
+  /*
+    How an image is framed, which the Image Properties dialog offers alongside the alignment classes
+    above (`IMAGE_STYLES` in `helpers/markdownImages.js`). Built on the content tokens, so a framed
+    screenshot follows the page into dark mode with the rest of the article. An AsciiDoc image carries
+    the same classes as roles on its wrapper instead -- see `_page-contents-asciidoc.scss`.
+  */
+  img {
+    &.decor-shadow {
+      box-shadow: var(--content-image-shadow);
+    }
+    &.decor-border {
+      border: 1px solid var(--content-rule-strong);
+    }
+    &.decor-rounded {
+      border-radius: 12px;
+    }
+  }
+
+  figure {
+    margin: 1.5em 0;
+    text-align: center;
+  }
+
+  figcaption {
+    margin-top: 0.6em;
+    color: var(--content-ink-muted);
+    font-size: 0.875em;
+  }
+
+  /*
+    An Iconify icon, drawn into the page as an `<svg>` when it was saved -- see `inlineIcons` in
+    `models/rendering.ts`. Coloured by the markup itself (`currentColor`), so what it needs from here
+    is to be part of the line -- Preflight makes every `svg` a block, which would put an icon written
+    mid-sentence on a line of its own -- and to be big enough to read beside the text it sits in.
+
+    1.4em rather than the 1em Iconify draws at: an icon is read as a glyph, and a glyph the same
+    nominal size as the type around it looks smaller than it, because a letter fills a fraction of
+    its em box while an icon fills the whole one.
+
+    An author who asked for a size gets it: `inlineIcons` writes that one as an inline style, which
+    outranks this.
+  */
+  svg.icon {
+    display: inline-block;
+    width: 1.4em;
+    height: 1.4em;
+  }
+
+  /*
+    The same icon before it has been inlined: what the editor's preview draws, what a page saved
+    before this carries, and what is left where a set could not be resolved at save time.
+
+    Sized through `font-size` rather than through `width`, which is the one difference between the
+    two: the element draws its own `<svg width="1em">` inside a shadow root nothing here can reach,
+    so growing the host box would leave a 1em glyph centred in a 1.4em one. Scaling what that `em`
+    measures against grows the drawing. An explicit `width` on the element is in pixels and is
+    untouched by this, exactly as the inline style above leaves the inlined form alone.
+
+    Aligned here rather than left alone, which is the other difference: Preflight gives every `svg`
+    `vertical-align: middle`, so the inlined form sits centred on the line without asking, while the
+    element is a custom tag Preflight never matches and its own `:host` rule sits it on the baseline
+    -- a 1.4em box on the baseline rides up over the text it was written into. An outer-tree
+    declaration beats a shadow tree's `:host` whatever the specificity, so this is all it takes, and
+    saying it here is what makes the editor's preview and the saved page the same picture.
+
+    `inline` is the author asking for the baseline instead, and it still means that: the attribute
+    nudges the element to the -0.125em Iconify aligns text-height icons by, which is exactly what
+    `inlineIcons` writes onto the saved `<svg>` for the same attribute.
+  */
+  iconify-icon {
+    font-size: 1.4em;
+  }
+  iconify-icon:not([inline]) {
+    vertical-align: middle;
+  }
+
+  /* Twemoji, which the renderer swaps in for `:shortcodes:` */
+  img.emoji {
+    display: inline-block;
+    width: 1.15em;
+    height: 1.15em;
+    margin: 0 0.05em;
+    border-radius: 0;
+    vertical-align: -0.2em;
+  }
+
+  // ---------------------------------------------------------------------------
+  // RULES AND DISCLOSURES
+  // ---------------------------------------------------------------------------
+
+  hr {
+    height: 1px;
+    margin: 2.5em 0;
+    border: 0;
+    background-color: var(--content-rule);
+  }
+
+  details {
+    margin: 1.5em 0;
+    padding: 0.75em 1.1em;
+    border: 1px solid var(--content-rule);
+    border-radius: 8px;
+    background-color: var(--content-surface-alt);
+
+    > summary {
+      cursor: pointer;
+      font-weight: 600;
+
+      /* -> Only spaced away from the content once there IS content below it */
+      &:focus-visible {
+        outline: 2px solid var(--content-link);
+        outline-offset: 2px;
+      }
+    }
+
+    &[open] > summary {
+      margin-bottom: 0.75em;
+      padding-bottom: 0.5em;
+      border-bottom: 1px solid var(--content-rule);
+    }
+
+    > :last-child {
+      margin-bottom: 0;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // FOOTNOTES
+  // ---------------------------------------------------------------------------
+
+  /* The reference in the text: a superscript number that does not need underlining to be seen */
+  .footnote-ref > a {
+    padding: 0 0.15em;
+    font-weight: 500;
+    text-decoration: none;
+  }
+
+  .footnotes-sep {
+    margin-top: 2.5em;
+  }
+
+  .footnotes {
+    color: var(--content-ink-muted);
+    font-size: 0.875em;
+
+    .footnotes-list {
+      padding-inline-start: 1.4em;
+    }
+
+    .footnote-item > p {
+      margin: 0.3em 0;
+    }
+  }
+
+  /*
+    Where a footnote link has just landed, so the reader can see which one they were sent to: one item
+    among a list of near-identical ones, where arriving says nothing about which is which.
+
+    Keyed off the class `helpers/anchors.js` leaves on it rather than `:target`, which stopped matching
+    once an in-content fragment link began updating the URL with `router.push` -- a pushed hash sets no
+    target element. Keep the name in step with `LANDED_CLASS` there.
+
+    Headings are deliberately not styled: a heading is what the reader asked for and it announces itself
+    by sitting at the top of the column, so the wash only added noise to every jump to a section.
+  */
+  .footnote-item.is-anchor-landed {
+    /* Drawn outside the box so it cannot shift the text it highlights */
+    box-shadow: 0 0 0 0.4em var(--content-mark);
+    background-color: var(--content-mark);
+    border-radius: 2px;
+  }
+
+  .footnote-backref {
+    margin-inline-start: 0.3em;
+    text-decoration: none;
+  }
+
+  // ---------------------------------------------------------------------------
+  // PRINT
+  // ---------------------------------------------------------------------------
+
+  /*
+    Written against the light palette above and reached from either theme, because the dark one is
+    screen-only -- see the note on it.
+
+    The chrome around the article is dealt with in `css/_print.scss`, which is the rest of this story:
+    what is hidden, and what is left of the shell once it stops being a viewport.
+  */
+  @media print {
+    /* Washes and tints cost ink and print muddy; the structure has to come from the rules instead */
+    --content-ink: #000;
+    --content-ink-muted: #333;
+    --content-surface-code: #fff;
+    --content-surface-alt: #fff;
+    /*
+      Which goes double for a table's head: a solid near-black bar is the most ink anything in content
+      asks for, and on paper it buys nothing -- the bold text and the rules already say "head". Its
+      lines go back to the hairline every other cell prints, and the shadow goes entirely.
+    */
+    --content-table-head: #fff;
+    --content-table-head-grade: #fff;
+    --content-table-head-ink: #000;
+    --content-table-head-rule: var(--content-rule);
+    --content-table-shadow: none;
+    /* -> A glow prints as a grey smudge round the disc and lifts nothing, the same trade `block-tabs`
+          makes with the shadow under a tabset */
+    --content-step-glow: none;
+    /* -> And the banding, which on paper is grey ink over every other row for no gain */
+    --content-table-row: transparent;
+    --content-table-row-alt: transparent;
+    /*
+      The article column prints with no padding of its own -- the sheet's own margin is the margin
+      now, see `_print.scss` -- so the rule under the page title has nothing left to reach back
+      through. Left at 1rem it would overhang the text by exactly the padding that is gone.
+    */
+    /*
+      `0px` and not `0`: the title's rule positions itself with `calc(-1 * var(--content-bleed))`, and
+      a unitless zero makes that a NUMBER rather than a length. The declaration is then invalid, the
+      start inset falls back to `auto` against an end one of `0`, and a rule with no width to shrink to disappears --
+      which is exactly how the page title lost the rule under it on paper.
+    */
+    --content-bleed: 0px;
+
+    font-size: 11pt;
+    line-height: 1.55;
+
+    pre.codeblock,
+    .codeblock-titled,
+    table,
+    img,
+    blockquote,
+    details {
+      /* -> A block split across a page break is unreadable in both halves */
+      break-inside: avoid;
+    }
+
+    h1,
+    h2,
+    h3,
+    h4,
+    h5,
+    h6 {
+      break-after: avoid;
+    }
+
+    /*
+      The rule under a title and a section heading is a gradient, which is to say a BACKGROUND -- and a
+      print dialog leaves background graphics off by default, so the one device that makes the sections
+      of a long page findable was the one thing that did not survive being printed. Same pair as a done
+      task item further up, for the same reason.
+    */
+    h1::after,
+    h2::after {
+      print-color-adjust: exact;
+      -webkit-print-color-adjust: exact;
+    }
+
+    /* -> A single line of a paragraph stranded on either side of a break; three is the usual floor */
+    p,
+    li {
+      orphans: 3;
+      widows: 3;
+    }
+
+    /*
+      Code wraps.
+
+      On screen a long line scrolls sideways inside its panel and nothing is lost. On paper the panel is
+      as wide as the sheet and everything past that edge is simply gone -- silently, which is the worst
+      way for a code sample to be wrong. So the rule the screen keeps a few hundred lines up ("code does
+      not wrap: a wrapped line is a different line, and indentation stops meaning anything") is the
+      wrong trade here and is inverted: a wrapped line is still readable, an absent one is not.
+
+      `overflow-wrap: break-word` breaks only where a single unbroken run is wider than the panel by
+      itself -- a URL in a comment, a base64 literal, a long path -- so ordinary code still gives way at
+      its spaces and its indentation survives.
+
+      The `width: max-content` the code carries has to go with it: it sizes the block to its longest
+      line, which leaves `pre-wrap` nothing to wrap against.
+    */
+    pre {
+      overflow-x: visible;
+      white-space: pre-wrap;
+      overflow-wrap: break-word;
+    }
+    pre.codeblock > code {
+      width: auto;
+    }
+
+    /*
+      And the line-number gutter goes with it.
+
+      Neither the digits nor a highlighted line's wash is part of the text: they are an absolutely
+      positioned layer of empty rows, each exactly `1lh` tall, that lands on its line by geometry alone.
+      A wrapped line is taller than one row, so from the first wrap onwards every number sits against
+      the wrong line -- and a code sample whose numbers lie is worse than one with no numbers at all.
+
+      The padding the gutter had reserved goes back to the panel's own, so a numbered block does not
+      print with an empty 3.6rem margin down its left side.
+    */
+    pre.codeblock .line-numbers-rows {
+      display: none;
+    }
+    pre.codeblock.line-numbers {
+      --code-pad-left: var(--code-pad-x);
+    }
+
+    /*
+      A step's disc has to print, which is not the default: a print dialog leaves background graphics
+      off, and the number on the disc is white -- so what came out was a line down the margin with a
+      blank beside every step, the numbering gone altogether. Same pair as a done task item and a tab's
+      label bar, for the same reason, and the one place in content where paper is asked for solid
+      colour: the discs ARE the numbering, and there is nothing left of a steps block without them.
+
+      The line between them needs none of this, being a border rather than a background.
+    */
+    block-steps > ol > li::before,
+    block-steps > ul > li::before {
+      print-color-adjust: exact;
+      -webkit-print-color-adjust: exact;
+    }
+
+    /*
+      Every panel of a tabset, one after another.
+
+      A tabset shows one panel at a time because a screen has one place to put it. Paper has as many
+      places as it needs, and a panel that does not print is content the reader is never told exists --
+      so they all print, each under a bar carrying its own label. `block-tabs` hides its strip for the
+      same reason, in its own stylesheet, where the strip lives.
+
+      Here rather than in that block because of where the panels live. `block-tab` has no shadow root at
+      all -- its content is page content, styled by this file, which is the whole point of it -- and
+      which panel is showing is an inline `display` its parent writes onto the element. So this is at
+      once the only stylesheet that reaches them and the only weight that beats an inline style.
+
+      `[label]` guards the bar: the label is an attribute, and a tab written without one would otherwise
+      print an empty rule.
+    */
+    block-tab {
+      display: block !important;
+    }
+    block-tab + block-tab {
+      margin-top: 1.5em;
+    }
+
+    /*
+      A solid bar and a spine down the side, and they are the same colour on purpose: at the top of a
+      panel the two meet and read as one shape turning the corner, which is what marks out where a
+      panel starts AND how far down the sheet it runs. That second half is the harder one -- a rule
+      under a label says where a panel begins and nothing at all about where it ends, and on paper
+      there is no strip left above to hold the set together.
+
+      This is the one place here that spends solid ink, and it is a deliberate departure from the note
+      a few rules up about a table's head: there, the bold text and the ruled grid already say "head",
+      so the near-black bar was ink buying nothing. Here the bar is the ONLY thing separating one
+      panel's content from the next one's, and drawn as a hairline and small caps it was too quiet to
+      do it.
+
+      Dark grey rather than the near-black the table's head uses on screen: it is enough for white to
+      read on (about 9:1) and costs a third less ink over a bar that repeats once per panel.
+
+      The bar's negative start margin is what takes it back over the padding so that it meets the spine
+      rather than starting inboard of it.
+
+      `print-color-adjust` is what makes any of it appear, for the reason a done task item carries the
+      same pair: a print dialog leaves background graphics OFF by default, so the fill would print as
+      nothing and the white label as white on white -- the panel losing its heading altogether, which
+      is worse than the quiet version this replaces. The property is inherited, so declaring it here
+      covers the bar as well as the spine.
+    */
+    block-tab[label] {
+      --content-tab-bar: #3a4049;
+      /*
+        Held as a property, and in `rem`, because the bar's negative margin has to cancel this padding
+        EXACTLY. Written as `0.9em` in both places it did not: an `em` here resolves against the
+        panel's font size and the same `em` on the bar against the bar's own smaller one, so the two
+        came out 13.2px and 10.7px and left a 2px seam of white between the spine and the bar.
+      */
+      --content-tab-pad: 0.75rem;
+
+      border-inline-start: 4px solid var(--content-tab-bar);
+      padding-inline-start: var(--content-tab-pad);
+      print-color-adjust: exact;
+      -webkit-print-color-adjust: exact;
+    }
+    block-tab[label]::before {
+      content: attr(label);
+      display: block;
+      margin-block: 0 0.9em;
+      margin-inline: calc(-1 * var(--content-tab-pad)) 0;
+      padding: 0.35em var(--content-tab-pad);
+      background-color: var(--content-tab-bar);
+      color: #fff;
+      font-size: 0.8125em;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    /*
+      The marker becomes the address.
+
+      On screen an external link only has to SAY that it leaves the wiki -- where it goes is in the
+      status bar, one hover away, and a click away after that. On paper there is neither: a link is
+      worth exactly the address printed beside it, so the arrow gives way to the href itself.
+
+      Still the renderer's class rather than a selector on the href, for the reason the screen rule
+      gives: whether an address is off-site is a question about its host, and that is settled at
+      render time. A relative link spelled out in full would be a path nobody can type.
+
+      Everything the screen rule set up for a masked glyph has to be undone, since this is the same
+      pseudo-element carrying text now rather than a shape -- the mask would otherwise cut the
+      address down to a 0.8em square of nothing.
+
+      A link whose text is already its own URL prints it twice. That is the cost of the rule, and it
+      is a good deal cheaper than a printed reference nobody can follow.
+    */
+    a.is-external-link::after {
+      content: ' (' attr(href) ')';
+      display: inline;
+      width: auto;
+      height: auto;
+      margin-inline-start: 0;
+      background-color: transparent;
+      mask-image: none;
+      opacity: 1;
+      font-size: 0.85em;
+      /* -> A URL has no spaces to break at and would otherwise run off the edge of the sheet */
+      word-break: break-all;
+    }
+  }
+}
+
+/*
+  Annotated passages, painted through the CSS Custom Highlight API rather than wrapped in elements:
+  the names are `HIGHLIGHTS` in `helpers/annotations.js`, and the two have to be kept in step. Nothing
+  is ever inserted into the article, which is what keeps the text one annotation is matched against
+  the text the next one was picked from.
+
+  Top level, because a highlight pseudo-element is matched on whatever element holds the text; the
+  custom properties still resolve from there, so the article's own `--content-mark` serves both themes.
+  A highlight can only take colours and a text decoration -- no padding, no shadow, no radius.
+*/
+::highlight(wiki-annotation-pending) {
+  background-color: color-mix(in srgb, var(--q-warning) 32%, transparent);
+}
+
+::highlight(wiki-annotation-draft) {
+  background-color: color-mix(in srgb, var(--q-warning) 45%, transparent);
+  text-decoration: underline 2px var(--q-warning);
+  text-underline-offset: 3px;
+}
+
+/* -> View All Annotations: every open one, quieter than one being picked, and the resolved ones as a
+      line under the text alone -- still there to be found, and drawn as done */
+::highlight(wiki-annotation-shown) {
+  background-color: color-mix(in srgb, var(--q-warning) 22%, transparent);
+  text-decoration: underline 1px var(--q-warning);
+  text-underline-offset: 3px;
+}
+
+::highlight(wiki-annotation-resolved) {
+  text-decoration: underline dotted 1px var(--q-positive);
+  text-underline-offset: 3px;
+}
+
+/* -> Over a passage that opens its note, which a highlight cannot say itself -- see
+      `PageAnnotationsLayer.vue` for why this is an attribute */
+.page-contents[data-annotation-hover] {
+  cursor: pointer;
+}
+
+::highlight(wiki-annotation-focus) {
+  background-color: var(--content-mark);
+  text-decoration: underline 2px var(--q-primary);
+  text-underline-offset: 3px;
+}

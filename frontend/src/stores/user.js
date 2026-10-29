@@ -1,0 +1,287 @@
+import { defineStore } from 'pinia'
+
+import { getAccessibleColor } from '@/helpers/accessibility'
+import { clearBufferForUser } from '@/helpers/editorBuffer'
+
+import { useSiteStore } from './site'
+
+const pad = (value) => String(value).padStart(2, '0')
+
+/**
+ * Render the date part of a moment the way the user asked for it.
+ *
+ * The stored preference is one of a handful of explicit patterns, or an empty string meaning "whatever
+ * this locale does" — which is the only case a formatter can be left to decide on its own.
+ */
+function formatDatePart(zoned, dateFormat) {
+  switch (dateFormat) {
+    case 'DD/MM/YYYY':
+      return `${pad(zoned.day)}/${pad(zoned.month)}/${zoned.year}`
+    case 'DD.MM.YYYY':
+      return `${pad(zoned.day)}.${pad(zoned.month)}.${zoned.year}`
+    case 'MM/DD/YYYY':
+      return `${pad(zoned.month)}/${pad(zoned.day)}/${zoned.year}`
+    case 'YYYY-MM-DD':
+      return `${zoned.year}-${pad(zoned.month)}-${pad(zoned.day)}`
+    case 'YYYY/MM/DD':
+      return `${zoned.year}/${pad(zoned.month)}/${pad(zoned.day)}`
+    default:
+      // -> Numeric parts rather than `dateStyle: 'short'`, which abbreviates the year to two digits
+      return zoned.toLocaleString(undefined, { year: 'numeric', month: 'numeric', day: 'numeric' })
+  }
+}
+
+/**
+ * The zone this user's clock is in: their stored preference where it is still a real zone, and this
+ * browser's otherwise.
+ *
+ * A preference can outlive the zone it names — the IANA database retires and renames them — and an
+ * empty one is the normal state for an account that never chose. Either way a table full of dates
+ * must not throw, so both fall back to where the reader actually is.
+ *
+ * @param timezone This user's stored zone, which may be empty or no longer exist.
+ */
+function resolveZone(timezone) {
+  if (!timezone) {
+    return Temporal.Now.timeZoneId()
+  }
+  try {
+    // -> The only way to ask whether a zone id is real is to use it
+    Temporal.Instant.fromEpochMilliseconds(0).toZonedDateTimeISO(timezone)
+    return timezone
+  } catch {
+    return Temporal.Now.timeZoneId()
+  }
+}
+
+/**
+ * The moment as this user's clock shows it, whatever form the API sent it in.
+ *
+ * @param date A `Temporal.Instant`, a `Date`, or a string one can be parsed from.
+ * @param timezone This user's stored zone, which may be empty or no longer exist.
+ */
+function toUserZone(date, timezone) {
+  let instant = date
+  if (typeof date === 'string') {
+    instant = Temporal.Instant.from(date)
+  } else if (date instanceof Date) {
+    instant = date.toTemporalInstant()
+  }
+  return instant.toZonedDateTimeISO(resolveZone(timezone))
+}
+
+/**
+ * Render the time part. `hourCycle` rather than `hour12: false`, which some locales render as 24:00
+ * where they mean 00:00.
+ */
+function formatTimePart(zoned, timeFormat) {
+  return zoned.toLocaleString(
+    undefined,
+    timeFormat === '24h'
+      ? { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }
+      : { hour: 'numeric', minute: '2-digit', hour12: true }
+  )
+}
+
+export const useUserStore = defineStore('user', {
+  state: () => ({
+    id: '10000000-0000-4000-8000-000000000001',
+    email: '',
+    name: '',
+    hasAvatar: false,
+    /**
+     * The language the wiki writes to this user in — the mails, today. Empty means the language of
+     * whichever site the mail is about.
+     *
+     * Deliberately not what the interface is drawn in: that follows the page being read, and on a
+     * screen that is not a page the locale picker's own choice, which `commonStore` keeps per
+     * browser. See the locale block in `App.vue`.
+     */
+    locale: '',
+    timezone: '',
+    dateFormat: 'YYYY-MM-DD',
+    timeFormat: '12h',
+    appearance: 'site',
+    cvd: 'none',
+    reduceMotion: false,
+    underlineLinks: false,
+    contentTextSize: 'default',
+    permissions: [],
+    pagePermissions: [],
+    authenticated: false,
+    profileLoaded: false
+  }),
+  actions: {
+    async refreshProfile() {
+      try {
+        this.applyProfile(
+          await API_CLIENT.get('users/whoami', {
+            cache: 'no-store'
+          }).json()
+        )
+      } catch (err) {
+        console.warn(err)
+      }
+    },
+    /**
+     * Take in a session that arrived with something else — `bootstrap` hands it over with the site and
+     * the flags, which is how an app load asks who is logged in without a request of its own. Asking
+     * again is what `refreshProfile` above is for, once a login or a logout has changed the answer.
+     */
+    applyProfile(resp) {
+      if (!resp?.authenticated) {
+        this.setToGuest()
+        return
+      }
+      this.$patch({
+        /*
+          Kept, rather than left at the guest id this store starts with. Nothing used to read it
+          while logged in, so nothing noticed -- but a live editing session identifies its
+          participants by it, and every one of them claiming the guest id makes a roomful of
+          people look like one person wearing the same colour.
+        */
+        id: resp.id,
+        name: resp.name || 'Unknown User',
+        email: resp.email,
+        hasAvatar: resp.hasAvatar ?? false,
+        location: resp.location || '',
+        jobTitle: resp.jobTitle || '',
+        pronouns: resp.pronouns || '',
+        locale: resp.locale || '',
+        timezone: resp.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || '',
+        dateFormat: resp.dateFormat || '',
+        timeFormat: resp.timeFormat || '12h',
+        appearance: resp.appearance || 'site',
+        cvd: resp.cvd || 'none',
+        reduceMotion: resp.reduceMotion ?? false,
+        underlineLinks: resp.underlineLinks ?? false,
+        contentTextSize: resp.contentTextSize || 'default',
+        permissions: resp.permissions || [],
+        authenticated: true,
+        profileLoaded: true
+      })
+    },
+    async logout() {
+      const siteStore = useSiteStore()
+      let redirect = '/'
+      try {
+        const resp = await API_CLIENT.post(`sites/${siteStore.id}/auth/logout`).json()
+        redirect = resp?.redirect || '/'
+      } catch (err) {
+        // -> Clear the client either way. Whatever went wrong, someone who clicked Logout must not be
+        //    left looking at a page that still says they are signed in.
+        console.warn(err)
+      }
+      /*
+        And whatever this browser kept of their unsaved edits. Whoever sits down at it next has no
+        business finding somebody else's pages in it, and the account that wrote them is not the one
+        that will be offered them -- see `helpers/editorBuffer.js`. Taken before the id below is gone.
+      */
+      await clearBufferForUser(this.id)
+      this.setToGuest()
+      EVENT_BUS.emit('logout', { redirect })
+    },
+    setToGuest() {
+      this.$patch({
+        id: '10000000-0000-4000-8000-000000000001',
+        email: '',
+        name: '',
+        hasAvatar: false,
+        locale: '',
+        timezone: '',
+        dateFormat: 'YYYY-MM-DD',
+        timeFormat: '12h',
+        appearance: 'site',
+        cvd: 'none',
+        reduceMotion: false,
+        underlineLinks: false,
+        contentTextSize: 'default',
+        permissions: [],
+        // -> Page permissions arrive with the page, so leaving them would keep edit buttons on screen
+        //    for a user who is no longer logged in until they navigate
+        pagePermissions: [],
+        authenticated: false,
+        /*
+          Loaded, not unknown: being a guest IS an answer, and this is where it is recorded — whether
+          it came back from `bootstrap` or from logging out. Left false, every navigation would ask
+          the server who this is all over again, and every reader of a public wiki is a guest.
+        */
+        profileLoaded: true
+      })
+    },
+    getAccessibleColor(base, hexBase) {
+      return getAccessibleColor(base, hexBase, this.cvd)
+    },
+    can(permission) {
+      if (
+        this.permissions.includes('manage:system') ||
+        this.permissions.includes(permission) ||
+        this.pagePermissions.includes(permission)
+      ) {
+        return true
+      }
+      return false
+    },
+    async fetchPagePermissions(path, locale) {
+      if (path.startsWith('/_')) {
+        this.pagePermissions = []
+        return
+      }
+      const siteStore = useSiteStore()
+      try {
+        this.pagePermissions = await API_CLIENT.post(
+          `sites/${siteStore.id}/pages/userPermissions`,
+          {
+            json: {
+              path,
+              // -> Absent means the site's primary locale, as it does everywhere a path is resolved
+              ...(locale && { locale })
+            }
+          }
+        ).json()
+      } catch (err) {
+        console.warn(`Failed to fetch page permissions at path ${path}!`)
+      }
+    },
+    /**
+     * Format a moment as this user asked to see it: their date pattern, their 12h/24h choice, and their
+     * time zone. Word order comes from the locale, which is why `t` is passed in.
+     *
+     * @param date A `Temporal.Instant`, a `Date`, or a string one can be parsed from — what the API
+     *             returns. Nullable columns like `lastLoginAt` are common, so nothing at all formats as
+     *             an empty string rather than blowing up mid-render.
+     */
+    formatDateTime(t, date) {
+      if (!date) {
+        return ''
+      }
+      const zoned = toUserZone(date, this.timezone)
+      return t('common.datetime', {
+        date: formatDatePart(zoned, this.dateFormat),
+        time: formatTimePart(zoned, this.timeFormat)
+      })
+    },
+    /**
+     * The IANA zone every date on screen is rendered in — this user's preference, or this browser's
+     * where they have none or theirs no longer exists.
+     *
+     * Resolved rather than read off `timezone` directly, so that what is displayed as the zone is the
+     * one the timestamps beside it were actually converted to. The two are the same call.
+     */
+    timezoneId() {
+      return resolveZone(this.timezone)
+    },
+    /**
+     * Format the DATE alone, in this user's pattern and zone. For a line with no room for a time, or
+     * where the time says nothing worth reading -- the day an update was released, say.
+     *
+     * No `t`: with only one part there is no word order for a locale to have an opinion about.
+     */
+    formatDate(date) {
+      if (!date) {
+        return ''
+      }
+      return formatDatePart(toUserZone(date, this.timezone), this.dateFormat)
+    }
+  }
+})

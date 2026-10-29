@@ -1,0 +1,2017 @@
+import { sql, type SQL } from 'drizzle-orm'
+import {
+  bigint,
+  boolean,
+  bytea,
+  check,
+  customType,
+  index,
+  integer,
+  jsonb,
+  pgEnum,
+  pgTable,
+  primaryKey,
+  text,
+  timestamp,
+  uniqueIndex,
+  uuid,
+  varchar
+} from 'drizzle-orm/pg-core'
+import type { AnyPgColumn } from 'drizzle-orm/pg-core'
+
+// == CUSTOM TYPES =====================
+
+// -> Typed as a string: an ltree path comes back from the driver as its dotted text form, and every
+//    caller treats it as one
+const ltree = customType<{ data: string }>({
+  dataType() {
+    return 'ltree'
+  }
+})
+const tsvector = customType({
+  dataType() {
+    return 'tsvector'
+  }
+})
+
+// == TABLES ===========================
+
+// API KEYS ----------------------------
+export const apiKeys = pgTable('apiKeys', {
+  id: uuid().primaryKey().defaultRandom(),
+  name: varchar({ length: 255 }).notNull(),
+  // -> Only the tail of the token, to tell keys apart in the admin list. The token itself is a
+  //    signed JWT shown once at creation and never stored: it is a bearer credential, and
+  //    verification needs the public key plus this row's state, not the token.
+  keyShort: varchar({ length: 8 }).notNull(),
+  // -> IDs of the groups whose permissions the key carries. Resolved on every request, so editing a
+  //    group immediately affects the keys pointing at it.
+  groups: jsonb().notNull().default([]),
+  expiration: timestamp().notNull().defaultNow(),
+  isRevoked: boolean().notNull().default(false),
+  createdAt: timestamp().notNull().defaultNow(),
+  updatedAt: timestamp().notNull().defaultNow()
+})
+
+// PERSONAL ACCESS TOKENS --------------
+/**
+ * A user's own API key: signed like one (`models/apiKeys.ts`), but acting AS the user it belongs to,
+ * and only within its scopes. See `models/personalTokens.ts`.
+ *
+ * Revoking deletes the row rather than flagging it: a token is its owner's to throw away, and a row
+ * that is gone authenticates nothing. The audit log is what keeps the record that it existed.
+ */
+export const personalTokens = pgTable(
+  'personalTokens',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    userId: uuid()
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    name: varchar({ length: 255 }).notNull(),
+    // -> Only the tail of the token, as for an API key: the token itself is never stored
+    keyShort: varchar({ length: 8 }).notNull(),
+    // -> `<category>:<level>` strings, at most one per category — `['pages:write', 'comments:read']`.
+    //    Read from here on every request rather than from the token, so the row is the one answer.
+    scopes: jsonb().notNull().default([]),
+    expiration: timestamp().notNull(),
+    // -> Written at most every few minutes per token and instance, so it is approximate by design
+    lastUsedAt: timestamp(),
+    /*
+      An OAuth grant: the token a consent screen made for an MCP client, rather than one its owner
+      made by hand. Null for every token made under Profile → Access Tokens. A grant's access tokens
+      live an hour and are accepted on `/_mcp` alone; `expiration` is the grant's own lifetime, past
+      which no refresh succeeds. See `models/oauth.ts`.
+    */
+    clientId: uuid().references(() => oauthClients.id, { onDelete: 'cascade' }),
+    // -> SHA-256 of the current refresh token's secret, rotated on every use. Never the token
+    refreshHash: varchar({ length: 64 }),
+    createdAt: timestamp().notNull().defaultNow(),
+    updatedAt: timestamp().notNull().defaultNow()
+  },
+  (table) => [
+    index('personalTokens_userId_idx').on(table.userId),
+    index('personalTokens_clientId_idx').on(table.clientId)
+  ]
+)
+
+// OAUTH CLIENTS -----------------------
+/**
+ * An MCP client that registered itself (RFC 7591) to be granted access through the OAuth flow — a
+ * connector in claude.ai or ChatGPT. Inert on its own: it can do nothing until a person consents, and
+ * one no grant ever named is purged after a day. Deleting one takes every grant made to it with it.
+ * See `models/oauth.ts`.
+ */
+export const oauthClients = pgTable('oauthClients', {
+  id: uuid().primaryKey().defaultRandom(),
+  name: varchar({ length: 255 }).notNull(),
+  // -> Matched exactly at authorization: a client is sent back only to an address it registered
+  redirectUris: jsonb().notNull().default([]),
+  createdAt: timestamp().notNull().defaultNow()
+})
+
+// OAUTH CODES -------------------------
+/**
+ * An authorization code a person's consent produced, waiting to be exchanged at the token endpoint.
+ * Single use and short-lived; the row is deleted when it is exchanged. Holds what the grant is to be:
+ * who consented, to which scopes and for how long, and the PKCE challenge the exchange must answer.
+ */
+export const oauthCodes = pgTable(
+  'oauthCodes',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    // -> SHA-256 of the code. Never the code
+    codeHash: varchar({ length: 64 }).notNull(),
+    clientId: uuid()
+      .notNull()
+      .references(() => oauthClients.id, { onDelete: 'cascade' }),
+    userId: uuid()
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    siteId: uuid()
+      .notNull()
+      .references(() => sites.id, { onDelete: 'cascade' }),
+    redirectUri: varchar({ length: 2048 }).notNull(),
+    codeChallenge: varchar({ length: 128 }).notNull(),
+    scopes: jsonb().notNull().default([]),
+    // -> The grant's lifetime, as one of `KEY_EXPIRATIONS`, chosen on the consent screen
+    grantExpiration: varchar({ length: 16 }).notNull(),
+    expiresAt: timestamp().notNull(),
+    createdAt: timestamp().notNull().defaultNow()
+  },
+  (table) => [uniqueIndex('oauthCodes_codeHash_idx').on(table.codeHash)]
+)
+
+// APPROVAL RULES ----------------------
+/**
+ * Which pages accept edit suggestions, who may submit them, and who reviews them.
+ *
+ * Per site, and matched the way group page rules are: a mode plus a pattern. A page no rule matches
+ * accepts no suggestions at all, so this table being empty means the feature is off.
+ */
+export const approvalRules = pgTable(
+  'approvalRules',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    name: varchar({ length: 255 }).notNull().default(''),
+    // -> A rule can be turned off without losing what it says, which is how an administrator suspends
+    //    suggestions on a section without having to write the rule again afterwards.
+    isEnabled: boolean().notNull().default(true),
+    // -> One of START / EXACT / SUBTREE / END / REGEX / TAG / TAGALL, matched the way group page rules are. A
+    //    varchar rather than an enum so that adding a mode does not need a migration; the API schema
+    //    is what rejects an unknown one.
+    match: varchar({ length: 16 }).notNull().default('START'),
+    path: varchar({ length: 2048 }).notNull().default(''),
+    // -> Group IDs. Resolved on use rather than joined, so deleting a group takes effect at once, the
+    //    way `apiKeys.groups` works.
+    submitterGroups: jsonb().notNull().default([]),
+    reviewerGroups: jsonb().notNull().default([]),
+    createdAt: timestamp().notNull().defaultNow(),
+    updatedAt: timestamp().notNull().defaultNow(),
+    siteId: uuid()
+      .notNull()
+      .references(() => sites.id)
+  },
+  (table) => [index('approvalRules_siteId_idx').on(table.siteId)]
+)
+
+// ASSETS ------------------------------
+export const assetKindEnum = pgEnum('assetKind', ['document', 'image', 'other'])
+export const assets = pgTable(
+  'assets',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    fileName: varchar({ length: 255 }).notNull(),
+    fileExt: varchar({ length: 255 }).notNull(),
+    isSystem: boolean().notNull().default(false),
+    kind: assetKindEnum().notNull().default('other'),
+    mimeType: varchar({ length: 255 }).notNull().default('application/octet-stream'),
+    fileSize: bigint({ mode: 'number' }), // in bytes
+    meta: jsonb().notNull().default({}),
+    createdAt: timestamp().notNull().defaultNow(),
+    updatedAt: timestamp().notNull().defaultNow(),
+    // -> Set only while the database is one of the targets configured to store this kind of file.
+    //    An asset is written to every target that claims it, and each derives where its own copy
+    //    sits from the tree, so there is nothing to record here about where the bytes went.
+    data: bytea(),
+    preview: bytea(),
+    authorId: uuid()
+      .notNull()
+      .references(() => users.id),
+    siteId: uuid()
+      .notNull()
+      .references(() => sites.id)
+  },
+  (table) => [index('assets_siteId_idx').on(table.siteId)]
+)
+
+// AUDIT LOG ---------------------------
+/**
+ * What somebody did, one row per action.
+ *
+ * Only actions a *person* took: every row is written from an API route handler, which is the one
+ * place the requester's identity and address are both in hand, and is by construction never reached
+ * by the scheduler or a storage sync. A job that creates a page therefore leaves no row here, which
+ * is the point — an audit log is a record of who did something, and "the wiki did it" is not an
+ * answer anybody audits.
+ *
+ * Reads are not recorded. Page views would outnumber everything else by orders of magnitude and
+ * bury the log, and failed logins are left out on purpose: a credential-stuffing run would otherwise
+ * fill the table on demand from the outside. A login that *succeeded* is recorded, since that is the
+ * event with consequences.
+ *
+ * Nothing here duplicates what another table already keeps. A page edit records the `pageHistory`
+ * version its change produced and nothing about the change itself — the before and after live there,
+ * and copying them would make this table enormous as well as wrong the moment the two disagreed.
+ */
+export const auditLog = pgTable(
+  'auditLog',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    ts: timestamp().notNull().defaultNow(),
+    /**
+     * Which part of the wiki the action belongs to: `page`, `asset`, `auth`, `profile` or `admin`.
+     * A varchar rather than an enum, for the same reason `pageHistory.action` is one — naming
+     * another area later should not need a migration. `AUDIT_KINDS` in `models/auditLog.ts` is the
+     * list that decides.
+     */
+    kind: varchar({ length: 16 }).notNull(),
+    /**
+     * What was done, camelCase — `createPage`, `editSite`, `login`. Deliberately a key rather than a
+     * sentence: it is what the interface looks a translation up by, and what a filter matches on.
+     * `AUDIT_ACTIONS` in `models/auditLog.ts` is the full list.
+     */
+    action: varchar({ length: 64 }).notNull(),
+    /** Where the request came from. 45 characters is the longest an IPv6 address can be written. */
+    clientIP: varchar({ length: 45 }).notNull().default(''),
+    /**
+     * The context of the action: which page, site or account it touched, and always an `actor` block
+     * carrying the email, display name and address the requester had AT THE TIME. That copy is the
+     * point of it — `userId` goes null when the account is deleted, and a log that then said only
+     * "somebody" would have lost exactly what it existed to record.
+     *
+     * Never anything secret. `sanitizeMeta` in `helpers/audit.ts` is the backstop, but the rule is
+     * that a route does not put a password, a token or a module's sensitive prop in here to begin
+     * with.
+     */
+    meta: jsonb().notNull().default({}),
+    // -> Set null rather than cascade: deleting an account must not delete the record of what it
+    //    did. The name and email on `meta.actor` are what the row is read by afterwards.
+    userId: uuid().references(() => users.id, { onDelete: 'set null' })
+  },
+  (table) => [
+    // -> The unfiltered view: newest first, which is the only order this table is ever read in
+    index('auditLog_ts_idx').on(table.ts.desc()),
+    // -> One index per filter, each carrying `ts` so that narrowing by it still comes back ordered
+    index('auditLog_userId_idx').on(table.userId, table.ts.desc()),
+    index('auditLog_kind_idx').on(table.kind, table.ts.desc()),
+    index('auditLog_action_idx').on(table.action, table.ts.desc())
+  ]
+)
+
+// AUTHENTICATION ----------------------
+export const authentication = pgTable('authentication', {
+  id: uuid().primaryKey().defaultRandom(),
+  module: varchar({ length: 255 }).notNull(),
+  isEnabled: boolean().notNull().default(false),
+  displayName: varchar({ length: 255 }).notNull().default(''),
+  config: jsonb().notNull().default({}),
+  registration: boolean().notNull().default(false),
+  allowedEmailRegex: varchar({ length: 255 }).notNull().default(''),
+  autoEnrollGroups: uuid().array().default([])
+})
+
+// BLOCKS ------------------------------
+/**
+ * One block available to one site — `<block-diagram>` on this wiki.
+ *
+ * A built-in block's row is metadata only: what it can do comes from the compiled manifest, which
+ * `models/blocks.ts` reads off disk at boot and reconciles against these rows. A CUSTOM block has no
+ * disk to read, so the three columns below carry the whole of it — what it declares, and the bytes
+ * that draw it. See `helpers/wkblock.ts` for the package they arrived in.
+ *
+ * Per site, package and all: a `.wkblock` imported into three sites is stored three times. That is
+ * the same answer every other per-site setting gives, and the alternative — one shared copy with the
+ * sites counted off it — buys a few megabytes at the cost of one site's upgrade changing another's
+ * block.
+ */
+export const blocks = pgTable(
+  'blocks',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    block: varchar({ length: 255 }).notNull(),
+    name: varchar({ length: 255 }).notNull(),
+    description: varchar({ length: 255 }).notNull(),
+    icon: varchar({ length: 255 }).notNull(),
+    isEnabled: boolean().notNull().default(false),
+    isCustom: boolean().notNull().default(false),
+    config: jsonb().notNull().default({}),
+    /**
+     * What a CUSTOM block declares — its props, its template, its content editor — as its package's
+     * copy of the component's `static definition`. Empty for a built-in, whose definition is read
+     * from the compiled manifest instead, so that an updated block describes itself correctly the
+     * moment it is deployed rather than whenever a row was last written.
+     */
+    definition: jsonb().notNull().default({}),
+    /**
+     * The `.wkblock` file a custom block was imported from, kept verbatim. Null for a built-in.
+     *
+     * This is the only copy: the files served to a browser are unpacked from it into
+     * `<dataPath>/cache/blocks`, which is a cache and starts empty on a fresh container.
+     */
+    packageData: bytea(),
+    /**
+     * SHA-256 of that package, and the name of its directory in the disk cache.
+     *
+     * Which is what makes re-importing a block take effect: the files on disk are stale exactly when
+     * they were unpacked under a different digest, and every instance in an HA set works that out for
+     * itself without being told. Empty for a built-in.
+     */
+    checksum: varchar({ length: 64 }).notNull().default(''),
+    siteId: uuid()
+      .notNull()
+      .references(() => sites.id)
+  },
+  (table) => [index('blocks_siteId_idx').on(table.siteId)]
+)
+
+// COMMENTS ----------------------------
+/**
+ * One comment on one page, for the BUILT-IN comments provider.
+ *
+ * The other providers are a snippet of markup and an account somewhere else, so nothing about them
+ * reaches this table — it exists for the provider that is this wiki. See `models/comments.ts`.
+ *
+ * Replies are one level deep and that is enforced in the model: a reply names the comment it answers
+ * in `parentId`, and a reply to a reply is attached to that reply's own parent rather than nesting
+ * further.
+ *
+ * **Deleting a comment that has replies keeps its row**, emptied, with `deletedAt` set: the replies
+ * are other people's words and stay where they were, under a placeholder saying the comment they
+ * answered was deleted. Content, author and annotations are cleared from that row, so nothing of what
+ * was deleted is left to serve. A comment with no replies is simply deleted, and so is a placeholder
+ * once the last reply under it goes (`models/comments.ts`). The foreign key still cascades, for the
+ * deletions that are not one comment at a time — a page, and everything said about it.
+ *
+ * `content` is markdown source and there is no stored render. It is turned into HTML in the reader's
+ * browser (`frontend/src/renderers/comment.js`) with raw HTML disabled, the same way a page's
+ * markdown becomes HTML in the browser — which also means a mention re-resolves every time it is
+ * drawn rather than freezing whatever a handle pointed at on the day it was written.
+ */
+export const comments = pgTable(
+  'comments',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    pageId: uuid()
+      .notNull()
+      .references(() => pages.id, { onDelete: 'cascade' }),
+    /**
+     * The comment this one answers, or null for one that starts a thread.
+     *
+     * The annotation breaks the circular inference a self-reference would otherwise cause
+     * (TS7022/TS7024), the same way the generated column on `pages` does.
+     */
+    parentId: uuid().references((): AnyPgColumn => comments.id, { onDelete: 'cascade' }),
+    /** Markdown source as it was typed. Never HTML — see the note above. */
+    content: text().notNull(),
+    /**
+     * The account that wrote it, or null for a guest — and also null once that account is deleted,
+     * which is why the name below is kept alongside rather than only joined for.
+     */
+    authorId: uuid().references(() => users.id, { onDelete: 'set null' }),
+    /**
+     * Who it says wrote it. What a guest typed into the form, and for a signed-in author a copy of
+     * their display name as it stood — used only when the account behind `authorId` is gone, since a
+     * rename should show through everywhere else.
+     */
+    authorName: varchar({ length: 255 }).notNull(),
+    /**
+     * A guest's email address. Required of a guest, empty for a signed-in author (the account has
+     * one), and never sent to a client: it is here for the spam check and for whatever moderation
+     * grows out of it.
+     */
+    authorEmail: varchar({ length: 255 }).notNull().default(''),
+    /** The address it was posted from, kept for the same reasons as the audit log's. Never served. */
+    authorIP: varchar({ length: 255 }).notNull().default(''),
+    /**
+     * Room for what a comment may grow: votes, a pin, a moderation state. Nothing reads it yet, and
+     * nothing should write a key into it without deciding what an absent one means.
+     */
+    meta: jsonb().notNull().default({}),
+    /**
+     * When it was deleted, for a comment kept as a placeholder because it has replies. Null for every
+     * comment that is still there. See the note on the table.
+     */
+    deletedAt: timestamp(),
+    createdAt: timestamp().notNull().defaultNow(),
+    updatedAt: timestamp().notNull().defaultNow()
+  },
+  (table) => [
+    // -> The talk view's own query: every comment on a page, oldest first
+    index('comments_page_created_idx').on(table.pageId, table.createdAt),
+    index('comments_parentId_idx').on(table.parentId),
+    index('comments_authorId_idx').on(table.authorId)
+  ]
+)
+
+/**
+ * A passage of the article a comment is about, and what was said about it.
+ *
+ * Rows of their own rather than a list in `comments.meta`, because each one has a life of its own
+ * after it is posted: it is resolved and reopened, its note is edited and it is deleted, one at a
+ * time and by people other than the comment's author. Only a comment that starts a thread carries
+ * any — a reply answers the comment, not the page.
+ *
+ * **The passage is described, never pointed at.** `anchor` holds the quoted text, a little of what
+ * surrounded it, and the heading it sat under — no element path, no offset into the stored render.
+ * A page is edited after it is annotated, and a description is what can be found again in a page
+ * that has moved on; a pointer is only right about the version it was taken from. The matching is
+ * the browser's, against the article as drawn (`frontend/src/helpers/annotations.js`), which is the
+ * same text the passage was selected from.
+ */
+export const commentAnnotations = pgTable(
+  'commentAnnotations',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    commentId: uuid()
+      .notNull()
+      .references(() => comments.id, { onDelete: 'cascade' }),
+    /** Where it comes in its comment, from 0 — the order the passages were picked in. */
+    position: integer().notNull().default(0),
+    /** What was said about the passage. Markdown, drawn the way a comment is. */
+    note: text().notNull(),
+    /**
+     * The passage: `{ exact, prefix, suffix, heading, offset }`. See `CommentAnchor` in
+     * `models/comments.ts`, which is the shape, and the note on the table, which is why.
+     */
+    anchor: jsonb().notNull(),
+    /** When it was marked done, or null while it is open. */
+    resolvedAt: timestamp(),
+    /** Who marked it done. Kept as an id only: a resolution is a state, not something said. */
+    resolvedById: uuid().references(() => users.id, { onDelete: 'set null' }),
+    createdAt: timestamp().notNull().defaultNow(),
+    updatedAt: timestamp().notNull().defaultNow()
+  },
+  (table) => [index('commentAnnotations_commentId_idx').on(table.commentId, table.position)]
+)
+
+// FEEDBACK STATUSES -------------------
+/**
+ * Where an idea on a feedback board stands: Open, Under Review, Planned, In Progress, Completed or
+ * Closed. See `models/feedback.ts`.
+ *
+ * **No row means `open`.** An idea is any page in a board's folder, and nothing is written on it to
+ * say so -- so creating one writes nothing here, and a page moved into a board is an open idea without
+ * anything having to notice. A row left behind by an idea moved out of its board is harmless: nothing
+ * reads it until the page is in a board again, and then it is that page's status.
+ *
+ * A table rather than a column or a field of `pages.config`, because a status is what the board's
+ * maintainers say about an idea rather than part of it: setting one must not make a page version,
+ * re-render, re-index or copy the page to a storage target, all of which a page write does. Its
+ * history is the audit log (`setFeedbackStatus`); only the current status is kept here.
+ */
+export const feedbackStatuses = pgTable(
+  'feedbackStatuses',
+  {
+    pageId: uuid()
+      .primaryKey()
+      .references(() => pages.id, { onDelete: 'cascade' }),
+    /** One of `FEEDBACK_STATUSES`, checked by the model rather than a postgres enum. */
+    status: varchar({ length: 32 }).notNull(),
+    /** The comment posted with the latest change, if one was. Cleared when that comment goes. */
+    commentId: uuid().references(() => comments.id, { onDelete: 'set null' }),
+    updatedAt: timestamp().notNull().defaultNow(),
+    /** Who set it. Kept as an id only, as a resolution is: a status is a state, not something said. */
+    updatedById: uuid().references(() => users.id, { onDelete: 'set null' })
+  },
+  (table) => [index('feedbackStatuses_status_idx').on(table.status)]
+)
+
+// GLOSSARY ----------------------------
+
+/**
+ * One term of a site's glossary, in one locale. See `dev/specs/glossary.md`.
+ *
+ * **A name means one term.** The term and every alias share one namespace per site and locale,
+ * compared with `lower()`. The unique index below is the database's half of that, term against term;
+ * everything involving an alias is checked by the model, since an index cannot reach into an array
+ * and compare it against another row's scalar.
+ *
+ * `caseSensitive` is about how the term is matched IN TEXT and never about uniqueness: `REST` and
+ * `rest` cannot be two terms either way.
+ */
+export const glossaryTerms = pgTable(
+  'glossaryTerms',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    siteId: uuid()
+      .notNull()
+      .references(() => sites.id, { onDelete: 'cascade' }),
+    locale: varchar({ length: 255 }).notNull(),
+    term: varchar({ length: 255 }).notNull(),
+    /** The full form, when the term is an abbreviation. */
+    expansion: varchar({ length: 255 }),
+    /** Basic markdown source, rendered in the browser with raw HTML disabled. Never HTML. */
+    definition: text().notNull().default(''),
+    aliases: text()
+      .array()
+      .notNull()
+      .default(sql`ARRAY[]::text[]`),
+    /** A page path in the term's own locale, with no locale prefix. Looked up when read. */
+    documentationPath: varchar({ length: 255 }),
+    /** Null for the default, "Read more", which is a locale string and not stored. */
+    documentationLabel: varchar({ length: 255 }),
+    /** `[{ url, label }]`, in the order given. */
+    references: jsonb().notNull().default([]),
+    caseSensitive: boolean().notNull().default(false),
+    /** Whether the term is linked automatically in page text. Nothing reads it yet. */
+    autoLink: boolean().notNull().default(true),
+    category: varchar({ length: 255 }),
+    creatorId: uuid().references(() => users.id, { onDelete: 'set null' }),
+    /** Who saved it last. */
+    authorId: uuid().references(() => users.id, { onDelete: 'set null' }),
+    createdAt: timestamp().notNull().defaultNow(),
+    /** Also the concurrency token: a save names the one it was opened with. */
+    updatedAt: timestamp().notNull().defaultNow()
+  },
+  (table) => [
+    index('glossaryTerms_site_locale_idx').on(table.siteId, table.locale),
+    uniqueIndex('glossaryTerms_site_locale_term_key').on(
+      table.siteId,
+      table.locale,
+      sql`lower(${table.term})`
+    ),
+    // -> What a page move with `updateLinks` looks terms up by
+    index('glossaryTerms_documentation_idx')
+      .on(table.siteId, table.locale, table.documentationPath)
+      .where(sql`"documentationPath" IS NOT NULL`)
+  ]
+)
+
+/**
+ * Two related glossary terms. Related is two-way, so a pair is ONE row, read from both sides.
+ *
+ * The check stores the smaller id first, which is what makes "A is related to B" and "B is related
+ * to A" the same row rather than two that could disagree. A join table rather than an array on the
+ * term, so that deleting a term takes it out of every other term's list by cascade alone.
+ */
+export const glossaryTermRelations = pgTable(
+  'glossaryTermRelations',
+  {
+    termId: uuid()
+      .notNull()
+      .references(() => glossaryTerms.id, { onDelete: 'cascade' }),
+    relatedId: uuid()
+      .notNull()
+      .references(() => glossaryTerms.id, { onDelete: 'cascade' })
+  },
+  (table) => [
+    primaryKey({ columns: [table.termId, table.relatedId] }),
+    index('glossaryTermRelations_relatedId_idx').on(table.relatedId),
+    check('glossaryTermRelations_order_check', sql`${table.termId} < ${table.relatedId}`)
+  ]
+)
+
+// GROUPS ------------------------------
+export const groups = pgTable(
+  'groups',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    name: varchar({ length: 255 }).notNull(),
+    permissions: jsonb().notNull(),
+    rules: jsonb().notNull(),
+    redirectOnLogin: varchar({ length: 255 }).notNull().default(''),
+    redirectOnFirstLogin: varchar({ length: 255 }).notNull().default(''),
+    redirectOnLogout: varchar({ length: 255 }).notNull().default(''),
+    isSystem: boolean().notNull().default(false),
+    /**
+     * What the directory provisioning this group calls it, as SCIM's `externalId`.
+     *
+     * Null for a group created here, and optional even for one that was not: `externalId` is a
+     * SHOULD in RFC 7643 and not every client sends it. Which is why it is not the thing that says
+     * who owns the group — `isProvisioned` is.
+     */
+    externalId: varchar({ length: 255 }),
+    /**
+     * Whether a SCIM client owns this group. Set by the first provisioning write and never cleared
+     * automatically; it is what lets SCIM delete a group it created while leaving one an
+     * administrator made by hand alone. See `models/scim.ts`.
+     */
+    isProvisioned: boolean().notNull().default(false),
+    createdAt: timestamp().notNull().defaultNow(),
+    updatedAt: timestamp().notNull().defaultNow()
+  },
+  (table) => [
+    // -> Nulls are distinct to postgres, which is what lets any number of groups have no external id
+    uniqueIndex('groups_externalId_idx').on(table.externalId)
+  ]
+)
+
+// HOOKS -------------------------------
+export const hookStateEnum = pgEnum('hookState', ['pending', 'success', 'error'])
+export const hooks = pgTable('hooks', {
+  id: uuid().primaryKey().defaultRandom(),
+  name: varchar({ length: 255 }).notNull(),
+  // -> Event keys such as `page:create`, matched against what the server emits
+  events: text()
+    .array()
+    .notNull()
+    .default(sql`ARRAY[]::text[]`),
+  url: text().notNull(),
+  includeMetadata: boolean().notNull().default(true),
+  includeContent: boolean().notNull().default(false),
+  acceptUntrusted: boolean().notNull().default(false),
+  // -> Sent verbatim as the Authorization header, so it holds whatever secret the remote expects
+  authHeader: text(),
+  // -> Outcome of the most recent delivery, which is what the admin list shows
+  state: hookStateEnum().notNull().default('pending'),
+  lastErrorMessage: text(),
+  createdAt: timestamp().notNull().defaultNow(),
+  updatedAt: timestamp().notNull().defaultNow()
+})
+
+// ICONS -------------------------------
+// -> An Iconify icon set the wiki draws icons from, e.g. `mdi`. Adding one makes its icons
+//    searchable; individual icons are only stored once something references them.
+export const iconSets = pgTable('iconSets', {
+  // -> The Iconify prefix, which is what content references: `<prefix>:<name>`
+  prefix: varchar({ length: 64 }).primaryKey(),
+  name: varchar({ length: 255 }).notNull(),
+  isEnabled: boolean().notNull().default(true),
+  // -> Iconify collection metadata (author, license, total, palette, samples, ...) as published by
+  //    the upstream API, refreshed on demand rather than being authored here
+  info: jsonb().notNull().default({}),
+  refreshedAt: timestamp(),
+  createdAt: timestamp().notNull().defaultNow()
+})
+
+// -> The permanent home of every icon the wiki has ever served. Fetched from the Iconify API on first
+//    use, then never fetched again: the disk cache is derived from these rows and may be empty.
+export const icons = pgTable(
+  'icons',
+  {
+    prefix: varchar({ length: 64 })
+      .notNull()
+      .references(() => iconSets.prefix),
+    name: varchar({ length: 255 }).notNull(),
+    // -> The SVG markup inside the `<svg>` element, with `currentColor` left as-is
+    body: text().notNull(),
+    // -> Resolved Iconify icon properties: the viewBox is `left top width height`, and the transform
+    //    flags apply on top of it. Aliases are resolved before storing, so a row is self-contained.
+    width: integer().notNull().default(16),
+    height: integer().notNull().default(16),
+    left: integer().notNull().default(0),
+    top: integer().notNull().default(0),
+    rotate: integer().notNull().default(0),
+    hFlip: boolean().notNull().default(false),
+    vFlip: boolean().notNull().default(false),
+    createdAt: timestamp().notNull().defaultNow()
+  },
+  (table) => [primaryKey({ columns: [table.prefix, table.name] })]
+)
+
+// IMPORT SESSIONS ---------------------
+/**
+ * One run of **Administration → Utilities → Import from Wiki.js 2.x**, from the moment the operator
+ * presses Start until the package has been walked.
+ *
+ * A row rather than memory, for two reasons that both come from the import living in a browser tab:
+ * in an HA set the next batch is answered by a different instance, and a tab that closed has to be
+ * able to say where it got to. See `dev/specs/wkbackup.md` §7.
+ *
+ * Everything the handlers need to agree about across thousands of requests is here — which target
+ * site each package site lands in, what the operator ticked, and the group mapping the user records
+ * resolve through — so a batch carries only its own records.
+ */
+export const importSessionStateEnum = pgEnum('importSessionState', ['open', 'finished', 'failed'])
+export const importSessions = pgTable(
+  'importSessions',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    /**
+     * The UUIDv5 namespace the derived ids of this import are built in.
+     *
+     * **Derived, not random** — from the source wiki and the site being imported into, so that the
+     * same package run into the same site a second time derives the same ids and upserts, while two
+     * operators importing two different packages cannot collide. It has to survive the SESSION and
+     * not just outlive a batch: an import that fell over is re-run from the top, which would
+     * otherwise mean a second copy of every comment and every history entry — the two record kinds
+     * with no natural key to match on. See `dev/specs/wkbackup.md` §4.
+     */
+    namespace: uuid().notNull(),
+    /** `manifest.source.kind`. Only `wikijs2` is implemented. */
+    source: varchar({ length: 32 }).notNull(),
+    /** `[{ sourceId, siteId }]` — each package site paired with the target site it lands in. */
+    sites: jsonb().notNull().default([]),
+    /** Which content kinds the operator ticked. A stream for anything absent is refused. */
+    includes: jsonb().notNull().default([]),
+    overwrite: boolean().notNull().default(false),
+    /**
+     * What to do with a page 2.x wrote as HTML — its WYSIWYG and code editors.
+     *
+     * `markdown` converts it and files it under 3.x's visual editor, so it stays editable the way it
+     * was written; `html` keeps the HTML exactly as it stands, which renders identically but is only
+     * editable as source. It is a per-import choice because it is a trade the operator has to make
+     * rather than one this code can make for them: a conversion is a rewrite of their content, and
+     * the alternative is a wiki nobody can edit visually again.
+     */
+    htmlConversion: varchar({ length: 16 }).notNull().default('markdown'),
+    state: importSessionStateEnum().notNull().default('open'),
+    /** `{ <stream>: <records written> }`, which is what a resumed tab reads to find its place. */
+    progress: jsonb().notNull().default({}),
+    /** Everything the import could not carry, in the order it was found. Shown in the log. */
+    warnings: jsonb().notNull().default([]),
+    /**
+     * Who is running it. Null once that account is gone, which costs nothing: a finished session is
+     * a receipt, and the audit log is where the act itself is recorded.
+     *
+     * Also what `usersStream` compares each record against — the account running the import is never
+     * written to, whatever `overwrite` says.
+     */
+    actorId: uuid().references(() => users.id, { onDelete: 'set null' }),
+    createdAt: timestamp().notNull().defaultNow(),
+    updatedAt: timestamp().notNull().defaultNow()
+  },
+  (table) => [index('importSessions_createdAt_idx').on(table.createdAt)]
+)
+
+/**
+ * What a record from the source wiki became here — its 2.x integer id paired with the row it is now.
+ *
+ * A table rather than a blob on the session, because the things that have to be looked up this way
+ * are unbounded: a page's author is a 2.x user id, a comment names its page by 2.x page id, and a
+ * wiki has as many of those as it has users and pages. A jsonb column rewritten once per batch would
+ * be megabytes of write amplification by the end of a large import, where this is an insert per
+ * record and one indexed read per batch.
+ *
+ * It exists because the package speaks 2.x's ids and this wiki matches on natural keys — a user by
+ * email, a page by path. Those two answers have to be joined up somewhere, and only for the entities
+ * something actually references: users, pages and groups.
+ *
+ * Rows go with the session, which is what stops this becoming a permanent record of somebody's old
+ * instance.
+ */
+export const importIdMap = pgTable(
+  'importIdMap',
+  {
+    sessionId: uuid()
+      .notNull()
+      .references(() => importSessions.id, { onDelete: 'cascade' }),
+    /** `user`, `page` or `group`. */
+    entity: varchar({ length: 32 }).notNull(),
+    /** The id the source wiki knew it by, as text — 2.x numbers them, a 3.x package would not. */
+    sourceId: varchar({ length: 255 }).notNull(),
+    targetId: uuid().notNull()
+  },
+  (table) => [primaryKey({ columns: [table.sessionId, table.entity, table.sourceId] })]
+)
+
+// JOB HISTORY -------------------------
+export const jobHistoryStateEnum = pgEnum('jobHistoryState', [
+  'active',
+  'completed',
+  'failed',
+  'interrupted'
+])
+export const jobHistory = pgTable('jobHistory', {
+  id: uuid().primaryKey().defaultRandom(),
+  task: varchar({ length: 255 }).notNull(),
+  state: jobHistoryStateEnum().notNull(),
+  useWorker: boolean().notNull().default(false),
+  wasScheduled: boolean().notNull().default(false),
+  payload: jsonb(),
+  attempt: integer().notNull().default(1),
+  maxRetries: integer().notNull().default(0),
+  lastErrorMessage: text(),
+  executedBy: varchar({ length: 255 }),
+  createdAt: timestamp().notNull(),
+  startedAt: timestamp().notNull().defaultNow(),
+  completedAt: timestamp()
+})
+
+// JOB SCHEDULE ------------------------
+export const jobSchedule = pgTable('jobSchedule', {
+  id: uuid().primaryKey().defaultRandom(),
+  task: varchar({ length: 255 }).notNull(),
+  cron: varchar({ length: 255 }).notNull(),
+  type: varchar({ length: 255 }).notNull().default('system'),
+  payload: jsonb(),
+  createdAt: timestamp().notNull().defaultNow(),
+  updatedAt: timestamp().notNull().defaultNow()
+})
+
+// JOB LOCK ----------------------------
+export const jobLock = pgTable('jobLock', {
+  key: varchar({ length: 255 }).primaryKey(),
+  lastCheckedBy: varchar({ length: 255 }),
+  lastCheckedAt: timestamp().notNull().defaultNow()
+})
+
+// JOBS --------------------------------
+export const jobs = pgTable('jobs', {
+  id: uuid().primaryKey().defaultRandom(),
+  task: varchar({ length: 255 }).notNull(),
+  useWorker: boolean().notNull().default(false),
+  payload: jsonb(),
+  retries: integer().notNull().default(0),
+  maxRetries: integer().notNull().default(0),
+  waitUntil: timestamp(),
+  isScheduled: boolean().notNull().default(false),
+  createdBy: varchar({ length: 255 }),
+  createdAt: timestamp().notNull().defaultNow(),
+  updatedAt: timestamp().notNull().defaultNow()
+})
+
+// LIVE NOTES --------------------------
+/**
+ * A scratch document edited live by whoever has its URL — see `models/liveNotes.ts`.
+ *
+ * Not a page: it has no path in the tree, no page rules and no render. What it is, is the shared Yjs
+ * document a collaboration room holds, kept between sessions — `state` is that document, and `content`
+ * and `title` are read off it on every write so that nothing has to decode a CRDT to list a note or,
+ * later, convert one into a page.
+ */
+export const liveNotes = pgTable(
+  'liveNotes',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    siteId: uuid()
+      .notNull()
+      .references(() => sites.id, { onDelete: 'cascade' }),
+    /**
+     * What `/n/<key>` names the note by: 24 random characters, or whatever its creator typed into the
+     * URL. Case-sensitive, unique per site, and the only thing a URL carries.
+     */
+    key: varchar({ length: 64 }).notNull(),
+    /** The first heading of the content, or empty. Derived; never written on its own. */
+    title: varchar({ length: 255 }).notNull().default(''),
+    /**
+     * Who besides its creator may do what with it: `editable` (anybody signed in with the key reads
+     * and writes), `locked` (they read), `private` (they do neither). See `liveNotes.rightsFor`.
+     */
+    access: varchar({ length: 16 }).notNull().default('editable'),
+    /** The markdown source, as of the last write of `state`. Derived from it, never the other way. */
+    content: text().notNull().default(''),
+    /** The room's Yjs document, as one update. Null until somebody has typed something. */
+    state: bytea(),
+    /** Who typed since the last revision. Moved onto that revision when it is taken, and emptied. */
+    pendingAuthorIds: uuid()
+      .array()
+      .notNull()
+      .default(sql`ARRAY[]::uuid[]`),
+    creatorId: uuid().references(() => users.id, { onDelete: 'set null' }),
+    /** Who typed into the note most recently, as of `updatedAt`. Null until somebody has. */
+    lastEditorId: uuid().references(() => users.id, { onDelete: 'set null' }),
+    createdAt: timestamp().notNull().defaultNow(),
+    /** When somebody last typed into the note — not when a revision was last taken. */
+    updatedAt: timestamp().notNull().defaultNow()
+  },
+  (table) => [
+    // -> Per site, since a custom key is somebody's choice and two sites may each make the same one.
+    //    Leading with the site, it also serves every lookup by site alone
+    uniqueIndex('liveNotes_siteId_key_key').on(table.siteId, table.key)
+  ]
+)
+
+/**
+ * A live note as it stood at one moment — the continuous history the revisions dialog lists.
+ *
+ * Taken by the room as the note is written (`liveNotes.persist`), at most once per
+ * `REVISION_INTERVAL` and once more when the last participant leaves, and only when the content
+ * differs from the revision before it.
+ */
+export const liveNoteRevisions = pgTable(
+  'liveNoteRevisions',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    noteId: uuid()
+      .notNull()
+      .references(() => liveNotes.id, { onDelete: 'cascade' }),
+    content: text().notNull(),
+    /** Everybody who typed between the previous revision and this one. */
+    authorIds: uuid()
+      .array()
+      .notNull()
+      .default(sql`ARRAY[]::uuid[]`),
+    createdAt: timestamp().notNull().defaultNow()
+  },
+  (table) => [index('liveNoteRevisions_noteId_createdAt_idx').on(table.noteId, table.createdAt)]
+)
+
+/**
+ * The images added to a live note: every one ever uploaded into it, whether or not its content still
+ * shows it — a revision may, and restoring one should not find its picture gone.
+ *
+ * What deleting the note deletes along with it (`liveNotes.delete`). The images are ordinary assets
+ * in the hidden `n` folder (`NOTE_IMAGES_FOLDER`), so they are stored and served like any other file;
+ * this list is the only thing that says which note each belongs to. An asset deleted some other way —
+ * a git pull that removed the file — takes its row with it.
+ */
+export const liveNoteImages = pgTable(
+  'liveNoteImages',
+  {
+    assetId: uuid()
+      .primaryKey()
+      .references(() => assets.id, { onDelete: 'cascade' }),
+    noteId: uuid()
+      .notNull()
+      .references(() => liveNotes.id, { onDelete: 'cascade' }),
+    createdAt: timestamp().notNull().defaultNow()
+  },
+  (table) => [index('liveNoteImages_noteId_idx').on(table.noteId)]
+)
+
+// LOCALES -----------------------------
+export const locales = pgTable(
+  'locales',
+  {
+    code: varchar({ length: 255 }).primaryKey(),
+    name: varchar({ length: 255 }).notNull(),
+    nativeName: varchar({ length: 255 }).notNull(),
+    language: varchar({ length: 8 }).notNull(), // Unicode language subtag
+    region: varchar({ length: 3 }).notNull(), // Unicode region subtag
+    script: varchar({ length: 4 }).notNull(), // Unicode script subtag
+    isRTL: boolean().notNull().default(false),
+    /**
+     * Whether `strings` holds a real string set. A locale the update task has only seen in the
+     * remote metadata gets a row so that it can be offered, but has nothing to serve until it is
+     * installed.
+     */
+    isInstalled: boolean().notNull().default(false),
+    /**
+     * The remote metadata's hash of the strings file this row was installed from, so that an update
+     * only downloads the locales that actually changed. Empty for a locale that came off disk and
+     * for one that is not installed yet -- which is exactly what makes the next update fetch it.
+     */
+    hash: varchar({ length: 64 }).notNull().default(''),
+    /**
+     * The short code an administrator would rather this locale be shown as -- `zh` for `zh-CN` --
+     * overriding the one derived from the tag. An alias and nothing more: `code` stays the identity,
+     * so nothing a page, an asset or a storage target already records has to move for this.
+     * Null when the derived form is fine, which is the usual case.
+     */
+    customCode: varchar({ length: 255 }).unique(),
+    /**
+     * The name an administrator would rather this locale be shown as, overriding the one `Intl`
+     * gives for the tag. Display only, and not unique: two locales reading alike in a menu is a
+     * choice somebody made, not a collision. Null when the derived name is fine.
+     */
+    customName: varchar({ length: 255 }),
+    strings: jsonb().notNull().default([]),
+    /**
+     * How much of the published translation is done, as a whole percentage — Crowdin's count, carried
+     * in the remote metadata, since the strings files themselves cannot say: untranslated strings
+     * are exported as the English source. A property of upstream, so it is kept for a locale that
+     * is merely available as well as an installed one. Null where nobody knows, which is any locale
+     * whose strings did not come from the published metadata.
+     */
+    completeness: integer(),
+    createdAt: timestamp().notNull().defaultNow(),
+    updatedAt: timestamp().notNull().defaultNow()
+  },
+  (table) => [index('locales_language_idx').on(table.language)]
+)
+
+// NAVIGATION --------------------------
+export const navigation = pgTable(
+  'navigation',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    items: jsonb().notNull().default([]),
+    /**
+     * Set only on a site-wide menu, naming the locale it is the menu for — the sidebar a page in that
+     * locale falls back to when nothing above it overrides one. Null on a menu belonging to a tree
+     * entry, which is identified by that entry's id instead. Postgres lets a unique index hold any
+     * number of nulls, which is what lets both kinds share the table.
+     */
+    locale: varchar({ length: 255 }),
+    siteId: uuid()
+      .notNull()
+      .references(() => sites.id)
+  },
+  (table) => [
+    index('navigation_siteId_idx').on(table.siteId),
+    uniqueIndex('navigation_siteId_locale_key').on(table.siteId, table.locale)
+  ]
+)
+
+// NOTIFICATION EVENTS -----------------
+/**
+ * The outbox: one row per thing that happened that somebody may need to be told about.
+ *
+ * Written by `notifications.emit()` from the request that caused it, and nothing more — working out
+ * who to tell happens later, in a worker, which claims these in batches (`FOR UPDATE SKIP LOCKED`).
+ * One row per EVENT rather than one scheduler job per event, because a job costs a `jobs` row and a
+ * `jobHistory` row each, and a busy wiki saves pages faster than that is worth paying for.
+ *
+ * No foreign keys: an event is a record of a moment, and the page, the comment or the actor it names
+ * may well be gone by the time it is processed — a deletion is the event that guarantees it.
+ */
+export const notificationEvents = pgTable(
+  'notificationEvents',
+  {
+    // -> Also the idempotency key: a fan-out replayed after a crash writes this id onto every entry
+    //    it touches, and an entry that already carries it is left alone
+    id: uuid().primaryKey().defaultRandom(),
+    kind: varchar({ length: 64 }).notNull(),
+    // -> 'user', 'import' or 'bulk', which a category may decline to fire for
+    origin: varchar({ length: 16 }).notNull().default('user'),
+    // -> Null for an event that belongs to no site
+    siteId: uuid(),
+    actorId: uuid(),
+    data: jsonb().notNull().default({}),
+    /**
+     * Candidates resolved when the event was written rather than when it is processed. Only a
+     * deletion needs it: the page's watchers are removed with the page by the foreign key's cascade,
+     * so they have to be read before the page goes or there is nobody left to tell.
+     */
+    recipients: uuid().array(),
+    // -> How far an interrupted fan-out got, so that the next run carries on from there
+    cursor: jsonb(),
+    claimedAt: timestamp(),
+    claimedBy: varchar({ length: 255 }),
+    processedAt: timestamp(),
+    createdAt: timestamp().notNull().defaultNow()
+  },
+  (table) => [
+    // -> The fan-out's own query: what is still to do, oldest first
+    index('notificationEvents_pending_idx')
+      .on(table.createdAt)
+      .where(sql`"processedAt" IS NULL`),
+    index('notificationEvents_processed_idx')
+      .on(table.processedAt)
+      .where(sql`"processedAt" IS NOT NULL`)
+  ]
+)
+
+// NOTIFICATIONS -----------------------
+/**
+ * What one person has been told about: the inbox, and the email queue, in one row.
+ *
+ * **A row covers both channels.** `inApp` says whether the inbox shows it and `emailState` where its
+ * email stands, so a person who only wants email still has a row — hidden from the inbox, and closed
+ * (`readAt` set) once the email has gone, since there is nowhere for them to read it. One row is what
+ * gives coalescing and the email cadence a single thing to work on.
+ *
+ * **A row coalesces.** Every entry has a `groupKey` (`watchedPage:<pageId>`, `mention:<commentId>`,
+ * …) and a person has at most one UNREAD entry per key, by the partial unique index below. Forty saves
+ * to a watched page are one entry with a `count` of forty; reading it frees the key, and the next save
+ * starts a new one.
+ *
+ * **A row carries a snapshot** (`data`) of what it is about — the title, the path, who did it — since
+ * the page may be renamed or deleted before anybody looks. The ids beside it are `set null` rather
+ * than cascaded for the same reason: a notification that a page was deleted has to outlive the page.
+ * A comment's excerpt is shown only while `commentId` is still set, so deleting a comment takes its
+ * text out of every inbox it reached.
+ */
+export const notifications = pgTable(
+  'notifications',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    userId: uuid()
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    // -> Null for an entry that belongs to no site, which every site's inbox shows. Cascaded: an
+    //    inbox is not content, and a site's entries mean nothing once the site has gone
+    siteId: uuid().references(() => sites.id, { onDelete: 'cascade' }),
+    category: varchar({ length: 64 }).notNull(),
+    // -> The latest one: an entry absorbing an edit and then a move says it was moved
+    variant: varchar({ length: 32 }).notNull(),
+    groupKey: varchar({ length: 255 }).notNull(),
+    pageId: uuid().references(() => pages.id, { onDelete: 'set null' }),
+    commentId: uuid().references(() => comments.id, { onDelete: 'set null' }),
+    actorId: uuid().references(() => users.id, { onDelete: 'set null' }),
+    data: jsonb().notNull().default({}),
+    count: integer().notNull().default(1),
+    lastEventId: uuid().notNull(),
+    inApp: boolean().notNull().default(true),
+    // -> 'none', 'pending', 'sending', 'sent', 'failed' or 'skipped'. A varchar rather than an enum
+    //    so that a state added later does not need a migration. `sending` is a claim, and its
+    //    `emailAfter` the lease — see `claim` in `notifications/mailer.ts`
+    emailState: varchar({ length: 16 }).notNull().default('none'),
+    emailAfter: timestamp(),
+    emailedAt: timestamp(),
+    readAt: timestamp(),
+    createdAt: timestamp().notNull().defaultNow(),
+    // -> Moved forward whenever the entry absorbs another event, and the inbox's sort key: an entry
+    //    that is still collecting news belongs at the top
+    updatedAt: timestamp().notNull().defaultNow()
+  },
+  (table) => [
+    // -> The inbox
+    index('notifications_user_updated_idx').on(table.userId, table.updatedAt),
+    // -> The badge, which every page view of a signed-in reader polls for
+    index('notifications_unread_idx')
+      .on(table.userId, table.siteId)
+      .where(sql`"readAt" IS NULL AND "inApp"`),
+    // -> The mail drain: what is due, and what a run that died while sending left behind
+    index('notifications_email_idx')
+      .on(table.emailAfter)
+      .where(sql`"emailState" IN ('pending', 'sending')`),
+    // -> Coalescing, and idempotency with it: see the note above
+    uniqueIndex('notifications_user_group_unread_idx')
+      .on(table.userId, table.groupKey)
+      .where(sql`"readAt" IS NULL`),
+    index('notifications_pageId_idx').on(table.pageId),
+    index('notifications_commentId_idx').on(table.commentId),
+    // -> The purge, which goes by age alone
+    index('notifications_createdAt_idx').on(table.createdAt)
+  ]
+)
+
+// PAGES ------------------------------
+export const pagePublishStateEnum = pgEnum('pagePublishState', ['draft', 'published', 'scheduled'])
+export const pages = pgTable(
+  'pages',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    // -> A BCP-47 code, matched only ever for equality. Not `ltree`: a hyphenated code is a single
+    //    label to it, so `'pt-BR'::ltree <@ 'pt'` is false and the type buys no locale-family
+    //    matching -- see the note on `pageHistory.locale`.
+    locale: varchar({ length: 255 }).notNull(),
+    path: varchar({ length: 255 }).notNull(),
+    hash: varchar({ length: 255 }).notNull(),
+    alias: varchar({ length: 255 }),
+    title: varchar({ length: 255 }).notNull(),
+    description: varchar({ length: 255 }),
+    icon: varchar({ length: 255 }),
+    publishState: pagePublishStateEnum('publishState').notNull().default('draft'),
+    publishStartDate: timestamp(),
+    publishEndDate: timestamp(),
+    config: jsonb().notNull().default({}),
+    relations: jsonb().notNull().default([]),
+    /**
+     * The set of pages this one is a translation of: every page sharing this id is the same page in
+     * another locale, and the locale selector uses it to send a reader to the right one.
+     *
+     * Null for a page with no counterparts, which is most of them — a null is what makes the unique
+     * index below tolerate any number of unrelated pages, since postgres counts nulls as distinct.
+     * The group has no row of its own: it is an identity, and its membership IS this column.
+     */
+    localeGroupId: uuid(),
+    content: text(),
+    render: text(),
+    searchContent: text(),
+    ts: tsvector('ts'),
+    tags: text()
+      .array()
+      .notNull()
+      .default(sql`ARRAY[]::text[]`),
+    toc: jsonb(),
+    editor: varchar({ length: 255 }).notNull(),
+    contentType: varchar({ length: 255 }).notNull(),
+    isBrowsable: boolean().notNull().default(true),
+    isSearchable: boolean().notNull().default(true),
+    // -> The generated expression references its own table, so the return type must be annotated
+    //    explicitly to break the circular inference (TS7022/TS7024).
+    isSearchableComputed: boolean('isSearchableComputed').generatedAlwaysAs(
+      (): SQL => sql`${pages.publishState} != 'draft' AND ${pages.isSearchable}`
+    ),
+    password: varchar({ length: 255 }),
+    /**
+     * How readers have rated the page, per scale: `{ thumbs?: { count, sum, up, down }, stars?: … }`.
+     * A cache of the `pageRatings` rows, rewritten by every rating and withdrawal (`models/pageRatings.ts`)
+     * so that a page view reads it off the row it already loads instead of aggregating per view.
+     */
+    ratings: jsonb().notNull().default({}),
+    scripts: jsonb().notNull().default({}),
+    historyData: jsonb().notNull().default({}),
+    createdAt: timestamp().notNull().defaultNow(),
+    updatedAt: timestamp().notNull().defaultNow(),
+    /**
+     * When the page's BODY last changed — unlike `updatedAt`, which a new title, a tag or a property
+     * moves as well. What a lifecycle rule counting days since the last content update counts from.
+     */
+    contentUpdatedAt: timestamp().notNull().defaultNow(),
+    /**
+     * When somebody last confirmed, from the lifecycle banner, that the page is still accurate. Counts
+     * as fresh content to every lifecycle rule counting days since something.
+     */
+    lastReviewedAt: timestamp(),
+    /**
+     * The banner a lifecycle rule put over the article, `{ message, icon, ruleId, setAt }`, until
+     * somebody marks the page reviewed. Not content: setting it records no version and moves nothing.
+     */
+    lifecycleBanner: jsonb(),
+    authorId: uuid()
+      .notNull()
+      .references(() => users.id),
+    creatorId: uuid()
+      .notNull()
+      .references(() => users.id),
+    siteId: uuid()
+      .notNull()
+      .references(() => sites.id)
+  },
+  (table) => [
+    index('pages_authorId_idx').on(table.authorId),
+    index('pages_creatorId_idx').on(table.creatorId),
+    index('pages_siteId_idx').on(table.siteId),
+    index('pages_ts_idx').using('gin', table.ts),
+    index('pages_tags_idx').using('gin', table.tags),
+    index('pages_isSearchableComputed_idx').on(table.isSearchableComputed),
+    // -> Trigram indexes for page suggestions, which match a typed word anywhere in a title or a
+    //    path (`ILIKE '%word%'`) — something neither a btree nor the `ts` vector can answer
+    index('pages_title_trgm_idx').using('gin', table.title.op('gin_trgm_ops')),
+    index('pages_path_trgm_idx').using('gin', table.path.op('gin_trgm_ops')),
+    // -> One page per locale in a group, enforced here rather than in the model: a group is edited
+    //    from any of its members, so two saves racing each other are two writers of the same set
+    uniqueIndex('pages_localeGroupId_locale_idx').on(table.localeGroupId, table.locale),
+    /*
+      Where a page sits, which is what a path addresses it by. Unique because two pages at one path in
+      one locale is the thing `createPage` and `movePage` both check for and neither can actually
+      prevent -- their check and their write are two statements, so two saves racing each other both
+      see a clear path. It is also the index the link table resolves against: "is there a page at this
+      address" is asked once per link on a page.
+    */
+    uniqueIndex('pages_siteId_locale_path_idx').on(table.siteId, table.locale, table.path),
+    // -> Every feedback board, which page access is resolved against and so is held in memory and
+    //    read again whenever one changes (`models/feedback.ts`). A handful of rows out of every page
+    index('pages_feedback_boards_idx')
+      .on(table.siteId)
+      .where(sql`"editor" = 'feedback'`)
+  ]
+)
+
+// PAGE HISTORY ------------------------
+/**
+ * One row per change to a page: what it looked like afterwards, who made it, and what kind of change
+ * it was.
+ *
+ * Every row is a complete version rather than a delta, which is what makes the three things this
+ * exists for straightforward: comparing any two versions, putting a page back to one of them, and
+ * recovering a page that was deleted. The deletion itself is recorded the same way, carrying the page
+ * as it stood when it went — that row is the whole of what a recovery needs.
+ *
+ * The render is deliberately not kept. It is derived from the content by a pipeline that lives in the
+ * frontend, and storing a second copy of every page's HTML for every version is a great deal of space
+ * for something a restore can regenerate.
+ */
+export const pageHistory = pgTable(
+  'pageHistory',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    // -> Not a foreign key: the history of a deleted page is exactly what recovering it needs, so it
+    //    has to outlive the row it points at
+    pageId: uuid().notNull(),
+    /**
+     * `created`, `updated`, `moved` or `deleted`. A varchar rather than an enum so that naming another
+     * kind of change later does not need a migration.
+     */
+    action: varchar({ length: 16 }).notNull().default('updated'),
+    /** Which fields this change touched, so a history list can summarise it without diffing. */
+    changedFields: text()
+      .array()
+      .notNull()
+      .default(sql`ARRAY[]::text[]`),
+    /*
+      Columns rather than part of `meta` below: a history list shows these for every row, a page that
+      has moved needs the path it had at the time rather than the one it has now, and looking a history
+      up by where the page was — the only way in once the page itself is gone — means matching on the
+      locale and the path together.
+
+      A locale code is BCP-47 with hyphens (`pt-BR`), and every comparison anywhere is an equality
+      one. `locales.code`, which these values come from, is a varchar too.
+    */
+    locale: varchar({ length: 255 }).notNull(),
+    path: varchar({ length: 255 }).notNull(),
+    title: varchar({ length: 255 }).notNull(),
+    content: text(),
+    /**
+     * The rest of the page as it stood: description, icon, tags, publish state and dates, relations,
+     * scripts, config, editor and content type. Kept whole rather than as columns of its own so that a
+     * field added to a page does not have to be added here too.
+     */
+    meta: jsonb().notNull().default({}),
+    /**
+     * Why the change was made, in the author's words, as the editor's reason-for-change prompt
+     * collected it. Null when the site does not ask for one, or asks and is not answered.
+     */
+    reason: varchar({ length: 255 }),
+    versionDate: timestamp().notNull().defaultNow(),
+    // -> Null once the account is gone, rather than holding the account hostage: a history row is a
+    //    record of what happened to the page, and requiring its author to exist for ever would mean
+    //    that editing a page once made an account undeletable — even after the page itself was gone.
+    authorId: uuid().references(() => users.id, { onDelete: 'set null' }),
+    /**
+     * How the change was made, when it was not by a person in the wiki's own interface: `mcp` for an
+     * AI assistant writing through the MCP server. Null for everything else.
+     *
+     * The author is still the person whose token the assistant held — they are the one accountable —
+     * but a reader is entitled to know which edits a person typed. Always recorded; whether the
+     * interface shows it is `mcp.showAiBadge`. A varchar rather than an enum, for the reason
+     * `action` is one: naming another way in later should not need a migration.
+     */
+    via: varchar({ length: 16 }),
+    siteId: uuid()
+      .notNull()
+      .references(() => sites.id)
+  },
+  (table) => [
+    index('pageHistory_pageId_idx').on(table.pageId, table.versionDate),
+    // -> "What happened to the page at this path, in this locale", which is how a deleted page is
+    //    found again: there is no page row left to look its ID up from. Leading with `siteId` means
+    //    this also serves the plain per-site queries.
+    index('pageHistory_siteId_idx').on(table.siteId, table.locale, table.path, table.versionDate),
+    index('pageHistory_authorId_idx').on(table.authorId)
+  ]
+)
+
+// PAGE LINKS --------------------------
+/**
+ * One row per distinct link written on a page, resolved to what it addresses.
+ *
+ * Derived from the stored render the way `toc` and `searchContent` are, and rewritten wholesale
+ * whenever that render is — see `models/pageLinks.ts`. Three questions are asked of it: what links to
+ * the page being read, whether what a page links to exists, and which pages have to be revisited when
+ * something they point at moves.
+ *
+ * **The address is what is stored, not a resolved page id.** A link is written as a path, and after a
+ * move the pages pointing at the old one still say the old one — which is precisely the thing worth
+ * knowing, and precisely what a foreign key would erase by following the page. It also lets a link to
+ * a page that does not exist yet be a row like any other, which is what a red link is. Whether a
+ * target resolves is a join against `pages` on `(siteId, locale, path)` at read time.
+ *
+ * `/a/<alias>` and `/i/<id>` are the exception and are stored as the reference they carry: those two
+ * survive a move by design, so resolving them to a path at write time would record the opposite of
+ * what they mean.
+ */
+export const pageLinks = pgTable(
+  'pageLinks',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    /**
+     * What the link addresses: a page by path (`page`), by alias (`alias`) or by id (`pageId`), or an
+     * uploaded file (`asset`).
+     *
+     * A varchar rather than an enum, for the reason `pageHistory.action` is one — naming another kind
+     * of target later should not need a migration. Links leaving the wiki are not recorded at all:
+     * nothing asks a question about them until there is a link checker to answer it, and they would
+     * be the bulk of the rows on a wiki that cites its sources.
+     */
+    kind: varchar({ length: 16 }).notNull(),
+    /**
+     * The href exactly as it appears in the page.
+     *
+     * Kept because resolving is lossy and the source is what a repair would have to edit: `../two`,
+     * `/en/one/two` and `/one/two.md` are one target and three strings, and only the string that was
+     * written can be found in the markdown again.
+     *
+     * Bounded rather than `text` because it is half of a unique btree index below, and a btree entry
+     * has a hard ceiling of about 2700 bytes — an href past it would fail the INSERT, and that INSERT
+     * is part of saving a page. 2048 is the conventional cap for a URL and far past anything a link
+     * in a wiki page is; `resolveLink` drops the ones that would not fit rather than truncating them
+     * into a different address.
+     */
+    href: varchar({ length: 2048 }).notNull(),
+    /**
+     * Which site the target belongs to. Usually the source's own, and another one for a link written
+     * as an absolute URL to a second site of this instance — those are worth following rather than
+     * writing off as external, since a move on either site breaks them just the same.
+     */
+    targetSiteId: uuid()
+      .notNull()
+      .references(() => sites.id),
+    // -> Both null for `alias` and `pageId`, which address a page without saying where it is
+    targetLocale: varchar({ length: 255 }),
+    targetPath: varchar({ length: 255 }),
+    /** The alias or the page id, for the two kinds that carry one. Null for the rest. */
+    targetRef: varchar({ length: 255 }),
+    createdAt: timestamp().notNull().defaultNow(),
+    // -> The page the link is written on. Its rows go with it: a link is part of a page's content,
+    //    and nothing is left to point at once the page is gone
+    pageId: uuid()
+      .notNull()
+      .references(() => pages.id, { onDelete: 'cascade' }),
+    siteId: uuid()
+      .notNull()
+      .references(() => sites.id)
+  },
+  (table) => [
+    // -> "What links here", and "what points at this path" for a page about to be moved. Leading with
+    //    the site because every one of those questions is asked within one
+    index('pageLinks_target_idx').on(table.targetSiteId, table.targetLocale, table.targetPath),
+    // -> The same question for the two kinds that address a page without a path
+    index('pageLinks_targetRef_idx').on(table.targetSiteId, table.kind, table.targetRef),
+    // -> Every link on one page, which is both the read for "do these targets exist" and the delete
+    //    half of rewriting a page's links
+    index('pageLinks_pageId_idx').on(table.pageId),
+    index('pageLinks_siteId_idx').on(table.siteId),
+    /*
+      One row per spelling, not per target: a page linking to the same place as `../two` and as
+      `/one/two` has two links to repair and two rows saying so. Two identical hrefs on one page are
+      one row, since there is nothing to tell them apart and nothing that would ask.
+    */
+    uniqueIndex('pageLinks_pageId_href_idx').on(table.pageId, table.href)
+  ]
+)
+
+// PAGE EDIT SUBMISSIONS ---------------
+/**
+ * An edit suggested by somebody who may read a page but not change it, waiting to be reviewed.
+ *
+ * Both the resulting source and a patch are kept, because they answer different questions. The patch
+ * is what a reviewer merges — it is computed against the page as it stood at submission time, so two
+ * people suggesting edits to different parts of a page can both be accepted. The source is what the
+ * author resumes from and what a review screen shows, and it cannot be reconstructed from the patch
+ * alone once the page has moved on.
+ */
+export const pageEditSubmissions = pgTable(
+  'pageEditSubmissions',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    content: text().notNull(),
+    /** Unified diff, from the page content this was based on to `content`. */
+    patch: text().notNull(),
+    /** SHA-256 of that base content, so a reviewer can tell the page has changed underneath. */
+    baseHash: varchar({ length: 64 }).notNull(),
+    // -> A guest has no account to attribute the suggestion to, so it says who sent it. Null for a
+    //    logged in author, whose name is on `authorId` instead.
+    guestName: varchar({ length: 255 }),
+    guestEmail: varchar({ length: 255 }),
+    createdAt: timestamp().notNull().defaultNow(),
+    updatedAt: timestamp().notNull().defaultNow(),
+    pageId: uuid()
+      .notNull()
+      .references(() => pages.id, { onDelete: 'cascade' }),
+    siteId: uuid()
+      .notNull()
+      .references(() => sites.id),
+    authorId: uuid().references(() => users.id)
+  },
+  (table) => [
+    index('pageEditSubmissions_pageId_idx').on(table.pageId),
+    index('pageEditSubmissions_siteId_idx').on(table.siteId),
+    index('pageEditSubmissions_authorId_idx').on(table.authorId),
+    // -> One open suggestion per person per page: coming back to the button continues that one rather
+    //    than starting a second. Guests are excluded because they are all the same nobody.
+    uniqueIndex('pageEditSubmissions_page_author_idx')
+      .on(table.pageId, table.authorId)
+      .where(sql`"authorId" IS NOT NULL`)
+  ]
+)
+
+// PAGE WATCHING -----------------------
+/**
+ * A page somebody asked to be told about, one row per person per page.
+ *
+ * A row IS the watch: there is no `isEnabled` to turn off, because unwatching a page is not a state a
+ * page keeps — it is the absence of interest, and the row goes. Which is also why the whole table can
+ * be read as "everyone to notify about this page" when notifications are built on top of it.
+ *
+ * `siteId` is carried alongside `pageId` rather than reached through the page, since every query here
+ * is scoped to one site: the watch list belongs to an inbox, and an inbox belongs to a site.
+ */
+export const pageWatching = pgTable(
+  'pageWatching',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    createdAt: timestamp().notNull().defaultNow(),
+    pageId: uuid()
+      .notNull()
+      .references(() => pages.id, { onDelete: 'cascade' }),
+    siteId: uuid()
+      .notNull()
+      .references(() => sites.id),
+    userId: uuid()
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' })
+  },
+  (table) => [
+    // -> Covers the site scoping too, being the leading column: this is the inbox's own query
+    index('pageWatching_user_site_idx').on(table.userId, table.siteId),
+    // -> Watching a page twice is watching it once, so the second attempt is a no-op rather than a row
+    uniqueIndex('pageWatching_page_user_idx').on(table.pageId, table.userId)
+  ]
+)
+
+// PAGE OWNERS -------------------------
+/**
+ * Who answers for a page: some users, or some groups — never a mix of the two, which
+ * `PUT …/pages/:pageId/ownership` refuses.
+ *
+ * No row means the page's creator, and that is the only way a page is owned by its creator: there is
+ * no mode column to fall out of step with the rows, so a page whose every owner has since been
+ * deleted is back with its creator through the cascade alone. A label for now — nothing is granted to
+ * an owner.
+ *
+ * Not part of the page's content, which is why it is a table and not a column: `pageHistory` copies
+ * the page row into every version, and a change of owners is not a version.
+ */
+export const pageOwners = pgTable(
+  'pageOwners',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    pageId: uuid()
+      .notNull()
+      .references(() => pages.id, { onDelete: 'cascade' }),
+    userId: uuid().references(() => users.id, { onDelete: 'cascade' }),
+    groupId: uuid().references(() => groups.id, { onDelete: 'cascade' })
+  },
+  (table) => [
+    // -> Nulls are distinct to postgres, so each covers its own kind of row and lets the other through
+    uniqueIndex('pageOwners_page_user_idx').on(table.pageId, table.userId),
+    uniqueIndex('pageOwners_page_group_idx').on(table.pageId, table.groupId),
+    index('pageOwners_userId_idx').on(table.userId),
+    index('pageOwners_groupId_idx').on(table.groupId),
+    check('pageOwners_owner_check', sql`num_nonnulls(${table.userId}, ${table.groupId}) = 1`)
+  ]
+)
+
+// PAGE LIFECYCLE RULES ----------------
+/**
+ * What happens to a page as it ages: when (`trigger`, counted in `triggerDays`) and what (`actions`).
+ *
+ * `trigger` is `contentAge` (days since the body last changed or the page was last reviewed),
+ * `commentAge` (days since the last comment, or the page's creation, or its last review) or
+ * `interval` (every so many days, counted from the rule's creation and then from its last firing).
+ * `actions` is a list of `{ kind: 'banner', message, icon }`, `{ kind: 'notify' }`,
+ * `{ kind: 'move', path }`, `{ kind: 'tags', tags }` and `{ kind: 'remove', after }` — the rule
+ * deleting itself once it has fired `after` times — at most one of each. See
+ * `models/pageLifecycle.ts`, which runs them once a day.
+ *
+ * Not page content, like `pageOwners`: saved on its own, recorded in no version. `authorId` is who
+ * last wrote the rule, and who its actions are carried out as.
+ */
+export const pageLifecycleRules = pgTable(
+  'pageLifecycleRules',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    pageId: uuid()
+      .notNull()
+      .references(() => pages.id, { onDelete: 'cascade' }),
+    name: varchar({ length: 255 }).notNull(),
+    trigger: varchar({ length: 32 }).notNull(),
+    triggerDays: integer().notNull(),
+    actions: jsonb().notNull().default([]),
+    authorId: uuid().references(() => users.id, { onDelete: 'set null' }),
+    createdAt: timestamp().notNull().defaultNow(),
+    updatedAt: timestamp().notNull().defaultNow(),
+    /** When it last fired, which is what keeps a rule from firing again every day it is due. */
+    lastFiredAt: timestamp(),
+    /** How many times it has fired, which is what a `remove` action counts towards. */
+    fireCount: integer().notNull().default(0),
+    /** What happened when it did: `{ status: 'applied' | 'skipped' | 'failed', message, at }`. */
+    lastOutcome: jsonb()
+  },
+  (table) => [index('pageLifecycleRules_pageId_idx').on(table.pageId)]
+)
+
+// PAGE RATINGS ------------------------
+/**
+ * One reader's rating of one page.
+ *
+ * `kind` is the site's ratings mode the rating was given under — `thumbs` (`value` is 1 or -1) or
+ * `stars` (1 to 5) — because the two scales cannot be added together, and a site may switch between
+ * them. Only the rows of the mode in force are counted, so switching back finds the old ratings where
+ * they were. Rating again under the other mode replaces the row: a reader has one opinion of a page.
+ *
+ * The totals are cached on the page (`pages.ratings`), one entry per scale, and rewritten from these
+ * rows whenever one of the page's changes. A rating removed by a deleted account's cascade is not
+ * subtracted until the page is next rated.
+ */
+export const pageRatings = pgTable(
+  'pageRatings',
+  {
+    pageId: uuid()
+      .notNull()
+      .references(() => pages.id, { onDelete: 'cascade' }),
+    userId: uuid()
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    kind: varchar({ length: 16 }).notNull(),
+    value: integer().notNull(),
+    createdAt: timestamp().notNull().defaultNow(),
+    updatedAt: timestamp().notNull().defaultNow()
+  },
+  (table) => [
+    primaryKey({ columns: [table.pageId, table.userId] }),
+    index('pageRatings_userId_idx').on(table.userId),
+    // -> A feedback board's Trending sort: the upvotes cast in the last two weeks, without reading
+    //    every vote ever cast to find them (`models/feedback.ts`)
+    index('pageRatings_recent_upvotes_idx')
+      .on(table.updatedAt)
+      .where(sql`"kind" = 'thumbs' AND "value" = 1`)
+  ]
+)
+
+// PAGE RENDER QUEUE -------------------
+/**
+ * A page waiting for the server to render it, one row per page.
+ *
+ * The markdown pipeline lives in the frontend, so rendering a page here means driving a headless
+ * browser — too heavy to hold a request open for, and ruinous to do several times at once. A row is a
+ * request for a render, and the `renderPages` task drains the table one page at a time through a
+ * single browser (`models/rendering.ts`).
+ *
+ * A row IS the request, so asking twice for the same page updates the row instead of adding a second:
+ * what gets rendered is the content as it stands when the browser reaches it, and rendering it twice
+ * would produce the same HTML. `createdAt` keeps its place in the queue across those repeats.
+ *
+ * The two permissions travel with the row because a render is sanitized against what the person who
+ * asked for it may embed, and by the time the job runs there is no session left to ask.
+ */
+export const pageRenderQueue = pgTable(
+  'pageRenderQueue',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    /** `write:scripts` — whether this render may keep `<script>` and inline handlers. */
+    allowScripts: boolean().notNull().default(false),
+    /** `write:styles` — whether this render may keep `<style>` and inline `style` attributes. */
+    allowStyles: boolean().notNull().default(false),
+    createdAt: timestamp().notNull().defaultNow(),
+    updatedAt: timestamp().notNull().defaultNow(),
+    pageId: uuid()
+      .notNull()
+      .unique()
+      .references(() => pages.id, { onDelete: 'cascade' }),
+    siteId: uuid()
+      .notNull()
+      .references(() => sites.id),
+    // -> Only ever logged, and a deleted account is no reason to drop a render somebody is waiting for
+    requestedById: uuid().references(() => users.id, { onDelete: 'set null' })
+  },
+  // -> How the drain picks what to render next
+  (table) => [index('pageRenderQueue_createdAt_idx').on(table.createdAt)]
+)
+
+// RATE LIMITS -------------------------
+/**
+ * One counter per rate-limited client, and the ban it has earned itself.
+ *
+ * In the database rather than in each instance's memory because a limit every instance enforces on
+ * its own is a limit multiplied by however many are running — and because a ban has to hold when the
+ * next attempt lands on another one. Every read and write of a row happens in a single upserting
+ * statement (`models/rateLimits.ts`), which is what makes concurrent attempts count exactly once.
+ *
+ * Rows are self-correcting: an expired window or ban is reset by the next attempt on that key. They
+ * are only ever deleted to reclaim space — see the `purgeRateLimits` task.
+ */
+export const rateLimits = pgTable(
+  'rateLimits',
+  {
+    /** What is being limited and who by, e.g. `auth:203.0.113.4`. */
+    key: varchar({ length: 255 }).primaryKey(),
+    /** Attempts made inside the current window. */
+    hits: integer().notNull().default(0),
+    windowStartedAt: timestamp().notNull().defaultNow(),
+    /** When the ban lifts. Null for a client that has not earned one. */
+    bannedUntil: timestamp(),
+    updatedAt: timestamp().notNull().defaultNow()
+  },
+  // -> How the purge finds rows nothing has touched in a long while
+  (table) => [index('rateLimits_updatedAt_idx').on(table.updatedAt)]
+)
+
+// SETTINGS ----------------------------
+export const settings = pgTable('settings', {
+  key: varchar({ length: 255 }).notNull().primaryKey(),
+  value: jsonb().notNull().default({})
+})
+
+// SESSIONS ----------------------------
+export const sessions = pgTable(
+  'sessions',
+  {
+    id: varchar({ length: 255 }).primaryKey(),
+    userId: uuid().references(() => users.id),
+    data: jsonb().notNull().default({}),
+    createdAt: timestamp().notNull().defaultNow(),
+    updatedAt: timestamp().notNull().defaultNow()
+  },
+  (table) => [index('sessions_userId_idx').on(table.userId)]
+)
+
+// SITES -------------------------------
+export const sites = pgTable('sites', {
+  id: uuid().primaryKey().defaultRandom(),
+  hostname: varchar({ length: 255 }).notNull().unique(),
+  isEnabled: boolean().notNull().default(false),
+  config: jsonb().notNull(),
+  createdAt: timestamp().notNull().defaultNow()
+})
+
+// -> The images an administrator uploads for a site — its logo, favicon and login background — one row
+//    per kind. Held in the database rather than under `dataPath`, which is a cache: an instance that
+//    comes back with an empty data directory must still look like itself. Whether a kind has been
+//    uploaded at all is mirrored in the site's `config.assets`, so serving a site that has uploaded
+//    nothing costs no query here.
+export const siteAssets = pgTable(
+  'siteAssets',
+  {
+    siteId: uuid()
+      .notNull()
+      .references(() => sites.id),
+    kind: varchar({ length: 255 }).notNull(),
+    data: bytea().notNull()
+  },
+  (table) => [primaryKey({ columns: [table.siteId, table.kind] })]
+)
+
+// STORAGE -----------------------------
+export const storage = pgTable(
+  'storage',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    // -> Directory name under `modules/storage`, one row per module per site
+    module: varchar({ length: 255 }).notNull(),
+    isEnabled: boolean().notNull().default(false),
+    // -> `{ activeTypes: string[] }`, i.e. which kinds of content are written here. What counts as a
+    //    large file is not among them: that is one answer per site, in the site's own config.
+    contentTypes: jsonb().notNull().default({}),
+    // -> `{ streaming: boolean, directAccess: boolean, servedTypes: string[] }`. `servedTypes` names
+    //    the content types a reader's request is answered from this target, and is a subset of
+    //    `contentTypes.activeTypes` — a target can only serve back what it was asked to store.
+    assetDelivery: jsonb().notNull().default({}),
+    // -> Values for the props the module declares in its `definition.yml`
+    config: jsonb().notNull().default({}),
+    // -> `{ status: 'healthy' | 'warning' | 'error', message: string, updatedAt: string | null }`:
+    //    how the target is actually behaving, as opposed to how it is configured. Written by the
+    //    storage model as it dispatches to the module — never by the admin area, which is why it is
+    //    absent from the storage PUT — and reported by the Status card on the target's page.
+    state: jsonb().notNull().default({}),
+    siteId: uuid()
+      .notNull()
+      .references(() => sites.id)
+  },
+  // -> Covers lookups by site as well, being the leading column
+  (table) => [uniqueIndex('storage_composite_idx').on(table.siteId, table.module)]
+)
+
+/**
+ * Changes a target has accepted and not yet published, oldest first.
+ *
+ * For a target whose own copy of the content is not somewhere every instance can see — the git
+ * target, whose working copy is a directory on whichever pod made the change. A change is recorded
+ * here instead, by whichever instance made it, and the target's sync replays the queue as commits on
+ * whichever instance runs it. So the queue is what every instance of an HA set agrees on, and a
+ * working copy is a cache any of them can rebuild.
+ *
+ * `data` is a snapshot of the file as it was written, not a pointer to the page or asset: forty saves
+ * between two syncs are forty commits, each with what that save wrote, and an asset whose only home is
+ * this target has its bytes nowhere else until the sync has pushed them.
+ */
+export const storageOutbox = pgTable(
+  'storageOutbox',
+  {
+    // -> Replay order. Bigint because every page save on a busy wiki takes one.
+    id: bigint({ mode: 'number' }).primaryKey().generatedAlwaysAsIdentity(),
+    targetId: uuid()
+      .notNull()
+      .references(() => storage.id, { onDelete: 'cascade' }),
+    // -> Which decides the commit message
+    kind: varchar({ length: 16 }).$type<'page' | 'asset'>().notNull(),
+    op: varchar({ length: 16 }).$type<'put' | 'delete' | 'move'>().notNull(),
+    // -> Relative to the target's root, as the layout files it. Where a move ends up.
+    path: text().notNull(),
+    // -> Where a move started
+    previousPath: text(),
+    // -> How a commit message names the content, worked out when the change was made
+    label: text().notNull(),
+    previousLabel: text(),
+    // -> The commit message its author gave — the reason for change of a page save — used instead of
+    //    the one made from the label. Null when nobody gave one.
+    message: text(),
+    // -> The file as written, for a `put`
+    data: bytea(),
+    // -> Not a foreign key: a commit made after the account is gone still happened, and falls back to
+    //    the target's default author
+    actorId: uuid(),
+    createdAt: timestamp().notNull().defaultNow()
+  },
+  (table) => [
+    index('storageOutbox_targetId_idx').on(table.targetId, table.id),
+    // -> A read of a file this target has accepted and not yet published
+    index('storageOutbox_path_idx').on(table.targetId, table.path)
+  ]
+)
+
+/**
+ * Where a target that syncs with a remote last left off, as every instance sees it.
+ *
+ * `commit` is the remote's commit the wiki and the remote last agreed on: everything the outbox held up
+ * to then was pushed in it, and everything the remote had up to then was applied to the wiki. It is
+ * only meaningful for the remote and branch it was recorded against, which is why those are kept with
+ * it — a target pointed somewhere else starts again from that remote rather than diffing against a
+ * commit the remote has never had.
+ */
+export const storageSyncState = pgTable('storageSyncState', {
+  targetId: uuid()
+    .primaryKey()
+    .references(() => storage.id, { onDelete: 'cascade' }),
+  remote: text().notNull(),
+  branch: varchar({ length: 255 }).notNull(),
+  commit: varchar({ length: 64 }).notNull(),
+  updatedAt: timestamp().notNull().defaultNow()
+})
+
+// TAGS --------------------------------
+export const tags = pgTable(
+  'tags',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    tag: varchar({ length: 255 }).notNull(),
+    usageCount: integer().notNull().default(0),
+    createdAt: timestamp().notNull().defaultNow(),
+    updatedAt: timestamp().notNull().defaultNow(),
+    siteId: uuid()
+      .notNull()
+      .references(() => sites.id)
+  },
+  (table) => [
+    index('tags_siteId_idx').on(table.siteId),
+    uniqueIndex('tags_composite_idx').on(table.siteId, table.tag)
+  ]
+)
+
+// TREE --------------------------------
+export const treeTypeEnum = pgEnum('treeType', ['folder', 'page', 'asset'])
+export const treeNavigationModeEnum = pgEnum('treeNavigationMode', [
+  'inherit',
+  'override',
+  'overrideExact',
+  'hide',
+  'hideExact'
+])
+export const tree = pgTable(
+  'tree',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    // -> Genuinely hierarchical, and queried as such with `<@`, `@>` and lquery: this is what ltree is
+    //    for. The locale beside it is not, and is a plain string. Each label is a folder name ENCODED
+    //    (`encodeTreeLabel`), never the name itself — what ltree accepts in a label depends on the
+    //    database's locale, and a path segment's characters are no business of the database's.
+    folderPath: ltree('folderPath'),
+    fileName: varchar({ length: 255 }).notNull(),
+    hash: varchar({ length: 255 }).notNull(),
+    type: treeTypeEnum('tree').notNull(),
+    locale: varchar({ length: 255 }).notNull(),
+    title: varchar({ length: 255 }).notNull(),
+    navigationMode: treeNavigationModeEnum('navigationMode').notNull().default('inherit'),
+    navigationId: uuid(),
+    tags: text()
+      .array()
+      .notNull()
+      .default(sql`ARRAY[]::text[]`),
+    meta: jsonb().notNull().default({}),
+    createdAt: timestamp().notNull().defaultNow(),
+    updatedAt: timestamp().notNull().defaultNow(),
+    siteId: uuid()
+      .notNull()
+      .references(() => sites.id)
+  },
+  (table) => [
+    // -> Hash rather than btree for the equality lookups a folder listing makes: a btree entry may not
+    //    exceed a third of a page, and a deep path of encoded non-Latin names gets there
+    index('tree_folderpath_idx').using('hash', table.folderPath),
+    index('tree_folderpath_gist_idx').using('gist', table.folderPath),
+    index('tree_fileName_idx').on(table.fileName),
+    index('tree_hash_idx').on(table.hash),
+    index('tree_type_idx').on(table.type),
+    // -> A plain btree: the locale is a string compared for equality, and GiST — which is what an
+    //    ltree column wanted — has no operator class for varchar at all
+    index('tree_locale_idx').on(table.locale),
+    index('tree_navigationMode_idx').on(table.navigationMode),
+    index('tree_navigationId_idx').on(table.navigationId),
+    index('tree_tags_idx').using('gin', table.tags),
+    index('tree_siteId_idx').on(table.siteId)
+  ]
+)
+
+// USER AVATARS ------------------------
+export const userAvatars = pgTable('userAvatars', {
+  id: uuid().primaryKey(),
+  data: bytea().notNull()
+})
+
+// USER KEYS ---------------------------
+export const userKeys = pgTable(
+  'userKeys',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    kind: varchar({ length: 255 }).notNull(),
+    token: varchar({ length: 255 }).notNull(),
+    meta: jsonb().notNull().default({}),
+    createdAt: timestamp().notNull().defaultNow(),
+    validUntil: timestamp().notNull(),
+    userId: uuid()
+      .notNull()
+      .references(() => users.id)
+  },
+  (table) => [index('userKeys_userId_idx').on(table.userId)]
+)
+
+// USERS -------------------------------
+export const users = pgTable(
+  'users',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    email: varchar({ length: 255 }).notNull().unique(),
+    name: varchar({ length: 255 }).notNull(),
+    /**
+     * The name this user is mentioned by in a comment, without the `@`.
+     *
+     * Null until they pick one, and a user without one is simply not mentionable — nothing is
+     * derived from their name on their behalf. Unique case-insensitively: `@Ana` and `@ana` have to
+     * be the same person for a mention to mean anything, so the index below is on the folded form
+     * while the column keeps the capitalization that was typed.
+     */
+    handle: varchar({ length: 64 }),
+    /**
+     * What the directory provisioning this account calls it, as SCIM's `externalId`.
+     *
+     * The identifier that survives a rename or a change of address at the provider, so it is what a
+     * SCIM client looks an account up by. Null for an account created here, and optional even for a
+     * provisioned one — see the same column on `groups`.
+     */
+    externalId: varchar({ length: 255 }),
+    /**
+     * Whether a SCIM client owns this account. Set by the first provisioning write, which is how an
+     * account created by hand is adopted by a directory that later claims it.
+     *
+     * What it gates is destruction: `DELETE /Users/:id` is only honoured for an account the client
+     * owns, so a token sitting in somebody else's console cannot empty the wiki's user list. See
+     * `models/scim.ts`.
+     */
+    isProvisioned: boolean().notNull().default(false),
+    auth: jsonb().notNull().default({}),
+    meta: jsonb().notNull().default({}),
+    passkeys: jsonb().notNull().default({}),
+    prefs: jsonb().notNull().default({}),
+    hasAvatar: boolean().notNull().default(false),
+    isActive: boolean().notNull().default(false),
+    isSystem: boolean().notNull().default(false),
+    isVerified: boolean().notNull().default(false),
+    lastLoginAt: timestamp(),
+    createdAt: timestamp().notNull().defaultNow(),
+    updatedAt: timestamp().notNull().defaultNow()
+  },
+  (table) => [
+    index('users_lastLoginAt_idx').on(table.lastLoginAt),
+    // -> Nulls are distinct to postgres, as for the handle below
+    uniqueIndex('users_externalId_idx').on(table.externalId),
+    // -> Folded, so that two handles differing only in case cannot both exist. Nulls are distinct to
+    //    postgres, which is what lets any number of users have no handle at all.
+    uniqueIndex('users_handle_idx').on(sql`lower(${table.handle})`)
+  ]
+)
+
+// == RELATION TABLES ==================
+
+// USER GROUPS -------------------------
+export const userGroups = pgTable(
+  'userGroups',
+  {
+    userId: uuid()
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    groupId: uuid()
+      .notNull()
+      .references(() => groups.id, { onDelete: 'cascade' })
+  },
+  (table) => [
+    primaryKey({ columns: [table.userId, table.groupId] }),
+    index('userGroups_userId_idx').on(table.userId),
+    index('userGroups_groupId_idx').on(table.groupId),
+    index('userGroups_composite_idx').on(table.userId, table.groupId)
+  ]
+)
+
+// USER NOTIFICATION PREFS -------------
+/**
+ * Which notifications one person has chosen to receive, and how.
+ *
+ * **Only a choice that differs from the category's default is stored.** No row means the default,
+ * which lives in the category's definition (`notifications/categories/`) and nowhere else, and setting
+ * a choice back to its default deletes the row rather than writing one that says the same thing.
+ *
+ * A table rather than a key in `users.prefs` because of the categories that are off by default: to
+ * tell everybody who asked about every page created, the question is "who has turned this on?" asked
+ * of every account on the instance, which is the partial index below rather than a scan of a JSONB
+ * column. The categories that are on by default ask the other way round — of these few watchers,
+ * who has turned it off — and that is the primary key.
+ *
+ * One row per channel rather than a column each, so that a third channel is a new value and not a
+ * migration. Global, not per site: a person has one set of preferences for every site they use.
+ */
+export const userNotificationPrefs = pgTable(
+  'userNotificationPrefs',
+  {
+    userId: uuid()
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    category: varchar({ length: 64 }).notNull(),
+    // -> 'inApp' or 'email'
+    channel: varchar({ length: 16 }).notNull(),
+    enabled: boolean().notNull(),
+    updatedAt: timestamp().notNull().defaultNow()
+  },
+  (table) => [
+    primaryKey({ columns: [table.userId, table.category, table.channel] }),
+    // -> Who has turned a category on, read in userId order: the fan-out pages through it a thousand
+    //    accounts at a time, and an opted-in audience can be every account on the instance
+    index('userNotificationPrefs_optin_idx')
+      .on(table.category, table.userId)
+      .where(sql`"enabled"`)
+  ]
+)

@@ -1,0 +1,4155 @@
+import { and, desc, eq, inArray, isNull, ne, notInArray, sql } from 'drizzle-orm'
+import {
+  pageLinks as pageLinksTable,
+  pages as pagesTable,
+  tree as treeTable,
+  users as usersTable
+} from '../db/schema.ts'
+import {
+  CustomError,
+  generatePathHash,
+  isValidPathSegment,
+  MAX_PATH_SEGMENT_BYTES,
+  normalizeNewPagePath,
+  normalizePagePath,
+  timingSafeCompare
+} from '../helpers/common.ts'
+import { invalidateAppShellCache } from '../helpers/appShell.ts'
+import { liveCondition, maySeeUnpublished } from '../helpers/publishing.ts'
+import { rewriteSourceLinks } from '../helpers/linkRewrite.ts'
+import type { SourceSyntax } from '../helpers/linkRewrite.ts'
+import { relinkHref, rewriteRenderLinks } from '../helpers/pageLinks.ts'
+import { currentVia } from '../helpers/via.ts'
+import type { AccessActor } from './groups.ts'
+import type { RulePageRef } from '../helpers/pageRules.ts'
+import type { FastifyRequest } from 'fastify'
+import type { RenderPermissions, TocNode } from './rendering.ts'
+import type { DeletedEntry } from './tree.ts'
+import type { StoragePageContent, StoragePageRef } from './storage.ts'
+import type { PageRatingsCache } from './pageRatings.ts'
+import type { LifecycleBanner } from './pageLifecycle.ts'
+
+/** What each editor produces, which is what the content column holds. */
+const EDITOR_CONTENT_TYPES: Record<string, string> = {
+  markdown: 'markdown',
+  visual: 'markdown',
+  asciidoc: 'adoc',
+  excalidraw: 'excalidraw',
+  redirect: 'redirect',
+  blog: 'blog',
+  feedback: 'feedback'
+}
+
+/**
+ * The editors that can open a page written by `editor`, itself excluded.
+ *
+ * Two editors are interchangeable when they produce the same content type, and only then: converting
+ * is a change of how a page is EDITED, never of what it says, so there is no translation step and
+ * nothing to lose. Markdown and Visual are that pair; asciidoc and redirect have nobody to swap with,
+ * which is the honest answer rather than an offer to rewrite a page into a format it was not written
+ * in.
+ */
+export function interchangeableEditors(editor: string): string[] {
+  const contentType = EDITOR_CONTENT_TYPES[editor]
+  if (!contentType) {
+    return []
+  }
+  return Object.entries(EDITOR_CONTENT_TYPES)
+    .filter(([name, type]) => type === contentType && name !== editor)
+    .map(([name]) => name)
+}
+
+/**
+ * The extension a page's source is written under, by the content type its editor produces.
+ *
+ * A page is addressed without one — its path is a URL — so this only ever appears where a page has to
+ * be a file: a storage target laying content out by path. It lives here rather than in that module
+ * because it is a fact about the page, and because it is what decides whether an uploaded file would
+ * land on top of one. See `storageFileName`.
+ */
+export const PAGE_FILE_EXTENSIONS: Record<string, string> = {
+  markdown: 'md',
+  html: 'html',
+  adoc: 'adoc',
+  /*
+    Not `json`, though the document is one. `.excalidraw` is the extension the format already has
+    everywhere else -- it is what Excalidraw itself saves, and what every tool that reads a drawing
+    looks for -- so a tree exported to disk holds files that open in the editor they came from. It
+    also keeps this out of the `.json` ambiguity that `EDITOR_FOR_PAGE_EXTENSION` below has to
+    arbitrate, since nothing else writes it.
+  */
+  excalidraw: 'excalidraw',
+  redirect: 'json',
+  blog: 'json',
+  feedback: 'json'
+}
+
+/** For a content type added since this was written. */
+const DEFAULT_PAGE_FILE_EXTENSION = 'txt'
+
+export function pageFileExtension(contentType: string): string {
+  return PAGE_FILE_EXTENSIONS[contentType] ?? DEFAULT_PAGE_FILE_EXTENSION
+}
+
+/**
+ * Which editor a file of a given extension is taken to belong to, when it did not say.
+ *
+ * Written out rather than derived by reading `PAGE_FILE_EXTENSIONS` backwards, because that map is
+ * one-to-one in neither direction. Two editors write `.json` — `redirect` and `blog` — and an answer
+ * that depended on which of them was declared first would change every time somebody reordered the
+ * table; and `markdown` and `visual` both write `.md`, which is what lets a page be converted between
+ * them without touching a byte of what it says, so the extension alone was never going to identify an
+ * editor. A file being imported carries its source and not the editor somebody wrote it in, and this
+ * is the answer for that case: the one each pair opens in by default.
+ *
+ * `.json` is read as a REDIRECTION. Every `.json` a storage target writes carries its editor at the
+ * top level of the document and never reaches this — see `importTree` — so what is left is a file
+ * somebody wrote by hand, and a redirection is both the older of the two meanings and the one whose
+ * document is a page's whole definition rather than a blog's chrome.
+ *
+ * `.html` has no editor and deliberately keeps none: the content type exists (a page can be stored as
+ * HTML) but nothing in this wiki authors one.
+ */
+const EDITOR_FOR_PAGE_EXTENSION: Record<string, string> = {
+  md: 'markdown',
+  adoc: 'asciidoc',
+  excalidraw: 'excalidraw',
+  json: 'redirect'
+}
+
+/**
+ * Which editor writes a given file extension.
+ *
+ * For a page being imported that did not say which editor it belongs to, which is allowed only where
+ * the site reserves the extension for pages — see `importAll` in the local disk module.
+ *
+ * @returns Null when no editor produces that extension, which for a reserved one means the site
+ *   reserved something this wiki has no editor for
+ */
+export function pageEditorForExtension(ext: string): string | null {
+  return EDITOR_FOR_PAGE_EXTENSION[ext] ?? null
+}
+
+/**
+ * The editor whose pages send their reader somewhere else.
+ *
+ * A redirection is an ordinary page — it has a path, a title, an icon and a place in the tree, and is
+ * browsable like any other — with nothing to read: no body, no render, and therefore nothing for the
+ * search index to hold. What an author fills in is where it points, and that is what its content
+ * column carries. See `normalizeRedirectContent`.
+ */
+const REDIRECT_EDITOR = 'redirect'
+
+/**
+ * The editor whose pages are a blog's front page.
+ *
+ * Like a redirection it is an ordinary page with no body: it has a path, a title, an icon and a place
+ * in the tree, and what an author fills in is how the blog behaves rather than anything to read. That
+ * is what its content column carries — see `normalizeBlogContent` and `BlogContent`.
+ *
+ * Unlike a redirection it is a destination. A blog's front page is what gets linked, bookmarked and
+ * searched for, so it stays in the sitemap, stays indexable and stays searchable; only the three
+ * checks that ask specifically about a REDIRECTION say otherwise, and none of them means "bodyless".
+ *
+ * Which pages are its posts is not recorded anywhere: they are the pages under its path. See
+ * `models/blogs.ts`.
+ */
+const BLOG_EDITOR = 'blog'
+
+/**
+ * The editor whose pages are a feedback board's front page.
+ *
+ * A blog's sibling: a bodyless destination whose content column holds how the board behaves
+ * (`FeedbackBoardContent`), and whose ideas are the pages in its folder. See `models/feedback.ts`.
+ */
+export const FEEDBACK_EDITOR = 'feedback'
+
+/**
+ * The editors whose pages have no body, and whose content column holds a settings document instead.
+ *
+ * A set rather than a flag per editor, because the same three questions get asked of each of them in
+ * `createPage` and `updatePage` — is an empty content column an error, does the content go through a
+ * normalizer, does the source travel to every reader — and answering them with one `isRedirect`
+ * boolean apiece is how those two functions become a lattice. What is NOT in here is anything a
+ * redirection is asked about *as a redirection*: staying out of the sitemap, never being indexable
+ * and never being searchable are facts about a doorway, not about having no body.
+ */
+const BODYLESS_EDITORS = new Set([REDIRECT_EDITOR, BLOG_EDITOR, FEEDBACK_EDITOR])
+
+/** Whether `editor` writes a settings document rather than something to read. */
+export function isBodylessEditor(editor: string): boolean {
+  return BODYLESS_EDITORS.has(editor)
+}
+
+/** Every editor that writes a settings document, for a query keeping their pages out of a listing. */
+export function bodylessEditors(): string[] {
+  return [...BODYLESS_EDITORS]
+}
+
+/** Whether `editor` is one this wiki has an editor for, which is what knowing its content type is. */
+export function isKnownEditor(editor: string): boolean {
+  return Object.hasOwn(EDITOR_CONTENT_TYPES, editor)
+}
+
+/**
+ * Put a bodyless editor's content into the one spelling its column holds, refusing what it cannot
+ * use. Returns the content unchanged for an editor that writes an actual body.
+ */
+export function normalizeBodylessContent(
+  editor: string,
+  content: string | undefined
+): string | undefined {
+  switch (editor) {
+    case REDIRECT_EDITOR:
+      return normalizeRedirectContent(content)
+    case BLOG_EDITOR:
+      return normalizeBlogContent(content)
+    case FEEDBACK_EDITOR:
+      return normalizeFeedbackContent(content)
+    default:
+      return content
+  }
+}
+
+/**
+ * How long a site's sitemap list is held before it is read again, in seconds.
+ *
+ * The same figure as the `Cache-Control` the file goes out with, for the same reason: a sitemap may
+ * be a few minutes out of date without anybody being misled. Note the two compound — see
+ * `listForSitemap`.
+ */
+const SITEMAP_TTL = 600
+
+/** Namespaced so that `invalidateSitemaps` can find every site's entry without knowing the sites. */
+const SITEMAP_CACHE_PREFIX = 'sitemap:'
+
+function sitemapCacheKey(siteId: string): string {
+  return `${SITEMAP_CACHE_PREFIX}${siteId}`
+}
+
+/**
+ * Sitemap lists being built right now, one at most per site.
+ *
+ * Deliberately NOT in `WIKI.cache`: a promise is this process's, and the point of it is to make
+ * concurrent callers in this process wait on one query rather than start their own.
+ */
+const sitemapBuilds = new Map<string, Promise<SitemapPage[]>>()
+
+const reAlias = /^[a-zA-Z0-9-_]*$/
+
+/**
+ * The colors a page icon may be drawn in, by Tailwind palette name. Empty is "unset", which draws it
+ * in the site's primary color. Of the greys only `slate` and `gray` are offered.
+ */
+export const PAGE_ICON_COLORS = [
+  'red',
+  'orange',
+  'amber',
+  'yellow',
+  'lime',
+  'green',
+  'emerald',
+  'teal',
+  'cyan',
+  'sky',
+  'blue',
+  'indigo',
+  'violet',
+  'purple',
+  'fuchsia',
+  'pink',
+  'rose',
+  'slate',
+  'gray'
+] as const
+
+/** Fields kept in the `config` blob rather than as columns, and flattened again on the way out. */
+const CONFIG_FIELDS = [
+  'allowBacklinks',
+  'allowComments',
+  'allowContributions',
+  'allowGlossaryLinks',
+  'allowRatings',
+  'iconColor',
+  'showLastEditedBy',
+  'showSidebar',
+  'showTags',
+  'showToc',
+  'tocDepth'
+] as const
+
+/**
+ * One counterpart of a page in another locale: the same page, written in a different language.
+ *
+ * A page holds at most one per locale, and the whole set is what `pages.localeGroupId` names. What is
+ * carried is what a reader being sent there needs — the locale to prefix with and the path to go to —
+ * plus the title, which is what an editing surface lists.
+ */
+export interface PageLocaleRelation {
+  locale: string
+  path: string
+  title: string
+  /**
+   * The counterpart's own tags. Not something a client is shown — the response schemas drop it —
+   * but a counterpart has to be judged against `read:pages` before it is named at anybody, and a
+   * rule that addresses pages by tag cannot answer without them.
+   */
+  tags: string[]
+}
+
+/**
+ * A counterpart as it is asked for: a locale and the path of the page in it.
+ *
+ * By path rather than by id because that is what a page picker answers with, and because a path is
+ * what an API client writing a translation set already has in hand. Resolved to a page on the way in —
+ * see `applyLocaleRelations`.
+ */
+export interface PageLocaleRelationInput {
+  locale: string
+  path: string
+}
+
+/** A page as the API exposes it: the columns and both blobs, flattened into one object. */
+export interface Page {
+  id: string
+  /**
+   * The site the page belongs to. Carried so that a page in hand is enough to ask a page rule about
+   * it — rules may be limited to particular sites, and `RulePageRef` requires one for that reason.
+   * Dropped by the response schemas: the caller addressed the page through its site to begin with.
+   */
+  siteId: string
+  path: string
+  hash: string
+  alias: string | null
+  title: string
+  description: string | null
+  icon: string | null
+  /** One of `PAGE_ICON_COLORS`, or empty for the site's primary color. */
+  iconColor: string
+  locale: string
+  editor: string
+  /** The other editors this page could be opened with — see `interchangeableEditors`. */
+  convertibleTo: string[]
+  contentType: string
+  publishState: 'draft' | 'published' | 'scheduled'
+  publishStartDate: Date | null
+  publishEndDate: Date | null
+  isBrowsable: boolean
+  isSearchable: boolean
+  /**
+   * The page's password, if it has one. Present only for a requester who may edit the page — see
+   * `getPage`'s `withPassword`. Absent, rather than null, for everyone else: a reader cannot tell a
+   * page with no password from one whose password was withheld, and does not need to.
+   */
+  password?: string | null
+  /** Whether the body was withheld because the page is password protected. See `getPage`. */
+  isLocked: boolean
+  /** Whether this page shows what links to it. The site-wide switch is `features.backlinks`. */
+  allowBacklinks: boolean
+  relations: any[]
+  /**
+   * This page in the other locales, as far as the requester may see them. Empty for a page that is
+   * not part of a locale group, and for one whose whole group is pages this requester may not read.
+   */
+  localeRelations: PageLocaleRelation[]
+  tags: string[]
+  toc: TocNode[]
+  render: string
+  /**
+   * The source. Present when the request asked for it, and always for a bodyless editor — see
+   * `toPage`, and `RedirectContent` / `BlogContent` for what those hold instead of a body.
+   */
+  content?: string
+  allowComments: boolean
+  allowContributions: boolean
+  /** Whether glossary terms are linked automatically in this page's text. See `features.glossaryAutoLink`. */
+  allowGlossaryLinks: boolean
+  allowRatings: boolean
+  showLastEditedBy: boolean
+  showSidebar: boolean
+  showTags: boolean
+  showToc: boolean
+  tocDepth: { min: number; max: number }
+  scriptJsLoad: string
+  scriptJsUnload: string
+  scriptCss: string
+  navigationId: string | null
+  navigationMode: string
+  /** Who created the page, as against who saved the version that stands. */
+  creatorId: string
+  authorId: string
+  authorName: string
+  /** Whether the account that saved the version that stands has uploaded an avatar. */
+  authorHasAvatar: boolean
+  /**
+   * How the version that stands was made, when not through the wiki's own interface: `mcp` for an
+   * AI assistant. Its `pageHistory.via`, which is what the last-edited line marks.
+   */
+  editedVia: string | null
+  /**
+   * The cached rating totals, per scale. Internal: the API answers with `rating`, the summary on the
+   * site's current scale — see `pageRatings.summaryFromCache`.
+   */
+  ratings: PageRatingsCache
+  createdAt: Date
+  updatedAt: Date
+  /** When the body last changed, which `updatedAt` is not: see `pages.contentUpdatedAt`. */
+  contentUpdatedAt: Date
+  lastReviewedAt: Date | null
+  /** Shown over the article to every reader until somebody marks the page reviewed. */
+  lifecycleBanner: LifecycleBanner | null
+}
+
+/** Everything a page can be created with. */
+export interface PageInput {
+  path: string
+  title: string
+  editor: string
+  content: string
+  /** The HTML the editor produced. Post-processed before it is stored — see `models/rendering.ts`. */
+  render?: string
+  locale?: string
+  description?: string
+  icon?: string
+  iconColor?: string
+  alias?: string
+  publishState?: 'draft' | 'published' | 'scheduled'
+  publishStartDate?: string | null
+  publishEndDate?: string | null
+  isBrowsable?: boolean
+  isSearchable?: boolean
+  password?: string
+  allowBacklinks?: boolean
+  relations?: any[]
+  /**
+   * The page's counterparts in other locales, stating the whole set rather than adding to it: a locale
+   * left out of the list is a locale this page has no counterpart in, and a page that was in the group
+   * and is not in the list leaves it. Absent means "leave the group alone", which is what a save that
+   * is not about translations sends.
+   */
+  localeRelations?: PageLocaleRelationInput[]
+  tags?: string[]
+  allowComments?: boolean
+  allowContributions?: boolean
+  allowGlossaryLinks?: boolean
+  allowRatings?: boolean
+  showLastEditedBy?: boolean
+  showSidebar?: boolean
+  showTags?: boolean
+  showToc?: boolean
+  tocDepth?: { min: number; max: number }
+  scriptJsLoad?: string
+  scriptJsUnload?: string
+  scriptCss?: string
+  /**
+   * Why this save is being made, as the editor's reason-for-change prompt collected it. Not a page
+   * field: it belongs to the version this save produces, and is recorded on the history row.
+   */
+  reasonForChange?: string
+}
+
+/** What bringing a page back out of the recycle bin takes. */
+export interface PageRestoreInput {
+  pageId: string
+  /**
+   * The deletion being undone, as the caller read it. Asked for rather than looked up alone, because
+   * the render below was produced from THAT snapshot's source: a page restored and deleted again in
+   * the meantime has a newer one, and the two must not be mixed.
+   */
+  versionId: string
+  /** The HTML the browser rendered the snapshot's source into, for where the page is going. */
+  render?: string
+  /** Where to put it, when not back where it was. */
+  path?: string
+  locale?: string
+  /** A title of its own, asked for alongside a new path; the one it had otherwise. */
+  title?: string
+}
+
+/** Who is saving, and what they are allowed to put in a page. */
+/** One row of the admin dashboard's recently-edited panel. */
+export interface RecentPage {
+  id: string
+  siteId: string
+  locale: string
+  path: string
+  title: string
+  updatedAt: Date
+  /** Whether this is the page appearing for the first time rather than a later edit of it. */
+  isNew: boolean
+  /**
+   * Where the page is, as a path on its own site — locale prefix included only where that site's
+   * settings put one there.
+   */
+  url: string
+  /**
+   * The host that site answers on, so a caller looking at one site can still link to a page on
+   * another. Null for the catch-all site, which has no host of its own to name.
+   */
+  hostname: string | null
+  /** Who wrote the version that stands. Null once that account is deleted. */
+  authorName: string | null
+}
+
+/** One row of the admin dashboard's newest-pages panel. */
+export interface NewestPage {
+  id: string
+  siteId: string
+  locale: string
+  path: string
+  title: string
+  createdAt: Date
+  /** As on `RecentPage`. */
+  url: string
+  /** As on `RecentPage`. */
+  hostname: string | null
+  /** Who created the page, whoever has written to it since. Null once that account is deleted. */
+  creatorName: string | null
+}
+
+/** A page as a sitemap entry sees it: where it is, when it last changed, and what it is a translation of. */
+export interface SitemapPage {
+  locale: string
+  path: string
+  updatedAt: Date
+  /** The set of pages this one is a translation of, or null when it has none — see the column. */
+  localeGroupId: string | null
+}
+
+/**
+ * A page as the HTML document served for it describes itself — see `describePageForPublic` and
+ * `describePageForRequest`.
+ *
+ * Everything here is scoped to whoever it was asked for: a page they may not read is not described at
+ * all, and neither are the translations of one they may not reach.
+ */
+export interface PageDescription {
+  locale: string
+  path: string
+  title: string
+  description: string | null
+  /**
+   * Which editor wrote the page.
+   *
+   * Carried so that a caller building a document can tell a page whose body is in `render` from one
+   * that keeps no body at all — a blog's front page has its posts in place of an article, and a
+   * document served to a client that will not run the app has to say what is on it. See
+   * `fragmentsForCrawler`.
+   */
+  editor: string
+  /**
+   * The stored render, or null where this page has no body to show a reader who has not asked for
+   * one: a password-protected page, whose body is exactly what the password covers, and a redirection,
+   * which has nowhere to keep one.
+   *
+   * Only wanted by the caller building a document for a client that will never run the app; a browser
+   * about to boot the SPA is served the head alone.
+   */
+  render: string | null
+  updatedAt: Date
+  /**
+   * Whether a search engine should list it — `isSearchable`, and off as well for the two cases with
+   * nothing to list. The same question the sitemap asks, answered for one page.
+   */
+  isIndexable: boolean
+  /**
+   * Every locale this page exists in and this requester may read, this one included. Empty for a page
+   * that is not part of a translation set, since an alternates list naming one document says nothing.
+   */
+  alternates: { locale: string; path: string }[]
+}
+
+export interface PageActor {
+  id: string
+  permissions: string[]
+}
+
+/** A page that links to a moved page's old address and was left alone, and why. */
+export interface RelinkSkip {
+  id: string
+  siteId: string
+  locale: string
+  path: string
+  title: string
+  /** What a page rule may address it by, so the caller can ask whether this page may be named. */
+  tags: string[]
+  /**
+   * `forbidden` — the mover may not edit it. `notInSource` — the link is in its render but could not
+   * be found in its source in a form that can be rewritten, so rewriting the render alone would only
+   * last until the next render from that source. `failed` — the save was refused, and the page left
+   * as it was.
+   */
+  reason: 'forbidden' | 'notInSource' | 'failed'
+}
+
+export interface RelinkResult {
+  /** Each page whose links were rewritten, with the version recording it. */
+  updated: { id: string; versionId: string | null }[]
+  skipped: RelinkSkip[]
+  /**
+   * The glossary terms documented by the page: `updated` now point at its new path, `cleared` lost it
+   * because the page left their locale. See `glossary.relinkDocumentation`.
+   */
+  glossary: { updated: string[]; cleared: string[] }
+}
+
+/** Which source syntax a link is looked for in, per editor. The rest keep links in JSON, or none. */
+export const SOURCE_SYNTAX: Record<string, SourceSyntax> = {
+  markdown: 'markdown',
+  visual: 'markdown',
+  asciidoc: 'adoc'
+}
+
+/**
+ * A page as it stands after a change, together with the history version that change produced.
+ *
+ * The version is returned rather than kept to itself because the audit log references it: an audit
+ * entry says a page was edited and points at the `pageHistory` row holding what the edit actually
+ * was, instead of copying the before and after into a second table. Null when history could not be
+ * recorded — `pageHistory.record` swallows its own failures, since losing a version is not a reason
+ * to fail the edit.
+ */
+export interface PageChange {
+  page: Page
+  versionId: string | null
+}
+
+function hasPermission(actor: PageActor, permission: string): boolean {
+  return actor.permissions.includes('manage:system') || actor.permissions.includes(permission)
+}
+
+/**
+ * Normalize a path to the form that gets stored, and refuse it if what is left is not addressable.
+ *
+ * Casing, spaces and underscores are corrected rather than rejected — `My_Page` is a path someone
+ * meant, and it means `my-page`. Anything else outside what a segment may hold
+ * (`isValidPathSegment`) is not something to guess at.
+ *
+ * @param current The path the page already has, when this is a move or a restore. Asked for the same
+ *   path back, it gets exactly that path: one written before underscores became hyphens keeps its
+ *   `_`, rather than a rename that only changes the title moving the page somewhere new.
+ */
+function normalizePath(input: string, current?: string): string {
+  if (current !== undefined && normalizePagePath(input) === current) {
+    return current
+  }
+  const path = normalizeNewPagePath(input)
+  if (!path.split('/').every(isValidPathSegment)) {
+    throw new CustomError(
+      'pageInvalidPath',
+      `A page path may only contain letters, numbers, hyphens and slashes, and each part of it be at most ${MAX_PATH_SEGMENT_BYTES} bytes long.`
+    )
+  }
+  return path
+}
+
+/**
+ * Where a redirection points, as its content column holds it.
+ *
+ * `kind` is stored rather than sniffed off the target, because it is the question the author actually
+ * answered: a page of this wiki, or somewhere else. The two are not reliably told apart afterwards —
+ * `/help` is a page here and a perfectly good relative URL elsewhere — and the editor has to open on
+ * the choice that was made rather than on a guess about it.
+ */
+export interface RedirectContent {
+  kind: 'page' | 'url'
+  /** A rooted path within this wiki, or an absolute `http(s)` URL. */
+  target: string
+  /** Whether the reader is told where they are going before being taken there. */
+  showInterstitial: boolean
+}
+
+/**
+ * Read a redirection's target back out of what the editor sent, and refuse anything that would not
+ * send a reader anywhere.
+ *
+ * Re-serialized rather than stored as it arrived, so that the column holds one canonical spelling: a
+ * save that changes nothing then reports no change, and the history rows say what they mean.
+ *
+ * A URL target is held to `http`/`https` deliberately. This value ends up in a `location` assignment,
+ * so any other scheme is either useless (`mailto:` in a redirect that nobody chose to follow) or an
+ * invitation (`javascript:`) — and a redirection is followed without the reader clicking anything.
+ */
+function normalizeRedirectContent(content: string | undefined): string {
+  let parsed: any
+  try {
+    parsed = JSON.parse(content ?? '')
+  } catch {
+    throw new CustomError('pageRedirectInvalid', 'A redirection needs a target.')
+  }
+  const kind = parsed?.kind === 'url' ? 'url' : 'page'
+  const target = typeof parsed?.target === 'string' ? parsed.target.trim() : ''
+  if (target.length < 1) {
+    throw new CustomError('pageRedirectMissingTarget', 'A redirection needs a target.')
+  }
+  if (kind === 'url') {
+    if (!/^https?:\/\/\S/i.test(target)) {
+      throw new CustomError(
+        'pageRedirectInvalidUrl',
+        'A redirection to a URL must be a complete http:// or https:// address.'
+      )
+    }
+  } else if (!target.startsWith('/') || target.startsWith('//')) {
+    throw new CustomError(
+      'pageRedirectInvalidPath',
+      'A redirection to a page of this wiki must be a path starting with a slash.'
+    )
+  }
+  const redirect: RedirectContent = {
+    kind,
+    target,
+    showInterstitial: parsed?.showInterstitial === true
+  }
+  return JSON.stringify(redirect)
+}
+
+/**
+ * The ways a listing can draw its posts, and the enum the API validates a saved blog against.
+ *
+ * Two, because there are two: a responsive grid of posts, or one post per row. A third narrower grid
+ * was a track width pretending to be a layout — how COMPACT a post reads is `show`, which turns off
+ * the description, the byline and the tags, and that is a choice an author can reason about in a way
+ * that `cards` versus `grid` was not.
+ *
+ * The default leads. Order means nothing to the validation below, but the editor's copy of this list
+ * (`helpers/pageBlog.js`) is mapped straight onto its layout dropdown, and the two are kept in step.
+ */
+export const BLOG_LAYOUTS = ['cards', 'list'] as const
+
+/**
+ * How a blog behaves, as its front page's content column holds it.
+ *
+ * A blog has no state of its own beyond this: its posts are the pages under its path, worked out at
+ * read time (`models/blogs.ts`), so nothing here is a list of anything. Every field is a display
+ * decision, which is why the whole document can be replaced without touching a post.
+ */
+export interface BlogContent {
+  /** How a post is drawn in the listing. */
+  layout: 'list' | 'cards'
+  /** How many posts a page of the listing holds. */
+  perPage: number
+  /** Which end of the blog the listing starts at. */
+  sort: 'newest' | 'oldest'
+  /**
+   * How many folders below the blog's own path posts are collected from.
+   *
+   * Deep by default, so that a blog filed by year (`/my-blog/2026/spring-notes`) is one blog rather
+   * than an empty one — a flat blog is the same setting with the number turned down.
+   */
+  depth: number
+  /** An introduction shown above the listing. Plain text: the front page has no renderer. */
+  intro: string
+  /** Which of a post's fields the listing shows. */
+  show: {
+    icon: boolean
+    description: boolean
+    author: boolean
+    date: boolean
+    tags: boolean
+  }
+  /** What the column beside the listing carries. */
+  sidebar: {
+    tags: boolean
+    archive: boolean
+  }
+}
+
+/** What a blog starts as, and what any missing field falls back to. */
+export const BLOG_DEFAULTS: BlogContent = {
+  /*
+    Cards, because a blog that has just been created has nothing in it to look at: the grid shows an
+    author what the listing is for in a way a stack of single lines does not, and every field a post
+    carries -- the icon, the blurb, the byline, the tags -- has somewhere to sit in it. `list` is the
+    denser reading and stays one option away.
+  */
+  layout: 'cards',
+  perPage: 10,
+  sort: 'newest',
+  depth: 5,
+  intro: '',
+  show: { icon: true, description: true, author: true, date: true, tags: true },
+  sidebar: { tags: true, archive: true }
+}
+
+/** The widest a blog page may be set to, so that one request cannot ask for the whole wiki. */
+const BLOG_MAX_PER_PAGE = 100
+
+/** As deep as posts may be collected from, matching the tree's own ceiling on a recursive listing. */
+const BLOG_MAX_DEPTH = 10
+
+/** As long an introduction as the front page will carry; past this it is an article, not a preamble. */
+const BLOG_MAX_INTRO = 2000
+
+/**
+ * Read a blog's settings back out of what the editor sent.
+ *
+ * Every field is defaulted rather than required, because none of them is a destination the way a
+ * redirection's target is: a blog with nothing filled in is a perfectly good blog, and refusing to
+ * save one would only mean an author cannot create the front page before deciding how it should
+ * look. What IS refused is a number outside what the listing can serve — a `perPage` of a million is
+ * not a preference, it is a request for the whole wiki on one screen.
+ *
+ * Re-serialized rather than stored as it arrived, for the same reason a redirection is: the column
+ * holds one canonical spelling, so a save that changes nothing reports no change.
+ */
+function normalizeBlogContent(content: string | undefined): string {
+  let parsed: any
+  try {
+    parsed = JSON.parse(content ?? '')
+  } catch {
+    parsed = null
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    parsed = {}
+  }
+  const perPage = Number.parseInt(parsed.perPage, 10)
+  if (parsed.perPage !== undefined && (!Number.isFinite(perPage) || perPage < 1)) {
+    throw new CustomError('pageBlogInvalidPerPage', 'A blog must show at least one post per page.')
+  }
+  const depth = Number.parseInt(parsed.depth, 10)
+  if (parsed.depth !== undefined && (!Number.isFinite(depth) || depth < 0)) {
+    throw new CustomError('pageBlogInvalidDepth', 'A blog cannot collect posts from above itself.')
+  }
+  const intro = typeof parsed.intro === 'string' ? parsed.intro.trim() : BLOG_DEFAULTS.intro
+  if (intro.length > BLOG_MAX_INTRO) {
+    throw new CustomError(
+      'pageBlogIntroTooLong',
+      `A blog's introduction cannot be longer than ${BLOG_MAX_INTRO} characters.`
+    )
+  }
+  const blog: BlogContent = {
+    layout: BLOG_LAYOUTS.includes(parsed.layout) ? parsed.layout : BLOG_DEFAULTS.layout,
+    perPage: Number.isFinite(perPage)
+      ? Math.min(perPage, BLOG_MAX_PER_PAGE)
+      : BLOG_DEFAULTS.perPage,
+    sort: parsed.sort === 'oldest' ? 'oldest' : BLOG_DEFAULTS.sort,
+    depth: Number.isFinite(depth) ? Math.min(depth, BLOG_MAX_DEPTH) : BLOG_DEFAULTS.depth,
+    intro,
+    show: {
+      icon: parsed.show?.icon ?? BLOG_DEFAULTS.show.icon,
+      description: parsed.show?.description ?? BLOG_DEFAULTS.show.description,
+      author: parsed.show?.author ?? BLOG_DEFAULTS.show.author,
+      date: parsed.show?.date ?? BLOG_DEFAULTS.show.date,
+      tags: parsed.show?.tags ?? BLOG_DEFAULTS.show.tags
+    },
+    sidebar: {
+      tags: parsed.sidebar?.tags ?? BLOG_DEFAULTS.sidebar.tags,
+      archive: parsed.sidebar?.archive ?? BLOG_DEFAULTS.sidebar.archive
+    }
+  }
+  return JSON.stringify(blog)
+}
+
+/**
+ * Read a stored blog's settings, for a caller that has the page in hand.
+ *
+ * Never throws: a front page whose content is missing or unparseable is a blog with every setting at
+ * its default, which is a working blog rather than a broken screen. The editor's own reading of the
+ * same document is `frontend/src/helpers/pageBlog.js`.
+ */
+export function parseBlogContent(content: string | null | undefined): BlogContent {
+  let parsed: any
+  try {
+    parsed = JSON.parse(content ?? '')
+  } catch {
+    parsed = null
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return {
+      ...BLOG_DEFAULTS,
+      show: { ...BLOG_DEFAULTS.show },
+      sidebar: { ...BLOG_DEFAULTS.sidebar }
+    }
+  }
+  const perPage = Number.parseInt(parsed.perPage, 10)
+  const depth = Number.parseInt(parsed.depth, 10)
+  return {
+    layout: BLOG_LAYOUTS.includes(parsed.layout) ? parsed.layout : BLOG_DEFAULTS.layout,
+    perPage:
+      Number.isFinite(perPage) && perPage > 0
+        ? Math.min(perPage, BLOG_MAX_PER_PAGE)
+        : BLOG_DEFAULTS.perPage,
+    sort: parsed.sort === 'oldest' ? 'oldest' : BLOG_DEFAULTS.sort,
+    depth:
+      Number.isFinite(depth) && depth >= 0 ? Math.min(depth, BLOG_MAX_DEPTH) : BLOG_DEFAULTS.depth,
+    intro: typeof parsed.intro === 'string' ? parsed.intro : BLOG_DEFAULTS.intro,
+    show: {
+      icon: parsed.show?.icon ?? BLOG_DEFAULTS.show.icon,
+      description: parsed.show?.description ?? BLOG_DEFAULTS.show.description,
+      author: parsed.show?.author ?? BLOG_DEFAULTS.show.author,
+      date: parsed.show?.date ?? BLOG_DEFAULTS.show.date,
+      tags: parsed.show?.tags ?? BLOG_DEFAULTS.show.tags
+    },
+    sidebar: {
+      tags: parsed.sidebar?.tags ?? BLOG_DEFAULTS.sidebar.tags,
+      archive: parsed.sidebar?.archive ?? BLOG_DEFAULTS.sidebar.archive
+    }
+  }
+}
+
+/** The orders a feedback board's listing can be read in. The default leads. */
+export const FEEDBACK_SORTS = ['top', 'newest', 'recent', 'trending'] as const
+
+export type FeedbackSort = (typeof FEEDBACK_SORTS)[number]
+
+/** One category a board files its ideas under: a page tag, and the name it is shown under. */
+export interface FeedbackCategory {
+  tag: string
+  label: string
+}
+
+/**
+ * How a feedback board behaves, as its front page's content column holds it.
+ *
+ * Like a blog's, nothing here is a list of ideas: they are the pages in the board's folder, worked
+ * out at read time (`models/feedback.ts`). Unlike a blog's there is no depth — ideas are filed flat,
+ * by the submission form — and no statuses to start on, which follow from the sort instead
+ * (`defaultStatusesFor`).
+ */
+export interface FeedbackBoardContent {
+  /** An introduction shown above the listing, in basic markdown rendered in the reader's browser. */
+  intro: string
+  /** The tags that count as categories on this board, in the order it offers them. */
+  categories: FeedbackCategory[]
+  /** Whether the submission form offers the categories. Off, ideas arrive uncategorized. */
+  submitterCategories: boolean
+  /** The order the listing opens in. */
+  sort: FeedbackSort
+  /** How many ideas a page of the listing holds. */
+  perPage: number
+  /** Whether new ideas may be submitted from the board. */
+  acceptsIdeas: boolean
+  /** Whether its ideas may be voted on. Off freezes the counts. */
+  voting: boolean
+  /**
+   * A notice at the top of the submission form, above the title, in the introduction's markdown --
+   * where the board sends what it does not take (bugs, say, or ideas that belong to another site).
+   * Empty shows nothing.
+   */
+  submitNotice: string
+}
+
+/** What a board starts as, and what any missing field falls back to. */
+export const FEEDBACK_DEFAULTS: FeedbackBoardContent = {
+  intro: '',
+  categories: [],
+  submitterCategories: true,
+  sort: 'top',
+  perPage: 20,
+  acceptsIdeas: true,
+  voting: true,
+  submitNotice: ''
+}
+
+/** As many ideas as a page of a board's listing may hold, for the same reason a blog has one. */
+const FEEDBACK_MAX_PER_PAGE = 100
+
+/** As many categories as one board may define, which is already more than a sidebar can show. */
+const FEEDBACK_MAX_CATEGORIES = 50
+
+/** As long as a category's tag or label may be, matching what the tags column is used to holding. */
+const FEEDBACK_MAX_CATEGORY_LENGTH = 100
+
+/**
+ * A board's categories as one canonical list: each tag trimmed and lowercased, each label trimmed and
+ * defaulting to its tag, the empty ones dropped, and a tag named twice kept once where it first
+ * appeared.
+ *
+ * Lowercased because a tag is compared lowercased wherever a rule matches one (`helpers/pageRules.ts`),
+ * and a board whose `Editor` and `editor` were two categories would count one idea under both.
+ */
+function normalizeFeedbackCategories(value: unknown): FeedbackCategory[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+  const seen = new Set<string>()
+  const categories: FeedbackCategory[] = []
+  for (const entry of value) {
+    const tag = typeof entry?.tag === 'string' ? entry.tag.trim().toLowerCase() : ''
+    if (!tag || seen.has(tag)) {
+      continue
+    }
+    const label = typeof entry.label === 'string' && entry.label.trim() ? entry.label.trim() : tag
+    seen.add(tag)
+    categories.push({
+      tag: tag.slice(0, FEEDBACK_MAX_CATEGORY_LENGTH),
+      label: label.slice(0, FEEDBACK_MAX_CATEGORY_LENGTH)
+    })
+  }
+  return categories
+}
+
+/**
+ * Read a board's settings back out of what the editor sent.
+ *
+ * The blog's rules (`normalizeBlogContent`): every field defaulted rather than required, a number the
+ * listing cannot serve refused, and the document re-serialized so that a save changing nothing
+ * reports no change.
+ */
+function normalizeFeedbackContent(content: string | undefined): string {
+  let parsed: any
+  try {
+    parsed = JSON.parse(content ?? '')
+  } catch {
+    parsed = null
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    parsed = {}
+  }
+  const perPage = Number.parseInt(parsed.perPage, 10)
+  if (parsed.perPage !== undefined && (!Number.isFinite(perPage) || perPage < 1)) {
+    throw new CustomError(
+      'pageFeedbackInvalidPerPage',
+      'A feedback board must show at least one idea per page.'
+    )
+  }
+  const intro = typeof parsed.intro === 'string' ? parsed.intro.trim() : FEEDBACK_DEFAULTS.intro
+  if (intro.length > BLOG_MAX_INTRO) {
+    throw new CustomError(
+      'pageFeedbackIntroTooLong',
+      `A feedback board's introduction cannot be longer than ${BLOG_MAX_INTRO} characters.`
+    )
+  }
+  const submitNotice =
+    typeof parsed.submitNotice === 'string'
+      ? parsed.submitNotice.trim()
+      : FEEDBACK_DEFAULTS.submitNotice
+  if (submitNotice.length > BLOG_MAX_INTRO) {
+    throw new CustomError(
+      'pageFeedbackSubmitNoticeTooLong',
+      `A feedback board's submission notice cannot be longer than ${BLOG_MAX_INTRO} characters.`
+    )
+  }
+  const categories = normalizeFeedbackCategories(parsed.categories)
+  if (categories.length > FEEDBACK_MAX_CATEGORIES) {
+    throw new CustomError(
+      'pageFeedbackTooManyCategories',
+      `A feedback board cannot have more than ${FEEDBACK_MAX_CATEGORIES} categories.`
+    )
+  }
+  const board: FeedbackBoardContent = {
+    intro,
+    categories,
+    submitterCategories:
+      typeof parsed.submitterCategories === 'boolean'
+        ? parsed.submitterCategories
+        : FEEDBACK_DEFAULTS.submitterCategories,
+    sort: FEEDBACK_SORTS.includes(parsed.sort) ? parsed.sort : FEEDBACK_DEFAULTS.sort,
+    perPage: Number.isFinite(perPage)
+      ? Math.min(perPage, FEEDBACK_MAX_PER_PAGE)
+      : FEEDBACK_DEFAULTS.perPage,
+    acceptsIdeas:
+      typeof parsed.acceptsIdeas === 'boolean'
+        ? parsed.acceptsIdeas
+        : FEEDBACK_DEFAULTS.acceptsIdeas,
+    voting: typeof parsed.voting === 'boolean' ? parsed.voting : FEEDBACK_DEFAULTS.voting,
+    submitNotice
+  }
+  return JSON.stringify(board)
+}
+
+/**
+ * Read a stored board's settings, for a caller that has the page in hand.
+ *
+ * Never throws, for the reason `parseBlogContent` never does: a board whose content cannot be read is
+ * a board with every setting at its default. The editor's own reading of the same document is
+ * `frontend/src/helpers/pageFeedback.js`.
+ */
+export function parseFeedbackContent(content: string | null | undefined): FeedbackBoardContent {
+  let parsed: any
+  try {
+    parsed = JSON.parse(content ?? '')
+  } catch {
+    parsed = null
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ...FEEDBACK_DEFAULTS, categories: [] }
+  }
+  const perPage = Number.parseInt(parsed.perPage, 10)
+  return {
+    intro: typeof parsed.intro === 'string' ? parsed.intro : FEEDBACK_DEFAULTS.intro,
+    categories: normalizeFeedbackCategories(parsed.categories).slice(0, FEEDBACK_MAX_CATEGORIES),
+    submitterCategories:
+      typeof parsed.submitterCategories === 'boolean'
+        ? parsed.submitterCategories
+        : FEEDBACK_DEFAULTS.submitterCategories,
+    sort: FEEDBACK_SORTS.includes(parsed.sort) ? parsed.sort : FEEDBACK_DEFAULTS.sort,
+    perPage:
+      Number.isFinite(perPage) && perPage > 0
+        ? Math.min(perPage, FEEDBACK_MAX_PER_PAGE)
+        : FEEDBACK_DEFAULTS.perPage,
+    acceptsIdeas:
+      typeof parsed.acceptsIdeas === 'boolean'
+        ? parsed.acceptsIdeas
+        : FEEDBACK_DEFAULTS.acceptsIdeas,
+    voting: typeof parsed.voting === 'boolean' ? parsed.voting : FEEDBACK_DEFAULTS.voting,
+    submitNotice:
+      typeof parsed.submitNotice === 'string' ? parsed.submitNotice : FEEDBACK_DEFAULTS.submitNotice
+  }
+}
+
+/**
+ * Pages model
+ *
+ * A page is a row here plus a row in the tree that gives it its place in the site. The markdown is
+ * authored and rendered in the browser; what arrives is both the source and the HTML, and the HTML is
+ * run through `models/rendering.ts` before being stored — that is where it gets sanitized against what
+ * the author is actually allowed to embed, and where the table of contents and the search text come
+ * from.
+ *
+ * Not implemented yet, and deliberately not faked here: version history (there is no table for it),
+ * page links, comments, and storage targets.
+ */
+class Pages {
+  /**
+   * Flatten a row and its blobs into the shape the API returns.
+   *
+   * @param locked Withhold the body — the source, the rendered HTML, the table of contents drawn from
+   *               it, the relation links written onto the page, and the page's own CSS and scripts,
+   *               which the page view runs against content this reader has not been given. The
+   *               metadata stays: a reader looking at the lock screen is told what page they are
+   *               being asked for a password to.
+   * @param withPassword Include the page's own password. Only for a requester who may edit the page,
+   *                     which is the one that has to be able to read it back and save it again.
+   * @param withContent Include the source. A bodyless editor's comes back either way: its content is
+   *                    not a body somebody wrote, it is the settings the page view needs to draw
+   *                    anything at all — where a redirection sends its reader, how a blog lists its
+   *                    posts. Withholding it would leave the page view unable to do the one thing the
+   *                    page is for, and the page view does not ask for content.
+   */
+  private toPage(
+    row: any,
+    {
+      withContent = false,
+      withPassword = false,
+      locked = false
+    }: { withContent?: boolean; withPassword?: boolean; locked?: boolean } = {}
+  ): Page {
+    const config = row.config ?? {}
+    const scripts = row.scripts ?? {}
+    return {
+      id: row.id,
+      siteId: row.siteId,
+      path: row.path,
+      hash: row.hash,
+      alias: row.alias,
+      title: row.title,
+      description: row.description,
+      icon: row.icon,
+      iconColor: config.iconColor ?? '',
+      locale: row.locale,
+      editor: row.editor,
+      /*
+        Which other editors could open this page — see `interchangeableEditors`. Derived rather than
+        stored, and answered here so that the rule about what may be converted into what lives in one
+        place: the client has only to intersect it with the editors the site has turned on.
+      */
+      convertibleTo: interchangeableEditors(row.editor),
+      contentType: row.contentType,
+      publishState: row.publishState,
+      publishStartDate: row.publishStartDate,
+      publishEndDate: row.publishEndDate,
+      isBrowsable: row.isBrowsable,
+      isSearchable: row.isSearchable,
+      ...(withPassword ? { password: row.password } : {}),
+      isLocked: locked,
+      relations: locked ? [] : (row.relations ?? []),
+      // -> Not withheld from a locked page: which languages a page exists in is not what a password
+      //    covers, and the lock screen is where a reader most needs to be able to switch to one
+      localeRelations: row.localeRelations ?? [],
+      tags: row.tags ?? [],
+      toc: locked ? [] : (row.toc ?? []),
+      render: locked ? '' : (row.render ?? ''),
+      ...((withContent || isBodylessEditor(row.editor)) && !locked
+        ? { content: row.content ?? '' }
+        : {}),
+      /*
+         Absent means yes, as every one of these does: the key is only written once somebody has
+         edited the page's properties, and a page nobody has touched shows what links to it. The
+         site-wide switch is `features.backlinks` -- see `pageLinks.isAllowed`.
+      */
+      allowBacklinks: config.allowBacklinks ?? true,
+      allowComments: config.allowComments ?? true,
+      allowContributions: config.allowContributions ?? true,
+      allowGlossaryLinks: config.allowGlossaryLinks ?? true,
+      allowRatings: config.allowRatings ?? true,
+      showLastEditedBy: config.showLastEditedBy ?? true,
+      showSidebar: config.showSidebar ?? true,
+      showTags: config.showTags ?? true,
+      showToc: config.showToc ?? true,
+      tocDepth: config.tocDepth ?? { min: 1, max: 2 },
+      scriptJsLoad: locked ? '' : (scripts.jsLoad ?? ''),
+      scriptJsUnload: locked ? '' : (scripts.jsUnload ?? ''),
+      scriptCss: locked ? '' : (scripts.css ?? ''),
+      navigationId: row.navigationId ?? null,
+      navigationMode: row.navigationMode ?? 'inherit',
+      creatorId: row.creatorId ?? row.authorId,
+      authorId: row.authorId,
+      authorName: row.authorName ?? '',
+      authorHasAvatar: row.authorHasAvatar ?? false,
+      editedVia: row.editedVia ?? null,
+      ratings: row.ratings ?? {},
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+      contentUpdatedAt: row.contentUpdatedAt,
+      lastReviewedAt: row.lastReviewedAt ?? null,
+      lifecycleBanner: row.lifecycleBanner ?? null
+    }
+  }
+
+  /**
+   * The other pages of a locale group: this page, written in every other language it exists in.
+   *
+   * Answered from the group id the page already carries, so a page that is not part of one costs no
+   * query at all — which is nearly every page on nearly every site.
+   *
+   * `unpublished` narrows it the same way it narrows the page itself: a draft translation is not
+   * something to offer a reader who could not open it. It is what makes the locale selector's list of
+   * languages the list of languages this reader can actually reach.
+   */
+  async localeRelationsFor(
+    siteId: string,
+    {
+      localeGroupId,
+      id,
+      unpublished = true
+    }: {
+      localeGroupId: string | null
+      id: string
+      /** As for `getPage`. */
+      unpublished?: boolean | ((page: RulePageRef) => boolean)
+    }
+  ): Promise<PageLocaleRelation[]> {
+    if (!localeGroupId) {
+      return []
+    }
+    const conditions = [
+      eq(pagesTable.siteId, siteId),
+      eq(pagesTable.localeGroupId, localeGroupId),
+      ne(pagesTable.id, id)
+    ]
+    if (unpublished === false) {
+      conditions.push(liveCondition(pagesTable))
+    }
+    const rows = await WIKI.db
+      .select({
+        locale: pagesTable.locale,
+        path: pagesTable.path,
+        title: pagesTable.title,
+        tags: pagesTable.tags,
+        isLive: sql<boolean>`${liveCondition(pagesTable)}`.mapWith(Boolean)
+      })
+      .from(pagesTable)
+      .where(and(...conditions))
+      .orderBy(pagesTable.locale)
+    return rows
+      .filter(
+        (row) =>
+          row.isLive ||
+          typeof unpublished !== 'function' ||
+          unpublished({ siteId, locale: row.locale, path: row.path, tags: row.tags ?? [] })
+      )
+      .map(({ locale, path, title, tags }) => ({ locale, path, title, tags }))
+  }
+
+  /**
+   * The locale group a page addressed by path belongs to, for a client about to join it.
+   *
+   * What the page properties panel asks before it accepts a chosen page: a page that is already the
+   * French version of something comes back with the rest of that set, which is what the panel fills
+   * its other rows in from — and what tells it, before anything is saved, that the set already has a
+   * page for a locale it has spoken for.
+   *
+   * @returns The whole group INCLUDING the page asked about, or null when there is no page there.
+   *          A page with no counterparts answers with just itself.
+   */
+  async localeGroupAt(
+    siteId: string,
+    { locale, path }: { locale?: string; path: string }
+  ): Promise<{
+    page: PageLocaleRelation & { id: string }
+    relations: PageLocaleRelation[]
+  } | null> {
+    // -> The site's own default when the caller did not say, as everything else addressing a page by
+    //    path does: a path alone names the primary locale's page
+    const page = await this.findByPath(siteId, locale || this.defaultLocale(siteId), path)
+    if (!page) {
+      return null
+    }
+    return {
+      page: {
+        id: page.id,
+        locale: page.locale,
+        path: page.path,
+        title: page.title,
+        tags: page.tags
+      },
+      relations: await this.localeRelationsFor(siteId, {
+        localeGroupId: page.localeGroupId,
+        id: page.id
+      })
+    }
+  }
+
+  /**
+   * The tags carried by the page at a path, or an empty list when there is no page there.
+   *
+   * For the one caller that has a path and no page: the endpoint the interface asks what it may do
+   * at a path it is about to show. A rule can address pages by tag, so answering that from the path
+   * alone would report a permission a tag rule had granted or taken away as though the rule did not
+   * exist — and the interface would then draw controls the endpoint behind them refuses, or hide
+   * ones it would have allowed.
+   *
+   * Read from the database rather than taken from the caller, for the obvious reason: what a page is
+   * tagged decides what may be done to it, and a client that could name the tags could name the ones
+   * that suit it.
+   */
+  async tagsAt(
+    siteId: string,
+    { locale, path }: { locale?: string; path: string }
+  ): Promise<string[]> {
+    const rows = await WIKI.db
+      .select({ tags: pagesTable.tags })
+      .from(pagesTable)
+      .where(
+        and(
+          eq(pagesTable.siteId, siteId),
+          eq(pagesTable.locale, locale || this.defaultLocale(siteId)),
+          eq(pagesTable.hash, generatePathHash(path || 'home'))
+        )
+      )
+      .limit(1)
+    return rows[0]?.tags ?? []
+  }
+
+  /** One page of a site, by the locale and path that address it. */
+  private async findByPath(
+    siteId: string,
+    locale: string,
+    path: string
+  ): Promise<{
+    id: string
+    locale: string
+    path: string
+    title: string
+    tags: string[]
+    localeGroupId: string | null
+  } | null> {
+    const rows = await WIKI.db
+      .select({
+        id: pagesTable.id,
+        locale: pagesTable.locale,
+        path: pagesTable.path,
+        title: pagesTable.title,
+        tags: pagesTable.tags,
+        localeGroupId: pagesTable.localeGroupId
+      })
+      .from(pagesTable)
+      .where(
+        and(
+          eq(pagesTable.siteId, siteId),
+          eq(pagesTable.locale, locale),
+          // -> By hash, which is the indexed way a page is addressed by path everywhere else here
+          eq(pagesTable.hash, generatePathHash(path || 'home'))
+        )
+      )
+      .limit(1)
+    return rows[0] ?? null
+  }
+
+  /**
+   * The id of the page at a path, or null when there is none.
+   *
+   * Matched on the path itself rather than on the hash `getPage` addresses a page with: the hash is
+   * 53 bits and never checked against the path it stands for, which is fine for a URL the frontend
+   * built and not for a path somebody typed or pasted — see `describePage`.
+   */
+  async idAtPath(siteId: string, locale: string, path: string): Promise<string | null> {
+    const rows = await WIKI.db
+      .select({ id: pagesTable.id })
+      .from(pagesTable)
+      .where(
+        and(
+          eq(pagesTable.siteId, siteId),
+          eq(pagesTable.locale, locale),
+          eq(pagesTable.path, path || 'home')
+        )
+      )
+      .limit(1)
+    return rows[0]?.id ?? null
+  }
+
+  /**
+   * A page's text as search indexes it: what `rendering.postProcess` extracted from the render.
+   *
+   * The readable form of a page whose source is not prose — a drawing's source is a scene document,
+   * and its render an SVG, but its labels are here as words.
+   */
+  async searchTextOf(id: string): Promise<string> {
+    const rows = await WIKI.db
+      .select({ text: pagesTable.searchContent })
+      .from(pagesTable)
+      .where(eq(pagesTable.id, id))
+      .limit(1)
+    return rows[0]?.text ?? ''
+  }
+
+  /**
+   * Set the locale group a page belongs to: which pages are this page in another language.
+   *
+   * **The list states the whole group, not this page's half of it.** The panel that sends it shows
+   * every active locale with the page filling that slot, so a locale left empty is a locale the set
+   * has no page for — and a page that was in the group and is not in the list leaves it. There is one
+   * group per set of translations and any member edits it, which is what makes "the same page in
+   * French" mean the same thing read from either side.
+   *
+   * **Picking a page that already belongs to a set joins that set**, bringing its other members with
+   * it: attaching an English page to an existing French/German pair is how the third language gets
+   * added, and requiring the pair to be broken up first would be a worse way to say it. The client is
+   * expected to have asked `localeGroupAt` and shown the author what they are joining.
+   *
+   * Which leaves one thing that cannot be reconciled and is refused: a set being joined that already
+   * holds a page for a locale this request speaks for — most importantly for the saving page's OWN
+   * locale, which is the case of a French page that is already some other English page's translation.
+   *
+   * @param page The page being saved, as it stands in the database.
+   * @param wanted Its counterparts. Empty dissolves the group, leaving every member unrelated.
+   */
+  private async applyLocaleRelations(
+    siteId: string,
+    page: { id: string; locale: string; localeGroupId: string | null },
+    wanted: PageLocaleRelationInput[]
+  ): Promise<void> {
+    /*
+      The group as it will stand, by locale. Seeded with the saving page, which occupies its own
+      locale's slot and is why nothing else may claim it.
+    */
+    const desired = new Map<string, { id: string; path: string; localeGroupId: string | null }>()
+    desired.set(page.locale, { id: page.id, path: '', localeGroupId: page.localeGroupId })
+
+    for (const entry of wanted ?? []) {
+      const locale = (entry?.locale ?? '').trim()
+      // -> A page is its own entry for its own locale, so a row naming it is agreement rather than an
+      //    instruction. The panel sends that row read-only for exactly this reason.
+      if (!locale || locale === page.locale) {
+        continue
+      }
+      const path = normalizePagePath(entry?.path ?? '')
+      const target = await this.findByPath(siteId, locale, path)
+      if (!target) {
+        throw new CustomError(
+          'pageLocaleRelationNotFound',
+          `There is no page at "${path}" in locale ${locale} to relate this page to.`
+        )
+      }
+      if (target.id === page.id) {
+        continue
+      }
+      const claimed = desired.get(locale)
+      if (claimed && claimed.id !== target.id) {
+        throw new CustomError(
+          'pageLocaleRelationDuplicate',
+          `Two different pages were given for locale ${locale}. A page has one counterpart per locale.`
+        )
+      }
+      desired.set(locale, { id: target.id, path: target.path, localeGroupId: target.localeGroupId })
+    }
+
+    /*
+      Every group this touches: the one the page is in, and the one behind each page it names. They are
+      about to become one group, or — where the page is leaving — none.
+
+      Held against the page that brought each one in, so a set that cannot be joined is refused by
+      naming the page the author actually chose rather than some third page they have never heard of.
+      Empty for the group this page is already in, which nobody chose.
+    */
+    const involved = new Map<string, string>()
+    if (page.localeGroupId) {
+      involved.set(page.localeGroupId, '')
+    }
+    for (const member of desired.values()) {
+      if (member.localeGroupId && !involved.has(member.localeGroupId)) {
+        involved.set(member.localeGroupId, member.path)
+      }
+    }
+
+    for (const [groupId, chosenPath] of involved) {
+      const members = await WIKI.db
+        .select({
+          id: pagesTable.id,
+          locale: pagesTable.locale,
+          path: pagesTable.path,
+          localeGroupId: pagesTable.localeGroupId
+        })
+        .from(pagesTable)
+        .where(and(eq(pagesTable.siteId, siteId), eq(pagesTable.localeGroupId, groupId)))
+      for (const member of members) {
+        const claimed = desired.get(member.locale)
+        if (claimed?.id === member.id) {
+          continue
+        }
+        if (groupId === page.localeGroupId) {
+          // -> A member of this page's own group that the request does not name: the author took it
+          //    out of the set, or pointed that locale at a different page, so it is dropped below
+          continue
+        }
+        if (claimed) {
+          throw new CustomError(
+            'pageLocaleRelationConflict',
+            `"${chosenPath}" already belongs to a set of translations whose ${member.locale} page is "${member.path}". A page can belong to only one set.`,
+            409
+          )
+        }
+        // -> The rest of the set being joined comes along: these pages and this one are the same page
+        desired.set(member.locale, {
+          id: member.id,
+          path: member.path,
+          localeGroupId: member.localeGroupId
+        })
+      }
+    }
+
+    /*
+      A group of one is no group. Written as null rather than left standing so that "this page has no
+      counterparts" is one state in the database instead of two, and so the unique index above never
+      has to hold a row nothing else can join.
+    */
+    const dissolve = desired.size < 2
+    const groupId = dissolve
+      ? null
+      : (page.localeGroupId ??
+        [...desired.values()].find((m) => m.localeGroupId)?.localeGroupId ??
+        crypto.randomUUID())
+
+    const memberIds = [...desired.values()].map((m) => m.id)
+
+    // -> Everything that was in one of these groups and is not in the set any more, first: the unique
+    //    index is on (group, locale), so a page has to vacate a slot before another can take it
+    const evicted = [...involved.keys()]
+    if (evicted.length > 0) {
+      await WIKI.db
+        .update(pagesTable)
+        .set({ localeGroupId: null })
+        .where(
+          and(
+            eq(pagesTable.siteId, siteId),
+            inArray(pagesTable.localeGroupId, evicted),
+            memberIds.length > 0 && !dissolve ? notInArray(pagesTable.id, memberIds) : sql`true`
+          )
+        )
+    }
+    if (!dissolve) {
+      await WIKI.db
+        .update(pagesTable)
+        .set({ localeGroupId: groupId })
+        .where(and(eq(pagesTable.siteId, siteId), inArray(pagesTable.id, memberIds)))
+    }
+  }
+
+  /**
+   * Take a set of pages out of their locale groups, for a folder that moved to another locale.
+   *
+   * The same rule `movePage` applies to one page, applied to everything under a folder that crossed
+   * locales at once. It has to happen before their `locale` column is rewritten: a group holds one
+   * page per locale and the index enforcing that would refuse the second arrival otherwise.
+   *
+   * One page at a time rather than in bulk, because the groups they belong to are not the same group
+   * and each has to be looked at for whether it still has anybody left in it. A folder move is a rare
+   * and deliberate act, so the queries are worth the plainness.
+   */
+  async detachFromLocaleGroups(siteId: string, ids: string[]): Promise<void> {
+    for (const id of ids) {
+      await this.detachFromLocaleGroup(siteId, id)
+    }
+  }
+
+  /**
+   * Take one page out of its locale group, leaving the rest of the set related to each other.
+   *
+   * For a page that stops being the version it was: a move across locales, where what it is the
+   * translation OF is no longer a question this group answers. Distinct from setting the relations to
+   * nothing, which is the group being dissolved by whoever was editing it.
+   */
+  private async detachFromLocaleGroup(siteId: string, id: string): Promise<void> {
+    const rows = await WIKI.db
+      .select({ localeGroupId: pagesTable.localeGroupId })
+      .from(pagesTable)
+      .where(and(eq(pagesTable.siteId, siteId), eq(pagesTable.id, id)))
+      .limit(1)
+    const groupId = rows[0]?.localeGroupId
+    if (!groupId) {
+      return
+    }
+    await WIKI.db
+      .update(pagesTable)
+      .set({ localeGroupId: null })
+      .where(and(eq(pagesTable.siteId, siteId), eq(pagesTable.id, id)))
+    // -> And the group goes with it if this was the last relation anybody had, for the same reason
+    //    `applyLocaleRelations` never writes a group of one
+    const remaining = await WIKI.db
+      .select({ id: pagesTable.id })
+      .from(pagesTable)
+      .where(and(eq(pagesTable.siteId, siteId), eq(pagesTable.localeGroupId, groupId)))
+    if (remaining.length < 2) {
+      await WIKI.db
+        .update(pagesTable)
+        .set({ localeGroupId: null })
+        .where(and(eq(pagesTable.siteId, siteId), eq(pagesTable.localeGroupId, groupId)))
+    }
+  }
+
+  /**
+   * A single page, by ID or by the hash of its path.
+   *
+   * The hash is what the frontend addresses a page with — see `generatePathHash` — so this is the
+   * lookup an ordinary page view goes through.
+   *
+   * A password-protected page still comes back to a requester who has not unlocked it: the metadata
+   * is what the lock screen is drawn from. What the password withholds is the body — see `toPage`'s
+   * `locked`. Anything that puts a page's text in front of a reader has to go through here, or
+   * through the same check, because the enforcement is this method and not the client.
+   *
+   * **The defaults hand over the whole page**, `unlocked` and `withPassword` included, the way they do
+   * for `unpublished` beside them: most callers here are a save, a move, a delete or a re-render, and
+   * none of those is a reader — a save that got a withheld body back would answer its author with an
+   * empty page, and a re-render would store one. A path that serves a reader has to say so, and there
+   * are exactly two: the `GET` route, and `unlockPage` below.
+   *
+   * @param unlocked Whether the password has been satisfied for this requester. Route-level concern:
+   *                 see `unlockedFor` in `api/pages.ts`. A function is called with the page once the
+   *                 row is in hand, which is what lets a caller answer per page even though it asked
+   *                 for the page by path hash — and answer by page rule, since whoever may edit the
+   *                 page is not asked for its password.
+   * @param withPassword Whether to include the password value. For whoever may edit the page — not for
+   *                     a reader who just entered it, who needs it no more after that. A function is
+   *                     asked of the page, as `unlocked` is.
+   */
+  /**
+   * The pages touched most recently, newest first — what the admin dashboard's panel is built from.
+   *
+   * Across every site, like the rest of that dashboard: it answers "what has been happening here",
+   * and an instance-wide question should not be filtered to whichever site the admin area happens to
+   * be pointed at.
+   *
+   * Ordered by `updatedAt`, which covers both halves of "edited or created": a page's creation sets
+   * it and every save moves it, so one column is the whole of the answer.
+   */
+  async getRecentlyEdited({ limit = 10 }: { limit?: number } = {}): Promise<RecentPage[]> {
+    const rows = await WIKI.db
+      .select({
+        id: pagesTable.id,
+        siteId: pagesTable.siteId,
+        locale: pagesTable.locale,
+        path: pagesTable.path,
+        title: pagesTable.title,
+        createdAt: pagesTable.createdAt,
+        updatedAt: pagesTable.updatedAt,
+        authorName: usersTable.name
+      })
+      .from(pagesTable)
+      // -> Left, so a page whose author has since been deleted is still listed, without a name
+      .leftJoin(usersTable, eq(usersTable.id, pagesTable.authorId))
+      .orderBy(desc(pagesTable.updatedAt))
+      .limit(limit)
+
+    return rows.map((row) => ({
+      id: row.id,
+      siteId: row.siteId,
+      locale: row.locale,
+      path: row.path,
+      title: row.title,
+      updatedAt: row.updatedAt,
+      /*
+        Creating a page sets both stamps to the same moment and every later save moves only
+        `updatedAt`, so equality is what tells the two apart. Compared in milliseconds because these
+        are `Date`s, which have no `valueOf` ordering worth relying on for equality.
+      */
+      isNew: row.createdAt.getTime() === row.updatedAt.getTime(),
+      url: this.urlFor(row.siteId, row.locale, row.path),
+      hostname: this.linkHostnameFor(row.siteId),
+      authorName: row.authorName
+    }))
+  }
+
+  /**
+   * The pages created most recently, newest first — the admin dashboard's other page panel.
+   *
+   * Across every site, for the reason `getRecentlyEdited` gives. Ordered by `createdAt`, which no
+   * later save moves, and named after the page's creator rather than whoever wrote to it last.
+   */
+  async getNewest({ limit = 10 }: { limit?: number } = {}): Promise<NewestPage[]> {
+    const rows = await WIKI.db
+      .select({
+        id: pagesTable.id,
+        siteId: pagesTable.siteId,
+        locale: pagesTable.locale,
+        path: pagesTable.path,
+        title: pagesTable.title,
+        createdAt: pagesTable.createdAt,
+        creatorName: usersTable.name
+      })
+      .from(pagesTable)
+      // -> Left, so a page whose creator has since been deleted is still listed, without a name
+      .leftJoin(usersTable, eq(usersTable.id, pagesTable.creatorId))
+      .orderBy(desc(pagesTable.createdAt))
+      .limit(limit)
+
+    return rows.map((row) => ({
+      ...row,
+      url: this.urlFor(row.siteId, row.locale, row.path),
+      hostname: this.linkHostnameFor(row.siteId)
+    }))
+  }
+
+  /**
+   * The host an admin-area row links to a page on (the dashboard's, the MCP contributions'), so a
+   * caller looking at one site can still reach a page on another. `*` is the catch-all rather than a
+   * host — a link to it is whatever host you are already on, hence null.
+   */
+  linkHostnameFor(siteId: string): string | null {
+    const hostname = WIKI.sites[siteId]?.hostname
+    return hostname && hostname !== '*' ? hostname : null
+  }
+
+  /**
+   * Every page of a site that belongs in its sitemap, cached.
+   *
+   * The list is what a sitemap costs: one read of every published page of a site, and then the guests
+   * group's rules resolved against each of them. That is far too much to spend per request on a
+   * document whose whole audience is a handful of crawlers, so it is built on demand and held for
+   * `SITEMAP_TTL` seconds.
+   *
+   * **The LIST is what is cached, not the file.** Rendering reads three things that a cached file
+   * would freeze: the request's own origin, which differs between the hosts a catch-all site answers
+   * on; `urlFor`, which brackets a path by locale exactly as that site's settings say; and whether the
+   * sitemap is enabled at all. Keeping those per request means a change to any of them shows up at
+   * once, that paging re-slices one list instead of caching every part separately, and that a site
+   * reached on several hostnames needs one entry rather than one per host.
+   *
+   * It is not the smaller of the two, mind: measured at about **275 bytes per page** — roughly 2.7 MB
+   * for a 10,000-page site — where the rendered XML for the same pages is nearer 1.5 MB, since a long
+   * one-byte string costs less than an object with four fields and a `Date`. The reasons above are
+   * what pay for the difference.
+   *
+   * What does wait for the TTL is a page appearing, changing or going. That is the deliberate trade —
+   * the file is already served `max-age=600`, so a crawler may be holding one that old regardless, and
+   * a sitemap is a hint about where to look rather than a statement of record. The two compound: a
+   * crawler can be reading a list up to twice the TTL old. Admin → System's **Flush Cache** empties
+   * this with everything else, and does it across an HA set, for when that is not good enough.
+   *
+   * @see `models/groups.ts` → `reloadCache`, which drops this when a group's rules change — the one
+   *      input where being out of date is a permissions question rather than a freshness one.
+   */
+  async listForSitemap(siteId: string): Promise<SitemapPage[]> {
+    const cached = WIKI.cache.get<SitemapPage[]>(sitemapCacheKey(siteId))
+    if (cached) {
+      return cached
+    }
+    /*
+      A burst against a cold cache is one query and not one per request. Without this the endpoint is
+      public, unauthenticated and trivially made to stack full table scans — which is most of what the
+      cache is here to prevent, and exactly when it is not yet populated.
+    */
+    const inFlight = sitemapBuilds.get(siteId)
+    if (inFlight) {
+      return inFlight
+    }
+    const build = this.buildSitemapList(siteId).finally(() => sitemapBuilds.delete(siteId))
+    sitemapBuilds.set(siteId, build)
+    return build
+  }
+
+  /** Drop every site's cached sitemap list, for a change that could have altered any of them. */
+  invalidateSitemaps(): void {
+    WIKI.cache.del(WIKI.cache.keys().filter((key) => key.startsWith(SITEMAP_CACHE_PREFIX)))
+  }
+
+  /**
+   * The read behind `listForSitemap`, which is the only thing that should call it.
+   *
+   * A sitemap is a list handed to search engines, so the question is not what exists but what a
+   * crawler may both reach and index. Four things decide it, three of them in SQL:
+   *
+   * - **Live**, on the same reading as everywhere else (`helpers/publishing.ts`) — a `scheduled` page
+   *   inside its window is listed, one outside it is not, and a draft never is. The list is cached, so a
+   *   window opening or closing reaches it within `SITEMAP_TTL`.
+   * - **Not a redirection**, which has no body to index and sends its reader elsewhere anyway.
+   * - **Not password protected**, since what a crawler would reach there is the lock screen.
+   * - **`isSearchable`**, the page property whose whole purpose is keeping a page out of search
+   *   results. A sitemap is the most direct way there is of putting one in them.
+   *
+   * The fourth is the guests group's page rules, which no query can express — they match on path,
+   * locale and tags, and are resolved a page at a time — so the candidates are filtered here. The
+   * guests group and nothing else: this document is the same for whoever asks, and what the public
+   * may read is exactly what that group's rules say. An administrator fetching it therefore gets the
+   * file a crawler would, which is also what makes it safe to cache publicly.
+   */
+  private async buildSitemapList(siteId: string): Promise<SitemapPage[]> {
+    const rows = await WIKI.db
+      .select({
+        locale: pagesTable.locale,
+        path: pagesTable.path,
+        tags: pagesTable.tags,
+        updatedAt: pagesTable.updatedAt,
+        localeGroupId: pagesTable.localeGroupId
+      })
+      .from(pagesTable)
+      .where(
+        and(
+          eq(pagesTable.siteId, siteId),
+          liveCondition(pagesTable),
+          eq(pagesTable.isSearchable, true),
+          ne(pagesTable.editor, REDIRECT_EDITOR),
+          isNull(pagesTable.password)
+        )
+      )
+      // -> A stable order, so that a sitemap split into numbered parts means the same thing on the
+      //    next fetch as it did on the one that handed the crawler those numbers
+      .orderBy(pagesTable.locale, pagesTable.path)
+
+    const guests = WIKI.models.groups.actorForPublic()
+    const pages = rows
+      .filter((row) => WIKI.models.groups.checkAccess(guests, 'read:pages', { ...row, siteId }))
+      .map(({ locale, path, updatedAt, localeGroupId }) => ({
+        locale,
+        path,
+        updatedAt,
+        localeGroupId
+      }))
+
+    WIKI.cache.set(sitemapCacheKey(siteId), pages, SITEMAP_TTL)
+    return pages
+  }
+
+  /**
+   * What the PUBLIC may see at a path, for the HTML document served to a client that will not run the
+   * app.
+   *
+   * The question `listForSitemap` asks of a whole site, asked of one page: the guests group's rules
+   * decide and nothing about the requester does, which is what makes the answer the same for whoever
+   * fetched it and therefore safe to cache and hand on.
+   *
+   * Live pages only, as everywhere the public is being answered — which is also what lets the app
+   * shell say 404 rather than 200 at a path with nothing published at it.
+   */
+  async describePageForPublic(
+    siteId: string,
+    ref: { locale: string; path: string }
+  ): Promise<PageDescription | null> {
+    return this.describePage(siteId, ref, WIKI.models.groups.actorForPublic(), false)
+  }
+
+  /**
+   * What THIS REQUESTER may see at a path, for the document a browser is about to boot the app from.
+   *
+   * Deliberately the same cut the page route itself makes (`GET /sites/:siteId/pages/:pageIdOrHash`),
+   * so that the title in the document and the page the app then draws can never be about different
+   * things: its `read:pages` check per path, and its `unpublished` — a page that is not live is
+   * described only to a signed-in session holding `write:pages` or `manage:pages` on it, and an API
+   * key is answered as the public is (`helpers/publishing.ts`).
+   *
+   * Not for caching across requesters: the answer is one reader's.
+   */
+  async describePageForRequest(
+    siteId: string,
+    ref: { locale: string; path: string },
+    req: FastifyRequest
+  ): Promise<PageDescription | null> {
+    const isSession = Boolean(req.session?.authenticated && req.session.user?.id)
+    const actor = WIKI.models.groups.actorForRequest(req)
+    return this.describePage(
+      siteId,
+      ref,
+      actor,
+      isSession ? (page: RulePageRef) => maySeeUnpublished(actor, page) : false
+    )
+  }
+
+  /**
+   * The read behind both, which is the only thing that should call it.
+   *
+   * `actor` and `unpublished` are paired by the two methods above rather than left to a caller, because
+   * the wrong pairing — the public actor with unpublished pages included — would describe a draft to
+   * whoever asked.
+   */
+  private async describePage(
+    siteId: string,
+    { locale, path }: { locale: string; path: string },
+    actor: AccessActor,
+    unpublished: false | ((page: RulePageRef) => boolean)
+  ): Promise<PageDescription | null> {
+    const conditions = [
+      eq(pagesTable.siteId, siteId),
+      eq(pagesTable.locale, locale),
+      // -> By path, and not by the hash `getPage` addresses a page with: that hash is 53 bits and is
+      //    never checked against the path it stands for, which is a collision a document served to
+      //    whoever asked simply need not have — nothing here was handed a hash to look up
+      eq(pagesTable.path, path)
+    ]
+    if (unpublished === false) {
+      conditions.push(liveCondition(pagesTable))
+    }
+
+    const rows = await WIKI.db
+      .select({
+        isLive: sql<boolean>`${liveCondition(pagesTable)}`.mapWith(Boolean),
+        locale: pagesTable.locale,
+        path: pagesTable.path,
+        title: pagesTable.title,
+        description: pagesTable.description,
+        render: pagesTable.render,
+        updatedAt: pagesTable.updatedAt,
+        tags: pagesTable.tags,
+        editor: pagesTable.editor,
+        isSearchable: pagesTable.isSearchable,
+        password: pagesTable.password,
+        localeGroupId: pagesTable.localeGroupId
+      })
+      .from(pagesTable)
+      .where(and(...conditions))
+      .limit(1)
+
+    const row = rows[0]
+    if (!row) {
+      return null
+    }
+    if (!WIKI.models.groups.checkAccess(actor, 'read:pages', { ...row, siteId })) {
+      return null
+    }
+    if (!row.isLive && unpublished && !unpublished({ ...row, siteId })) {
+      return null
+    }
+
+    // -> A page and its lock are two things: the title and the description are not what a password
+    //    covers (the search index treats them the same way), so they travel and the body does not.
+    //    Held against the column and not against this requester's unlocks — the public description of
+    //    a page is cached and shared, so a body any one requester had earned must not get into it
+    const isProtected = Boolean(row.password)
+    const isRedirect = row.editor === REDIRECT_EDITOR
+    return {
+      locale: row.locale,
+      path: row.path,
+      title: row.title,
+      description: row.description,
+      editor: row.editor,
+      render: isProtected || isRedirect ? null : row.render,
+      updatedAt: row.updatedAt,
+      isIndexable: row.isSearchable && !isProtected && !isRedirect,
+      alternates: await this.readableAlternates(siteId, row.localeGroupId, actor)
+    }
+  }
+
+  /**
+   * The locales a page can be read in, for the alternates a document names.
+   *
+   * Live and readable by this actor, and including the page itself, which is what an `hreflang`
+   * set calls for. A translation the asker may not read is not a URL to point them at — for the public
+   * that is the same cut the sitemap makes, which is why the two say the same thing about a page.
+   *
+   * Live regardless of who is asking, unlike the page itself: a draft translation is not an
+   * alternate version of a document, it is one that does not exist yet.
+   */
+  private async readableAlternates(
+    siteId: string,
+    localeGroupId: string | null,
+    actor: AccessActor
+  ): Promise<{ locale: string; path: string }[]> {
+    if (!localeGroupId) {
+      return []
+    }
+    const rows = await WIKI.db
+      .select({ locale: pagesTable.locale, path: pagesTable.path, tags: pagesTable.tags })
+      .from(pagesTable)
+      .where(
+        and(
+          eq(pagesTable.siteId, siteId),
+          eq(pagesTable.localeGroupId, localeGroupId),
+          liveCondition(pagesTable)
+        )
+      )
+      .orderBy(pagesTable.locale)
+    const readable = rows.filter((row) =>
+      WIKI.models.groups.checkAccess(actor, 'read:pages', { ...row, siteId })
+    )
+    // -> One document is not a set of alternates: a page whose only readable version is itself has
+    //    nothing for an annotation to point at
+    return readable.length > 1 ? readable.map(({ locale, path }) => ({ locale, path })) : []
+  }
+
+  /**
+   * Where a page lives, as a path.
+   *
+   * Built here rather than by the caller because the rule is per SITE — a site brackets its URLs by
+   * locale or it does not — and a client looking at one site has no way to know how another one is
+   * configured. Mirrors `localeUrlPrefix` in the frontend's site store and the redirect in
+   * `index.ts`, which is what corrects a URL that arrives without the prefix.
+   */
+  urlFor(siteId: string, locale: string, path: string): string {
+    const locales = WIKI.sites[siteId]?.config?.locales
+    const prefix =
+      locales?.forcePrefix || locale !== locales?.primary
+        ? `/${WIKI.models.locales.shortCodeFor(locale)}`
+        : ''
+    return `${prefix}/${path}`
+  }
+
+  async getPage({
+    siteId,
+    id,
+    hash,
+    locale,
+    withContent = false,
+    unpublished = true,
+    unlocked = true,
+    withPassword = true
+  }: {
+    siteId: string
+    id?: string
+    hash?: string
+    locale?: string
+    /**
+     * Include the source. A predicate for a caller whose answer depends on the page — `read:source`
+     * is granted by a page rule, and a rule is chosen by path, locale and tags, none of which a
+     * request addressing a page by hash has in hand before the row is read.
+     */
+    withContent?: boolean | ((page: RulePageRef) => boolean)
+    /**
+     * Whether a page that is not live (`helpers/publishing.ts`) may be returned: `false` holds the
+     * read to live pages, and a predicate is asked of a page that is not live once its row is read.
+     * Open by default, since most callers are the wiki acting on its own pages; anything answering a
+     * reader passes one.
+     */
+    unpublished?: boolean | ((page: RulePageRef) => boolean)
+    unlocked?: boolean | ((page: RulePageRef & { id: string }) => boolean)
+    withPassword?: boolean | ((page: RulePageRef) => boolean)
+  }): Promise<Page | null> {
+    const conditions = [eq(pagesTable.siteId, siteId)]
+    if (unpublished === false) {
+      // -> A password does not hide a page from a reader — it withholds the body until they enter
+      //    it, which is what `locked` below does. Being unpublished does.
+      conditions.push(liveCondition(pagesTable))
+    }
+    if (id) {
+      conditions.push(eq(pagesTable.id, id))
+    } else if (hash) {
+      conditions.push(eq(pagesTable.hash, hash))
+      // -> A path is only unique within a locale, so without one this could match more than one page
+      conditions.push(eq(pagesTable.locale, locale ?? this.defaultLocale(siteId)))
+    } else {
+      return null
+    }
+
+    const results = await WIKI.db
+      .select({
+        page: pagesTable,
+        isLive: sql<boolean>`${liveCondition(pagesTable)}`.mapWith(Boolean),
+        authorName: usersTable.name,
+        authorHasAvatar: usersTable.hasAvatar,
+        // -> The newest version is the page as it stands; one indexed row off `pageHistory_pageId_idx`
+        editedVia: sql<
+          string | null
+        >`(SELECT h."via" FROM "pageHistory" h WHERE h."pageId" = ${pagesTable.id} ORDER BY h."versionDate" DESC, h."id" DESC LIMIT 1)`,
+        navigationId: treeTable.navigationId,
+        navigationMode: treeTable.navigationMode
+      })
+      .from(pagesTable)
+      .leftJoin(usersTable, eq(usersTable.id, pagesTable.authorId))
+      .leftJoin(treeTable, eq(treeTable.id, pagesTable.id))
+      .where(and(...conditions))
+      .limit(1)
+
+    const row = results[0]
+    if (!row) {
+      return null
+    }
+    const ref: RulePageRef = {
+      path: row.page.path,
+      locale: row.page.locale,
+      siteId,
+      tags: row.page.tags ?? []
+    }
+    // -> Not there, rather than refused: whether a draft exists at a path is the draft's business
+    if (!row.isLive && typeof unpublished === 'function' && !unpublished(ref)) {
+      return null
+    }
+    const isUnlocked =
+      typeof unlocked === 'function' ? unlocked({ ...ref, id: row.page.id }) : unlocked
+    const includeContent = typeof withContent === 'function' ? withContent(ref) : withContent
+    const includePassword = typeof withPassword === 'function' ? withPassword(ref) : withPassword
+    return this.toPage(
+      {
+        ...row.page,
+        authorName: row.authorName,
+        authorHasAvatar: row.authorHasAvatar,
+        editedVia: row.editedVia,
+        navigationId: row.navigationId,
+        navigationMode: row.navigationMode,
+        // -> A second query only for a page that is part of a set, which is a column read away
+        localeRelations: await this.localeRelationsFor(siteId, {
+          localeGroupId: row.page.localeGroupId,
+          id: row.page.id,
+          unpublished
+        })
+      },
+      {
+        withContent: includeContent,
+        withPassword: includePassword,
+        locked: Boolean(row.page.password) && !isUnlocked
+      }
+    )
+  }
+
+  /**
+   * Check a page's password, and hand the page over if it matches.
+   *
+   * Deliberately the only way past the lock: a reader gets the body from here or from a `getPage` the
+   * route has already marked as unlocked, and never from a flag the browser sent.
+   *
+   * @returns The page, its body included, or null when the password is wrong or the page has none —
+   *          the caller cannot tell those apart, and neither can whoever is guessing.
+   */
+  async unlockPage({
+    siteId,
+    id,
+    hash,
+    locale,
+    password,
+    unpublished = true
+  }: {
+    siteId: string
+    id?: string
+    hash?: string
+    locale?: string
+    password: string
+    /** As for `getPage`. */
+    unpublished?: boolean | ((page: RulePageRef) => boolean)
+  }): Promise<Page | null> {
+    /*
+      Asked for as a reader would see it, for two reasons: a wrong guess must not assemble the body in
+      the first place, and `isLocked` is how this knows there is a password to check at all.
+    */
+    const page = await this.getPage({
+      siteId,
+      id,
+      hash,
+      locale,
+      unpublished,
+      unlocked: false,
+      withPassword: false
+    })
+    if (!page?.isLocked) {
+      return null
+    }
+    const stored = await WIKI.db
+      .select({ password: pagesTable.password })
+      .from(pagesTable)
+      .where(eq(pagesTable.id, page.id))
+      .limit(1)
+    const expected = stored[0]?.password
+    if (!expected || !timingSafeCompare(password, expected)) {
+      return null
+    }
+    // -> Unlocked, but still without the password itself: entering it is not the same as being able
+    //    to change it, and the reader has no further use for the value
+    return this.getPage({
+      siteId,
+      id: page.id,
+      unpublished,
+      unlocked: true,
+      withPassword: false
+    })
+  }
+
+  /**
+   * Create a page.
+   *
+   * @param actor Who is saving it. Their permissions decide what survives sanitizing.
+   */
+  async createPage(siteId: string, input: PageInput, actor: PageActor): Promise<PageChange> {
+    if (!WIKI.sites[siteId]) {
+      throw new CustomError('pageInvalidSite', 'This site does not exist.', 404)
+    }
+
+    const path = normalizePath(input.path)
+    const locale = input.locale || this.defaultLocale(siteId)
+    const title = (input.title ?? '').trim()
+    if (title.length < 1) {
+      throw new CustomError('pageTitleMissing', 'A page needs a title.')
+    }
+    const editor = input.editor || 'markdown'
+    const isRedirect = editor === REDIRECT_EDITOR
+    // -> A bodyless editor has no body to be empty: what its content column holds instead is a
+    //    settings document, which has its own rules about what it may say
+    const content = normalizeBodylessContent(editor, input.content)
+    if (!isBodylessEditor(editor) && (!content || content.trim().length < 1)) {
+      throw new CustomError('pageEmptyContent', 'A page cannot be empty.')
+    }
+
+    const hash = generatePathHash(path)
+    const duplicate = await WIKI.db
+      .select({ id: pagesTable.id })
+      .from(pagesTable)
+      .where(
+        and(eq(pagesTable.siteId, siteId), eq(pagesTable.locale, locale), eq(pagesTable.path, path))
+      )
+      .limit(1)
+    if (duplicate.length > 0) {
+      throw new CustomError('pageDuplicatePath', 'A page already exists at this path.', 409)
+    }
+
+    const pathParts = path.split('/')
+    await this.guardAgainstAssetCollision({
+      siteId,
+      locale,
+      parentPath: pathParts.slice(0, -1).join('/'),
+      fileName: pathParts.at(-1)!,
+      contentType: EDITOR_CONTENT_TYPES[editor] ?? 'text'
+    })
+    await this.guardFeedbackBoards(siteId, locale, path, editor)
+
+    const alias = await this.validateAlias(siteId, input.alias)
+    const { render, toc, text, links } = await WIKI.models.rendering.postProcess(
+      siteId,
+      input.render ?? '',
+      {
+        scripts: hasPermission(actor, 'write:scripts'),
+        styles: hasPermission(actor, 'write:styles')
+      }
+    )
+
+    const inserted = await WIKI.db
+      .insert(pagesTable)
+      .values({
+        alias,
+        authorId: actor.id,
+        creatorId: actor.id,
+        config: this.buildConfig(input, siteId),
+        content,
+        contentType: EDITOR_CONTENT_TYPES[editor] ?? 'text',
+        description: input.description ?? '',
+        editor,
+        hash,
+        icon: input.icon ?? '',
+        /*
+          A redirection is a doorway rather than a destination, so it stays out of the browse menu
+          unless its author says otherwise -- the same default the redirect editor's own toggle
+          opens on. Unlike `isSearchable` below this is a choice and not a rule: a redirection that
+          IS the name readers look for belongs in the menu, and saying so is all it takes.
+        */
+        isBrowsable: input.isBrowsable ?? !isRedirect,
+        // -> A redirection has nothing to find: a result for it would be a result whose page is a
+        //    doorway to the page the reader actually wanted, which is the one search should offer
+        isSearchable: isRedirect ? false : (input.isSearchable ?? true),
+        locale,
+        password: input.password || null,
+        path,
+        publishState: input.publishState ?? 'published',
+        publishStartDate: input.publishStartDate ? new Date(input.publishStartDate) : null,
+        publishEndDate: input.publishEndDate ? new Date(input.publishEndDate) : null,
+        relations: input.relations ?? [],
+        render,
+        searchContent: text,
+        scripts: this.buildScripts(input, actor),
+        siteId,
+        tags: input.tags ?? [],
+        title,
+        toc
+      })
+      .returning()
+
+    const page = inserted[0]
+
+    try {
+      /*
+        Before the tree entry, so that both live inside the same rollback: a translation set that
+        cannot be joined -- the French page is already somebody else's French version -- has to refuse
+        the whole save, and an author told their page was not created must not find it created.
+      */
+      if (input.localeRelations !== undefined) {
+        await this.applyLocaleRelations(
+          siteId,
+          { id: page.id, locale, localeGroupId: null },
+          input.localeRelations
+        )
+      }
+      await WIKI.models.tree.addPage({
+        id: page.id,
+        parentPath: pathParts.slice(0, -1).join('/'),
+        fileName: pathParts.at(-1)!,
+        title: page.title,
+        locale,
+        siteId,
+        tags: input.tags ?? [],
+        meta: this.treeMeta(page)
+      })
+    } catch (err) {
+      // -> A page with no tree entry is invisible to navigation and to the file manager, which is
+      //    worse than not having saved it at all
+      await WIKI.db.delete(pagesTable).where(eq(pagesTable.id, page.id))
+      throw err
+    }
+
+    /*
+      A blog's posts are the pages under its path, and a feedback board's ideas the pages in its
+      folder, so the folder at that path is where its author is about to be working — and nothing has put one there yet. Created here so that the blog has
+      somewhere to write its first post into rather than looking like a dead end in the file manager.
+
+      Deliberately OUTSIDE the rollback above: the folder is a convenience and the blog is complete
+      without it, so a folder that cannot be made must not take the page with it. `ensureFolder` never
+      throws for that reason.
+    */
+    if (editor === BLOG_EDITOR || editor === FEEDBACK_EDITOR) {
+      await WIKI.models.blogs.ensureFolder({ siteId, locale, path, title })
+    }
+
+    // -> What this page points at, which is only knowable once it has an id and an address of its
+    //    own: a relative link resolves against the page holding it
+    await WIKI.models.pageLinks.refreshForPage(page, links)
+    // -> And every link somebody had already written to this path or alias stops being a red one
+    await WIKI.models.pageLinks.refreshLinksTo(
+      siteId,
+      { paths: [{ locale, path }], aliases: [alias] },
+      page.id
+    )
+
+    const versionId = await WIKI.models.pageHistory.record({
+      siteId,
+      pageId: page.id,
+      action: 'created',
+      authorId: actor.id,
+      via: currentVia(),
+      reason: input.reasonForChange
+    })
+
+    const stored = this.toStoragePage(
+      siteId,
+      actor.id,
+      page,
+      page.content ?? '',
+      input.reasonForChange
+    )
+    await WIKI.models.storage.mirrorPage(stored.ref, stored.content)
+
+    await WIKI.models.search.indexPage(page.id, locale)
+    await WIKI.models.hooks.emit('page:create', {
+      id: page.id,
+      path: page.path,
+      locale,
+      siteId,
+      authorId: actor.id,
+      metadata: { title: page.title, description: page.description, editor }
+    })
+    await WIKI.models.notifications.emit('page:create', {
+      siteId,
+      actorId: actor.id,
+      data: { variant: 'created', page: WIKI.models.notifications.pageSnapshot(page) }
+    })
+    await WIKI.models.navigationAutomation.pageCreated(siteId, {
+      id: page.id,
+      locale: page.locale,
+      path: page.path,
+      title: page.title,
+      icon: page.icon
+    })
+
+    /*
+      Everything a document served to a client that will not run the app says about a page comes out
+      of the row this just wrote — its title, its description, its body, whether it is published and
+      searchable, and where it sits. Dropping the lot is cheaper than working out which URLs a change
+      reached: a rename moves a page, and joining or leaving a translation set moves its siblings'
+      alternates with it.
+    */
+    invalidateAppShellCache()
+    // -> A board's front page is what page access is resolved against: see `models/feedback.ts`
+    await WIKI.models.feedback.pageChanged(editor)
+
+    return { page: (await this.getPage({ siteId, id: page.id })) as Page, versionId }
+  }
+
+  /**
+   * Update a page. Only the fields present in the patch are touched.
+   */
+  async updatePage(
+    siteId: string,
+    id: string,
+    patch: Partial<PageInput>,
+    actor: PageActor
+  ): Promise<PageChange | null> {
+    const results = await WIKI.db
+      .select()
+      .from(pagesTable)
+      .where(and(eq(pagesTable.id, id), eq(pagesTable.siteId, siteId)))
+      .limit(1)
+    const existing = results[0]
+    if (!existing) {
+      return null
+    }
+
+    /*
+      First, before a single column is written: joining a set can be refused, and a save that is going
+      to fail has to fail before it has changed the page. The two are independent otherwise -- a locale
+      group is not a field of the page it relates.
+    */
+    if (patch.localeRelations !== undefined) {
+      await this.applyLocaleRelations(
+        siteId,
+        { id: existing.id, locale: existing.locale, localeGroupId: existing.localeGroupId },
+        patch.localeRelations
+      )
+    }
+
+    const values: Record<string, any> = { updatedAt: sql`now()` }
+    let treeTitle: string | null = null
+    // -> Which editor authored a page is not something a save may change, so the row is the authority
+    //    on what kind of page this is
+    const isRedirect = existing.editor === REDIRECT_EDITOR
+
+    if (patch.title !== undefined) {
+      const title = patch.title.trim()
+      if (title.length < 1) {
+        throw new CustomError('pageTitleMissing', 'A page needs a title.')
+      }
+      values.title = title
+      treeTitle = title
+    }
+    if (patch.description !== undefined) {
+      values.description = patch.description.trim()
+    }
+    if (patch.icon !== undefined) {
+      values.icon = patch.icon.trim()
+    }
+    if (patch.alias !== undefined) {
+      values.alias = await this.validateAlias(siteId, patch.alias, id)
+    }
+    if (patch.content !== undefined) {
+      values.content = normalizeBodylessContent(existing.editor, patch.content)
+    }
+    if (patch.publishState !== undefined) {
+      if (
+        patch.publishState === 'scheduled' &&
+        !(patch.publishStartDate ?? existing.publishStartDate) &&
+        !(patch.publishEndDate ?? existing.publishEndDate)
+      ) {
+        throw new CustomError(
+          'pageMissingScheduledDates',
+          'A scheduled page needs a start or an end date.'
+        )
+      }
+      values.publishState = patch.publishState
+    }
+    if (patch.publishStartDate !== undefined) {
+      values.publishStartDate = patch.publishStartDate ? new Date(patch.publishStartDate) : null
+    }
+    if (patch.publishEndDate !== undefined) {
+      values.publishEndDate = patch.publishEndDate ? new Date(patch.publishEndDate) : null
+    }
+    if (patch.isBrowsable !== undefined) {
+      values.isBrowsable = patch.isBrowsable
+    }
+    if (patch.isSearchable !== undefined) {
+      // -> Never for a redirection; see the same call in `createPage`
+      values.isSearchable = isRedirect ? false : patch.isSearchable
+    }
+    if (patch.password !== undefined) {
+      values.password = patch.password || null
+    }
+    if (patch.relations !== undefined) {
+      values.relations = patch.relations
+    }
+    if (patch.tags !== undefined) {
+      values.tags = patch.tags
+    }
+
+    // -> A render only means anything next to the content it came from, so the two move together
+    let renderHrefs: string[] | undefined
+    if (patch.render !== undefined) {
+      const { render, toc, text, links } = await WIKI.models.rendering.postProcess(
+        siteId,
+        patch.render,
+        {
+          scripts: hasPermission(actor, 'write:scripts'),
+          styles: hasPermission(actor, 'write:styles')
+        }
+      )
+      values.render = render
+      values.toc = toc
+      values.searchContent = text
+      renderHrefs = links
+    }
+
+    if (CONFIG_FIELDS.some((field) => patch[field] !== undefined)) {
+      values.config = this.buildConfig(patch, siteId, existing.config as Record<string, any>)
+    }
+    if (
+      patch.scriptJsLoad !== undefined ||
+      patch.scriptJsUnload !== undefined ||
+      patch.scriptCss !== undefined
+    ) {
+      values.scripts = this.buildScripts(patch, actor, existing.scripts as Record<string, any>)
+    }
+
+    // -> The author is whoever last changed it; the creator does not move
+    values.authorId = actor.id
+
+    // -> Worked out before the write, against the row as it stands: the editor sends every field on
+    //    every save, so the patch alone would report a change to all of them
+    const changedFields = WIKI.models.pageHistory.changedFields(existing, values)
+    // -> The body, and only the body, is what a lifecycle rule counts content age from
+    if (changedFields.includes('content')) {
+      values.contentUpdatedAt = sql`now()`
+    }
+
+    await WIKI.db.update(pagesTable).set(values).where(eq(pagesTable.id, id))
+
+    const updated = (await this.getPage({ siteId, id })) as Page
+
+    /*
+      Unconditionally, and not only for a save that carried a render: a redirection's destination is
+      its content, and the sidebar relations are a column of their own, so a save touching either of
+      those changes what the page links to without the render moving at all. Read back rather than
+      assembled from the patch, for the same reason `changedFields` is worked out against the row.
+    */
+    const markedRender = await WIKI.models.pageLinks.refreshById(siteId, id, renderHrefs)
+    // -> Read back before its red links were marked, and it is what the editor is handed to draw
+    if (markedRender !== null) {
+      updated.render = markedRender
+    }
+    // -> `/a/<alias>` links follow the alias: the old one now points at nothing, the new one at this
+    if (values.alias !== undefined && values.alias !== existing.alias) {
+      await WIKI.models.pageLinks.refreshLinksTo(
+        siteId,
+        { aliases: [existing.alias, values.alias] },
+        id
+      )
+    }
+
+    const versionId = await WIKI.models.pageHistory.record({
+      siteId,
+      pageId: id,
+      action: 'updated',
+      authorId: actor.id,
+      via: currentVia(),
+      changedFields,
+      reason: patch.reasonForChange
+    })
+
+    // -> Every save, not only one that renamed or retagged the page: `meta` copies the author, the
+    //    description, the editor and the publishing fields too, and a folder listing that read a
+    //    stale copy would show a page as a draft long after it went live
+    await WIKI.db
+      .update(treeTable)
+      .set({
+        ...(treeTitle !== null ? { title: treeTitle } : {}),
+        ...(patch.tags !== undefined ? { tags: patch.tags } : {}),
+        meta: this.treeMeta(updated),
+        updatedAt: sql`now()`
+      })
+      .where(eq(treeTable.id, id))
+    await WIKI.models.navigationAutomation.pageRelabeled(
+      siteId,
+      {
+        id,
+        locale: updated.locale,
+        path: updated.path,
+        title: updated.title,
+        icon: updated.icon,
+        alias: updated.alias
+      },
+      { title: existing.title, icon: existing.icon }
+    )
+
+    // -> The source is whatever this save set it to, else whatever it already was: a save that only
+    //    changed the title still rewrites the copy, since the title is in its front matter
+    const stored = this.toStoragePage(
+      siteId,
+      actor.id,
+      updated,
+      values.content ?? existing.content ?? '',
+      patch.reasonForChange
+    )
+    await WIKI.models.storage.mirrorPage(stored.ref, stored.content)
+
+    await WIKI.models.search.indexPage(id, updated.locale)
+    await WIKI.models.hooks.emit('page:edit', {
+      id,
+      path: updated.path,
+      locale: updated.locale,
+      siteId,
+      authorId: actor.id,
+      metadata: { title: updated.title, description: updated.description }
+    })
+    // -> Only a save that changed something: re-publishing a page as it stood is not news
+    const variants = this.notificationVariants(changedFields, values)
+    if (variants.length > 0) {
+      await WIKI.models.notifications.emit('page:edit', {
+        siteId,
+        actorId: actor.id,
+        data: {
+          variant: variants[0]!,
+          variants,
+          page: WIKI.models.notifications.pageSnapshot(updated)
+        }
+      })
+    }
+    invalidateAppShellCache()
+    // -> A board's front page is what page access is resolved against: see `models/feedback.ts`
+    await WIKI.models.feedback.pageChanged(updated.editor)
+
+    return { page: updated, versionId }
+  }
+
+  /**
+   * What a save did, as a page's watchers are told it — the publishing change first, since being
+   * published or taken down says more about a page than an edit to it does, and an edit after it when
+   * anything else changed too.
+   *
+   * @param changedFields What `pageHistory.changedFields` made of the save
+   */
+  notificationVariants(changedFields: string[], values: Record<string, any>): string[] {
+    const variants: string[] = []
+    const publishing = new Set(['publishState', 'publishStartDate', 'publishEndDate'])
+    if (changedFields.includes('publishState')) {
+      // -> Back to a draft from either other state is the page being taken down
+      variants.push(
+        values.publishState === 'published'
+          ? 'published'
+          : values.publishState === 'scheduled'
+            ? 'scheduled'
+            : 'unpublished'
+      )
+    } else if (changedFields.some((field) => publishing.has(field))) {
+      variants.push('scheduled')
+    }
+    if (changedFields.some((field) => !publishing.has(field))) {
+      variants.push('edited')
+    }
+    return variants
+  }
+
+  /**
+   * Open a page with a different editor from now on.
+   *
+   * A page has exactly one editor and everyone who opens it gets that one — there is no scenario
+   * where two people edit the same page through different editors, which is what makes converting a
+   * deliberate act rather than a per-author preference.
+   *
+   * Only between editors that produce the same content type (`interchangeableEditors`), so nothing is
+   * translated and nothing can be lost: Markdown and Visual are two views of one markdown source. The
+   * content the caller sends is that source written the way the new editor writes it — the Visual
+   * editor normalises quote style, list indentation and table padding, and doing it here, once, is
+   * what keeps it out of the next author's first real edit.
+   *
+   * The editor is written before the save rather than as part of it, because `updatePage` will not
+   * change it: which editor authored a page is not something an ordinary save may touch, and that
+   * invariant is worth more than the one statement it costs here. `pageHistory` snapshots the row
+   * after the write, so the single version this produces already records the page as converted.
+   *
+   * @returns The change, or null when the page is not there.
+   */
+  async convertPage(
+    siteId: string,
+    id: string,
+    {
+      editor,
+      content,
+      render,
+      reasonForChange
+    }: { editor: string; content?: string; render?: string; reasonForChange?: string },
+    actor: PageActor
+  ): Promise<PageChange | null> {
+    const results = await WIKI.db
+      .select({ id: pagesTable.id, editor: pagesTable.editor })
+      .from(pagesTable)
+      .where(and(eq(pagesTable.id, id), eq(pagesTable.siteId, siteId)))
+      .limit(1)
+    const existing = results[0]
+    if (!existing) {
+      return null
+    }
+    if (existing.editor === editor) {
+      throw new CustomError('pageAlreadyUsesEditor', 'This page already uses that editor.')
+    }
+    if (!interchangeableEditors(existing.editor).includes(editor)) {
+      throw new CustomError(
+        'pageEditorNotInterchangeable',
+        `A page written with the ${existing.editor} editor cannot be converted to ${editor}.`
+      )
+    }
+
+    await WIKI.db
+      .update(pagesTable)
+      .set({ editor, contentType: EDITOR_CONTENT_TYPES[editor] ?? 'text' })
+      .where(eq(pagesTable.id, id))
+
+    /*
+      Saved through the ordinary path, so the history version, the re-render, the search index and the
+      copy on every storage target all happen exactly as they do for any other edit. `content` is
+      absent when the new editor writes the source the same way the old one did, and `updatePage`
+      leaves the column alone rather than blanking it.
+    */
+    return this.updatePage(
+      siteId,
+      id,
+      { content, render, reasonForChange } as Partial<PageInput>,
+      actor
+    )
+  }
+
+  /**
+   * Move a page to another path, taking its tree entry with it.
+   */
+  async movePage(
+    siteId: string,
+    id: string,
+    { path, locale, title }: { path: string; locale?: string; title?: string },
+    actor: PageActor
+  ): Promise<PageChange | null> {
+    // -> With the source, which the move itself does not need: it is what the copy kept by a storage
+    //    target is rewritten from once the page has landed at its new path
+    const page = await this.getPage({ siteId, id, withContent: true })
+    if (!page) {
+      return null
+    }
+    const existingContent = page.content
+    const newPath = normalizePath(path, page.path)
+    /*
+      A move may cross locales — the same page, translated, is the same page moved — so the
+      destination is a locale AND a path, and everything below asks about the pair rather than about
+      the path alone. Absent, it stays where it is: a rename is a move that changes neither.
+    */
+    const newLocale = locale || page.locale
+    const isRelocated = newPath !== page.path || newLocale !== page.locale
+    if (!isRelocated && (title === undefined || title === page.title)) {
+      // -> Nothing moved and nothing was renamed, so there is no version recording a change either
+      return { page, versionId: null }
+    }
+
+    if (isRelocated) {
+      const duplicate = await WIKI.db
+        .select({ id: pagesTable.id })
+        .from(pagesTable)
+        .where(
+          and(
+            ne(pagesTable.id, id),
+            eq(pagesTable.siteId, siteId),
+            eq(pagesTable.locale, newLocale),
+            eq(pagesTable.path, newPath)
+          )
+        )
+        .limit(1)
+      if (duplicate.length > 0) {
+        throw new CustomError('pageDuplicatePath', 'A page already exists at this path.', 409)
+      }
+      await this.guardAgainstAssetCollision({
+        siteId,
+        locale: newLocale,
+        parentPath: newPath.split('/').slice(0, -1).join('/'),
+        fileName: newPath.split('/').at(-1)!,
+        contentType: page.contentType
+      })
+      await this.guardFeedbackBoards(siteId, newLocale, newPath, page.editor)
+    }
+
+    /*
+      A page that changes locale stops being the version it was, so it leaves its translation set --
+      and has to, before the write: the set holds one page per locale, and the page arriving in a
+      locale another member already covers is a pair the unique index would refuse. The rest of the
+      set stays related to each other.
+    */
+    if (newLocale !== page.locale) {
+      await this.detachFromLocaleGroup(siteId, id)
+    }
+
+    await WIKI.db
+      .update(pagesTable)
+      .set({
+        path: newPath,
+        locale: newLocale,
+        hash: generatePathHash(newPath),
+        ...(title !== undefined ? { title: title.trim() } : {}),
+        authorId: actor.id,
+        updatedAt: sql`now()`
+      })
+      .where(eq(pagesTable.id, id))
+
+    // -> The tree entry is what places the page in the site, so it is moved rather than rewritten:
+    //    dropping and re-adding would create the destination folders but leave the old ones counted
+    const pathParts = newPath.split('/')
+    await WIKI.models.tree.deleteEntry(id)
+    await WIKI.models.tree.addPage({
+      id,
+      parentPath: pathParts.slice(0, -1).join('/'),
+      fileName: pathParts.at(-1)!,
+      title: title !== undefined ? title.trim() : page.title,
+      locale: newLocale,
+      siteId,
+      tags: page.tags,
+      meta: this.treeMeta({ ...page, path: newPath, locale: newLocale })
+    })
+
+    const moved = (await this.getPage({ siteId, id })) as Page
+
+    // -> Recorded as its own kind of change rather than an edit: a move is what breaks inbound links,
+    //    and a history list has to be able to say so
+    const versionId = await WIKI.models.pageHistory.record({
+      siteId,
+      pageId: id,
+      action: 'moved',
+      authorId: actor.id,
+      via: currentVia(),
+      changedFields: [
+        ...(newPath !== page.path ? ['path'] : []),
+        ...(newLocale !== page.locale ? ['locale'] : []),
+        ...(title !== undefined && title.trim() !== page.title ? ['title'] : [])
+      ]
+    })
+
+    /*
+      The search vector is built with the dictionary of the page's locale and holds its title, so
+      both halves of a move can invalidate it. Rebuilt here rather than left to the next edit, which
+      for a page nobody edits again is never.
+    */
+    await WIKI.models.search.indexPage(id, newLocale)
+
+    /*
+      Not the pages pointing AT this one -- those still say where it was, which is the thing worth
+      knowing and exactly what the table is for. This is the other direction: every relative link the
+      moved page itself carries resolved against the folder it used to sit in, and now resolves
+      against a different one. Nothing about its content changed and every one of its links may have.
+    */
+    const markedRender = await WIKI.models.pageLinks.refreshById(siteId, id)
+    if (markedRender !== null) {
+      moved.render = markedRender
+    }
+    /*
+      And the pages pointing at it, whose rows still say where it was -- which is exactly what turns
+      their links red. The path it arrived at is handed over too, since a link somebody wrote to where
+      the page now is has just started resolving.
+    */
+    if (isRelocated) {
+      await WIKI.models.pageLinks.refreshLinksTo(
+        siteId,
+        {
+          paths: [
+            { locale: page.locale, path: page.path },
+            { locale: newLocale, path: newPath }
+          ]
+        },
+        id
+      )
+    }
+
+    // -> Moved and then rewritten, rather than deleted and written afresh: the move is what keeps a
+    //    versioned target's history of the file attached to it, and the rewrite is because a move may
+    //    carry a new title and always carries a new modification time, both of which are in the copy
+    const stored = this.toStoragePage(siteId, actor.id, moved, existingContent ?? '')
+    await WIKI.models.storage.relocatePage(stored.ref, { locale: page.locale, path: page.path })
+    await WIKI.models.storage.mirrorPage(stored.ref, stored.content)
+
+    await WIKI.models.hooks.emit('page:rename', {
+      id,
+      path: moved.path,
+      previousPath: page.path,
+      locale: moved.locale,
+      siteId,
+      authorId: actor.id
+    })
+    await WIKI.models.notifications.emit('page:rename', {
+      siteId,
+      actorId: actor.id,
+      data: {
+        variant: 'moved',
+        page: WIKI.models.notifications.pageSnapshot(moved),
+        previousPath: page.path,
+        previousLocale: page.locale
+      }
+    })
+    // -> The links follow the page first, so that a title changed in the same move is then looked
+    //    for where they now point
+    const automated = {
+      id,
+      locale: moved.locale,
+      path: moved.path,
+      title: moved.title,
+      icon: moved.icon,
+      alias: moved.alias
+    }
+    if (isRelocated) {
+      await WIKI.models.navigationAutomation.pageMoved(siteId, automated, {
+        locale: page.locale,
+        path: page.path
+      })
+    }
+    await WIKI.models.navigationAutomation.pageRelabeled(siteId, automated, {
+      title: page.title,
+      icon: page.icon
+    })
+    invalidateAppShellCache()
+    // -> A board's front page is what page access is resolved against: see `models/feedback.ts`
+    await WIKI.models.feedback.pageChanged(moved.editor)
+    return { page: moved, versionId }
+  }
+
+  /**
+   * Point every page linking to where a page USED to be at where it is now.
+   *
+   * The optional half of a move, asked for from the rename dialog. A move on its own leaves those links
+   * saying the old address on purpose — that is what makes them findable as the ones it broke (see
+   * `movePage`) — and this is the repair. Only links written as a PATH: `/a/<alias>` and `/i/<id>`
+   * survive a move by design, and have nothing to repair.
+   *
+   * Each page is edited the way an author would edit it, through `updatePage`: its source is
+   * rewritten (and the stored render with it, so readers see the fix without waiting on a re-render),
+   * which gives it a version in its history naming the move as the reason, a fresh copy on every
+   * storage target, re-derived links and red links, and a webhook. The source is rewritten in place,
+   * href by href, and nothing else in it is touched — see `helpers/linkRewrite.ts`.
+   *
+   * The render is never rewritten on its own. A link that is in the render but cannot be found in the
+   * source in a form that can be rewritten is left as it is and reported, because a fixed render over
+   * an unfixed source would break again the next time the page is rendered.
+   *
+   * Glossary terms documented by the page follow it too, in the same call (`relinkDocumentation`).
+   *
+   * @param previous Where the page was before the move.
+   * @param mayEdit Whether the mover may edit a given page. Every page here is somebody else's, so this
+   *                is asked of each one, and a page they may not edit is reported rather than changed —
+   *                moving a page is not a way to write to pages the mover could not have saved.
+   */
+  async relinkMovedPage(
+    siteId: string,
+    id: string,
+    previous: { locale: string; path: string },
+    actor: PageActor,
+    mayEdit: (page: RulePageRef) => boolean
+  ): Promise<RelinkResult> {
+    const result: RelinkResult = {
+      updated: [],
+      skipped: [],
+      glossary: { updated: [], cleared: [] }
+    }
+    const [moved] = await WIKI.db
+      .select({ locale: pagesTable.locale, path: pagesTable.path })
+      .from(pagesTable)
+      .where(and(eq(pagesTable.id, id), eq(pagesTable.siteId, siteId)))
+      .limit(1)
+    if (!moved || (moved.locale === previous.locale && moved.path === previous.path)) {
+      return result
+    }
+    const target = { siteId, locale: moved.locale, path: moved.path }
+
+    // -> Ahead of the linking pages, and whether or not there are any: a page can document a term
+    //    without a single page linking to it
+    result.glossary = await WIKI.models.glossary.relinkDocumentation(siteId, previous, moved)
+
+    const rows = await WIKI.db
+      .select({ pageId: pageLinksTable.pageId, href: pageLinksTable.href })
+      .from(pageLinksTable)
+      .where(
+        and(
+          eq(pageLinksTable.targetSiteId, siteId),
+          eq(pageLinksTable.kind, 'page'),
+          eq(pageLinksTable.targetLocale, previous.locale),
+          eq(pageLinksTable.targetPath, previous.path)
+        )
+      )
+    const hrefsByPage = new Map<string, string[]>()
+    for (const row of rows) {
+      hrefsByPage.set(row.pageId, [...(hrefsByPage.get(row.pageId) ?? []), row.href])
+    }
+    if (hrefsByPage.size < 1) {
+      return result
+    }
+
+    // -> In the wiki's own language, since it is read in every linking page's history -- which may be
+    //    on several sites, and is not the mover's to choose
+    const { t } = await WIKI.models.locales.translator(WIKI.sites[siteId]?.config?.locales?.primary)
+    const reasonForChange = t('pageRenameDialog.updateLinksReason', {
+      from: this.urlFor(siteId, previous.locale, previous.path),
+      to: this.urlFor(siteId, moved.locale, moved.path)
+    })
+
+    for (const [pageId, hrefs] of hrefsByPage) {
+      const [page] = await WIKI.db
+        .select({
+          id: pagesTable.id,
+          siteId: pagesTable.siteId,
+          locale: pagesTable.locale,
+          path: pagesTable.path,
+          title: pagesTable.title,
+          tags: pagesTable.tags,
+          editor: pagesTable.editor,
+          content: pagesTable.content,
+          render: pagesTable.render,
+          relations: pagesTable.relations
+        })
+        .from(pagesTable)
+        .where(eq(pagesTable.id, pageId))
+        .limit(1)
+      if (!page) {
+        continue
+      }
+      const skip = (reason: RelinkSkip['reason']) =>
+        result.skipped.push({
+          id: page.id,
+          siteId: page.siteId,
+          locale: page.locale,
+          path: page.path,
+          title: page.title,
+          tags: page.tags ?? [],
+          reason
+        })
+      if (
+        !mayEdit({
+          siteId: page.siteId,
+          locale: page.locale,
+          path: page.path,
+          tags: page.tags ?? []
+        })
+      ) {
+        skip('forbidden')
+        continue
+      }
+
+      // -> Resolved from where the linking page sits NOW, which for the moved page itself is its new
+      //    address: a relative link is rewritten relative to it
+      const replacements = new Map<string, string>()
+      for (const href of hrefs) {
+        const next = relinkHref(href, page, target)
+        if (next !== null && next !== href) {
+          replacements.set(href, next)
+        }
+      }
+      if (replacements.size < 1) {
+        continue
+      }
+
+      const patch: Partial<PageInput> = { reasonForChange }
+      const found = new Set<string>()
+      const content = page.content ?? ''
+      const syntax = SOURCE_SYNTAX[page.editor]
+      if (syntax) {
+        const rewrite = rewriteSourceLinks(content, syntax, replacements)
+        if (rewrite.replaced.size > 0) {
+          patch.content = rewrite.content
+          rewrite.replaced.forEach((href) => found.add(href))
+        }
+      } else if (page.editor === REDIRECT_EDITOR || page.editor === 'excalidraw') {
+        try {
+          const parsed = JSON.parse(content)
+          if (page.editor === REDIRECT_EDITOR) {
+            const next = replacements.get(String(parsed?.target ?? '').trim())
+            if (next !== undefined) {
+              found.add(parsed.target.trim())
+              parsed.target = next
+              patch.content = JSON.stringify(parsed)
+            }
+          } else {
+            // -> An element's own link, which the export wraps the element in an anchor for. Written
+            //    back the way `serializeAsJSON` writes a scene
+            for (const element of Array.isArray(parsed?.elements) ? parsed.elements : []) {
+              const next =
+                typeof element?.link === 'string'
+                  ? replacements.get(element.link.trim())
+                  : undefined
+              if (next !== undefined) {
+                found.add(element.link.trim())
+                element.link = next
+              }
+            }
+            if (found.size > 0) {
+              patch.content = JSON.stringify(parsed, null, 2)
+            }
+          }
+        } catch {
+          // -> Content that will not parse holds no link this can find
+        }
+      }
+
+      // -> The sidebar relations, which are links too and are stored as a column of their own
+      if (Array.isArray(page.relations)) {
+        let relationsChanged = false
+        const relations = (page.relations as any[]).map((relation) => {
+          const next =
+            typeof relation?.target === 'string'
+              ? replacements.get(relation.target.trim())
+              : undefined
+          if (next === undefined) {
+            return relation
+          }
+          found.add(relation.target.trim())
+          relationsChanged = true
+          return { ...relation, target: next }
+        })
+        if (relationsChanged) {
+          patch.relations = relations
+        }
+      }
+
+      if (found.size < 1) {
+        skip('notInSource')
+        continue
+      }
+
+      // -> Only the hrefs that were fixed in the source, so the render never says something the source
+      //    does not. Written ahead of the save, which re-derives the page's links from it
+      const render = rewriteRenderLinks(
+        page.render ?? '',
+        new Map([...replacements].filter(([href]) => found.has(href)))
+      )
+      if (render !== null) {
+        await WIKI.db.update(pagesTable).set({ render }).where(eq(pagesTable.id, page.id))
+      }
+
+      /*
+        One page at a time, and one failing does not stop the rest: the move itself has already
+        happened, and the other pages are no less worth fixing. The render goes back to what it was, so
+        a page whose save was refused is left exactly as it stood.
+      */
+      try {
+        const change = await this.updatePage(page.siteId, page.id, patch, actor)
+        if (change) {
+          result.updated.push({ id: page.id, versionId: change.versionId })
+        }
+      } catch (err: any) {
+        WIKI.logger.warn(`Could not update the links of page ${page.id}: ${err.message}`)
+        if (render !== null) {
+          await WIKI.db
+            .update(pagesTable)
+            .set({ render: page.render })
+            .where(and(eq(pagesTable.id, page.id), eq(pagesTable.render, render)))
+        }
+        skip('failed')
+      }
+    }
+
+    return result
+  }
+
+  /**
+   * Delete a page and its tree entry.
+   *
+   * @returns The page as it last stood and the version recording its deletion, or null when there
+   *          was no such page
+   */
+  async deletePage(siteId: string, id: string, actor: PageActor): Promise<PageChange | null> {
+    const page = await this.getPage({ siteId, id })
+    if (!page) {
+      return null
+    }
+    // -> Before the row goes, and this version is what recovering the page would be built from
+    const versionId = await WIKI.models.pageHistory.record({
+      siteId,
+      pageId: id,
+      action: 'deleted',
+      authorId: actor.id,
+      via: currentVia()
+    })
+
+    /*
+      Before the row goes, because its watchers go with it: the event captures them as it is written.
+      The fan-out checks the page really has gone before it tells anybody, so a delete that fails from
+      here on announces nothing.
+    */
+    await WIKI.models.notifications.emit('page:delete', {
+      siteId,
+      actorId: actor.id,
+      data: { variant: 'deleted', page: WIKI.models.notifications.pageSnapshot(page) },
+      watchersOf: id
+    })
+
+    // -> Out of its set of translations first, which dissolves the set if this leaves one page in
+    //    it: a group of one is no group, and the survivor's locale picker would offer nothing
+    await this.detachFromLocaleGroup(siteId, id)
+    await WIKI.db.delete(pagesTable).where(eq(pagesTable.id, id))
+    await WIKI.models.tree.deleteEntry(id)
+    // -> Every link to it, by any of the three ways a link can name it, now points at nothing
+    await WIKI.models.pageLinks.refreshLinksTo(siteId, {
+      paths: [{ locale: page.locale, path: page.path }],
+      pageIds: [id],
+      aliases: [page.alias]
+    })
+    // -> A page that overrode the sidebar owns a menu keyed by its own id, which nothing could reach
+    //    once the page is gone
+    await WIKI.models.navigation.deleteNavForEntries([id])
+    await WIKI.models.navigationAutomation.pageDeleted(siteId, {
+      id,
+      locale: page.locale,
+      path: page.path,
+      title: page.title,
+      alias: page.alias
+    })
+    await WIKI.models.storage.removePage({
+      id,
+      siteId,
+      actorId: actor.id,
+      locale: page.locale,
+      path: page.path,
+      contentType: page.contentType
+    })
+
+    await WIKI.models.hooks.emit('page:delete', {
+      id,
+      path: page.path,
+      locale: page.locale,
+      siteId,
+      authorId: actor.id
+    })
+    invalidateAppShellCache()
+    // -> A board's front page is what page access is resolved against: see `models/feedback.ts`
+    await WIKI.models.feedback.pageChanged(page.editor)
+    return { page, versionId }
+  }
+
+  /**
+   * Bring a deleted page back, under its own id, from the version that recorded its deletion.
+   *
+   * The same id rather than a new page, which is what makes this an undo: every version the page ever
+   * had is keyed by that id and comes back with it, and so do the `/_version/` links pointing into
+   * them. The page is restored as the snapshot held it — title, content, tags, config, scripts,
+   * publish state and password — and put back where it was unless another path is asked for.
+   *
+   * What does not come back, and why:
+   * - The RENDER is not part of a version, so it is the browser's, from the snapshot's source — and
+   *   is sanitized against what the RESTORER may embed, as any render is. Scripts the page carried in
+   *   its own `scripts` column come back regardless, since those are what their author wrote.
+   * - Its place in a set of TRANSLATIONS. Leaving the set dissolved it if it left one page behind, and
+   *   rejoining one is a statement about the other pages that is not this restore's to make.
+   * - An ALIAS another page has taken since.
+   * - Its sidebar MENU, if it overrode one: that was keyed by the page's tree entry and went with it.
+   * - Its ratings, which are the readers' rows and were dropped with the page.
+   *
+   * @throws 404 when the page is not in the bin, 409 when `versionId` is not its current deletion or
+   *         when the destination path is taken
+   */
+  async restorePage(
+    siteId: string,
+    input: PageRestoreInput,
+    actor: PageActor
+  ): Promise<PageChange> {
+    if (!WIKI.sites[siteId]) {
+      throw new CustomError('pageInvalidSite', 'This site does not exist.', 404)
+    }
+    const deletion = await WIKI.models.pageHistory.deletionOf(siteId, input.pageId)
+    if (!deletion) {
+      throw new CustomError('pageNotDeleted', 'This page is not in the recycle bin.', 404)
+    }
+    if (deletion.id !== input.versionId) {
+      throw new CustomError(
+        'pageRestoreStale',
+        'This page has changed in the recycle bin since it was loaded. Reload it and try again.',
+        409
+      )
+    }
+
+    const meta = deletion.meta
+    const title = input.title?.trim() || deletion.title
+    const path = normalizePath(input.path ?? deletion.path, deletion.path)
+    const locale = input.locale || deletion.locale
+    const editor = meta.editor || 'markdown'
+    const contentType = meta.contentType || EDITOR_CONTENT_TYPES[editor] || 'text'
+
+    const duplicate = await WIKI.db
+      .select({ id: pagesTable.id })
+      .from(pagesTable)
+      .where(
+        and(eq(pagesTable.siteId, siteId), eq(pagesTable.locale, locale), eq(pagesTable.path, path))
+      )
+      .limit(1)
+    if (duplicate.length > 0) {
+      throw new CustomError('pageDuplicatePath', 'A page already exists at this path.', 409)
+    }
+    const pathParts = path.split('/')
+    await this.guardAgainstAssetCollision({
+      siteId,
+      locale,
+      parentPath: pathParts.slice(0, -1).join('/'),
+      fileName: pathParts.at(-1)!,
+      contentType
+    })
+    await this.guardFeedbackBoards(siteId, locale, path, editor)
+
+    // -> Kept only while it is still free: an alias is unique across the site, and one taken since is
+    //    somebody else's now
+    let alias: string | null = meta.alias || null
+    if (alias) {
+      const taken = await WIKI.db
+        .select({ id: pagesTable.id })
+        .from(pagesTable)
+        .where(and(eq(pagesTable.siteId, siteId), eq(pagesTable.alias, alias)))
+        .limit(1)
+      if (taken.length > 0) {
+        alias = null
+      }
+    }
+
+    /*
+      Who made it, as they were -- but only while that account exists. The column is a foreign key,
+      and an account deleted since the page went would otherwise make the page impossible to restore
+      at all; the restorer stands in, as they would for a page they created.
+
+      Its owners are not restored: they are not part of a version (see `pageOwners`), and went with
+      the page row. A restored page is its creator's again, which is what no owner means.
+    */
+    const origin = await WIKI.models.pageHistory.originOf(siteId, input.pageId)
+    const creatorExists = origin?.authorId
+      ? (
+          await WIKI.db
+            .select({ id: usersTable.id })
+            .from(usersTable)
+            .where(eq(usersTable.id, origin.authorId))
+            .limit(1)
+        ).length > 0
+      : false
+    const creatorId = creatorExists ? origin!.authorId! : actor.id
+
+    const { render, toc, text, links } = await WIKI.models.rendering.postProcess(
+      siteId,
+      input.render ?? '',
+      {
+        scripts: hasPermission(actor, 'write:scripts'),
+        styles: hasPermission(actor, 'write:styles')
+      }
+    )
+
+    const tags: string[] = Array.isArray(meta.tags) ? meta.tags : []
+    const inserted = await WIKI.db
+      .insert(pagesTable)
+      .values({
+        id: input.pageId,
+        alias,
+        authorId: actor.id,
+        creatorId,
+        config: meta.config ?? {},
+        content: deletion.content,
+        contentType,
+        description: meta.description ?? '',
+        editor,
+        hash: generatePathHash(path),
+        icon: meta.icon ?? '',
+        isBrowsable: meta.isBrowsable ?? true,
+        isSearchable: meta.isSearchable ?? true,
+        locale,
+        localeGroupId: null,
+        password: meta.password || null,
+        path,
+        publishState: meta.publishState ?? 'published',
+        publishStartDate: meta.publishStartDate ? new Date(meta.publishStartDate) : null,
+        publishEndDate: meta.publishEndDate ? new Date(meta.publishEndDate) : null,
+        relations: meta.relations ?? [],
+        render,
+        searchContent: text,
+        scripts: meta.scripts ?? {},
+        siteId,
+        tags,
+        title,
+        toc,
+        ...(origin ? { createdAt: origin.versionDate } : {})
+      })
+      .returning()
+
+    const page = inserted[0]
+
+    try {
+      await WIKI.models.tree.addPage({
+        id: page.id,
+        parentPath: pathParts.slice(0, -1).join('/'),
+        fileName: pathParts.at(-1)!,
+        title: page.title,
+        locale,
+        siteId,
+        tags,
+        meta: this.treeMeta(page)
+      })
+    } catch (err) {
+      // -> As on a create: a page with no tree entry is invisible to everything that lists the wiki,
+      //    and it is back in the bin rather than lost -- the deletion is still its newest version
+      await WIKI.db.delete(pagesTable).where(eq(pagesTable.id, page.id))
+      throw err
+    }
+
+    // -> Outside the rollback, as on a create: the folder is a convenience, see `createPage`
+    if (editor === BLOG_EDITOR || editor === FEEDBACK_EDITOR) {
+      await WIKI.models.blogs.ensureFolder({ siteId, locale, path, title: page.title })
+    }
+
+    await WIKI.models.pageLinks.refreshForPage(page, links)
+    // -> Under its own id, so a `/i/<id>` link written before it was deleted resolves again as well
+    await WIKI.models.pageLinks.refreshLinksTo(
+      siteId,
+      { paths: [{ locale, path }], pageIds: [page.id], aliases: [page.alias] },
+      page.id
+    )
+
+    const versionId = await WIKI.models.pageHistory.record({
+      siteId,
+      pageId: page.id,
+      action: 'restored',
+      authorId: actor.id,
+      via: currentVia()
+    })
+
+    const stored = this.toStoragePage(siteId, actor.id, page, page.content ?? '')
+    await WIKI.models.storage.mirrorPage(stored.ref, stored.content)
+
+    await WIKI.models.search.indexPage(page.id, locale)
+    // -> A create, to anything listening: a page has appeared at a path, which is what a webhook
+    //    subscribed to new pages is there to hear
+    await WIKI.models.hooks.emit('page:create', {
+      id: page.id,
+      path: page.path,
+      locale,
+      siteId,
+      authorId: actor.id,
+      metadata: { title: page.title, description: page.description, editor }
+    })
+    await WIKI.models.notifications.emit('page:create', {
+      siteId,
+      actorId: actor.id,
+      data: { variant: 'restored', page: WIKI.models.notifications.pageSnapshot(page) }
+    })
+    // -> Back where it was, and so back in the menu its deletion took it out of
+    await WIKI.models.navigationAutomation.pageCreated(siteId, {
+      id: page.id,
+      locale: page.locale,
+      path: page.path,
+      title: page.title,
+      icon: page.icon
+    })
+
+    invalidateAppShellCache()
+    // -> A board's front page is what page access is resolved against: see `models/feedback.ts`
+    await WIKI.models.feedback.pageChanged(editor)
+
+    return { page: (await this.getPage({ siteId, id: page.id })) as Page, versionId }
+  }
+
+  /**
+   * Delete every page on a site carrying a tag.
+   *
+   * One page at a time through `deletePage` rather than one statement against the table: a page is
+   * more than its row — a tree entry, a navigation menu keyed by its id, a copy on every storage
+   * target — and a bulk `DELETE` would leave all of that behind. This is a handful of pages on a
+   * development instance, so the cost of doing it properly is nothing.
+   *
+   * The folders the pages sat in are left standing. They are not tagged, nothing is served from an
+   * empty one, and a folder somebody created themselves must not be swept up because a tagged page
+   * happened to be filed in it.
+   *
+   * @returns How many pages were deleted
+   */
+  async deletePagesByTag(
+    siteId: string,
+    tag: string,
+    actor: PageActor
+  ): Promise<{ locale: string; path: string }[]> {
+    const rows = await WIKI.db
+      .select({ id: pagesTable.id })
+      .from(pagesTable)
+      .where(and(eq(pagesTable.siteId, siteId), sql`${pagesTable.tags} @> ${sql.param([tag])}`))
+
+    // -> Where each one was, for a caller tidying up after them -- the folders they sat in
+    const deleted: { locale: string; path: string }[] = []
+    // -> One action, however many pages: watchers hear about theirs, nobody else about every one
+    await WIKI.models.notifications.withOrigin('bulk', async () => {
+      for (const row of rows) {
+        const change = await this.deletePage(siteId, row.id, actor)
+        if (change) {
+          deleted.push({ locale: change.page.locale, path: change.page.path })
+        }
+      }
+    })
+    return deleted
+  }
+
+  /**
+   * Delete the pages left behind by a folder deletion, which removed their tree entries already.
+   *
+   * Not optional tidying: a page is served from its own row, found by the hash of its path, and the
+   * tree is only consulted for where it sits in the site. A page whose tree entry went with the
+   * folder is therefore still live at its URL while being invisible to everything that lists the
+   * wiki -- including the file manager somebody would have to use to delete it.
+   *
+   * Each one is recorded as deleted first, exactly as deleting a single page does. `pageHistory`
+   * carries no foreign key back to `pages` precisely so that it outlives the row, which is what makes
+   * a folder deleted by mistake recoverable.
+   */
+  async deleteOrphaned(siteId: string, entries: DeletedEntry[], actor: PageActor): Promise<void> {
+    if (entries.length < 1) {
+      return
+    }
+    for (const entry of entries) {
+      await WIKI.models.pageHistory.record({
+        siteId,
+        pageId: entry.id,
+        action: 'deleted',
+        authorId: actor.id,
+        via: currentVia()
+      })
+    }
+    // -> Read before the rows go: what a target filed each page under is decided by its content type,
+    //    and guessing would mean reaching for names that may belong to the assets beside them. The
+    //    aliases are for the links that name a page by one
+    const doomed = await WIKI.db
+      .select({
+        id: pagesTable.id,
+        contentType: pagesTable.contentType,
+        alias: pagesTable.alias,
+        title: pagesTable.title,
+        path: pagesTable.path,
+        locale: pagesTable.locale,
+        tags: pagesTable.tags,
+        publishState: pagesTable.publishState
+      })
+      .from(pagesTable)
+      .where(
+        inArray(
+          pagesTable.id,
+          entries.map((entry) => entry.id)
+        )
+      )
+    const contentTypes = new Map(doomed.map((row) => [row.id, row.contentType]))
+    // -> Before the rows go, as `deletePage` does, and as one bulk action: a folder's watchers hear
+    //    about their pages, and nobody who asked about every deletion hears about each of them
+    await WIKI.models.notifications.withOrigin('bulk', async () => {
+      for (const row of doomed) {
+        await WIKI.models.notifications.emit('page:delete', {
+          siteId,
+          actorId: actor.id,
+          data: { variant: 'deleted', page: WIKI.models.notifications.pageSnapshot(row) },
+          watchersOf: row.id
+        })
+      }
+    })
+    // -> Out of their sets of translations first, for the same reason `deletePage` does it
+    await this.detachFromLocaleGroups(
+      siteId,
+      entries.map((entry) => entry.id)
+    )
+    await WIKI.db.delete(pagesTable).where(
+      inArray(
+        pagesTable.id,
+        entries.map((entry) => entry.id)
+      )
+    )
+    // -> As for a single page: whatever linked to any of them is now a red link
+    await WIKI.models.pageLinks.refreshLinksTo(siteId, {
+      paths: entries.map((entry) => ({
+        locale: entry.locale,
+        path: entry.folderPath ? `${entry.folderPath}/${entry.fileName}` : entry.fileName
+      })),
+      pageIds: entries.map((entry) => entry.id),
+      aliases: doomed.map((row) => row.alias)
+    })
+
+    // -> One per page, as deleting them one at a time would have sent: a subscriber mirroring the
+    //    wiki has to hear about each page, not about the folder it happened to sit in
+    for (const entry of entries) {
+      const path = entry.folderPath ? `${entry.folderPath}/${entry.fileName}` : entry.fileName
+      const contentType = contentTypes.get(entry.id)
+      if (contentType) {
+        await WIKI.models.storage.removePage({
+          id: entry.id,
+          siteId,
+          actorId: actor.id,
+          locale: entry.locale,
+          path,
+          contentType
+        })
+      }
+      await WIKI.models.hooks.emit('page:delete', {
+        id: entry.id,
+        path,
+        locale: entry.locale,
+        siteId,
+        authorId: actor.id
+      })
+    }
+    invalidateAppShellCache()
+    // -> Any of them may have been a feedback board's front page, which access is resolved against
+    await WIKI.models.feedback.reloadBoardsEverywhere()
+    WIKI.logger.debug(`Deleted ${entries.length} page(s) that went with a deleted folder.`)
+  }
+
+  // == STORAGE ========================
+
+  /**
+   * The file name a page occupies on a target that lays content out by path.
+   *
+   * The name a page and an asset can collide on, and so the thing both of them are checked against
+   * before either is written — see `guardAgainstAssetCollision` here and its opposite number in the
+   * assets model.
+   */
+  storageFileName(fileName: string, contentType: string): string {
+    return `${fileName}.${pageFileExtension(contentType)}`
+  }
+
+  /**
+   * The file name an existing page occupies, or null if there is no such page.
+   */
+  async storageFileNameOf(id: string): Promise<string | null> {
+    const results = await WIKI.db
+      .select({ path: pagesTable.path, contentType: pagesTable.contentType })
+      .from(pagesTable)
+      .where(eq(pagesTable.id, id))
+      .limit(1)
+    const row = results[0]
+    return row ? this.storageFileName(row.path.split('/').at(-1)!, row.contentType) : null
+  }
+
+  /**
+   * Refuse a page whose stored file would land on an asset that is already there.
+   *
+   * The page and the asset have different names as far as the tree is concerned — a page is `readme`
+   * and the asset is `readme.md` — so nothing in the tree stops the two coexisting. They only meet
+   * once the page has to be a file, and by then one of them would be overwriting the other.
+   *
+   * Normally unreachable, because the site's `pageExtensions` keeps assets off these extensions in
+   * the first place. It is the backstop for a site that has removed one from that list, and for
+   * content that predates its being on it.
+   *
+   * @throws `pageNameTakenByAsset` when the name is not free
+   */
+  private async guardAgainstAssetCollision({
+    siteId,
+    locale,
+    parentPath,
+    fileName,
+    contentType
+  }: {
+    siteId: string
+    locale: string
+    parentPath: string
+    fileName: string
+    contentType: string
+  }): Promise<void> {
+    const storedName = this.storageFileName(fileName, contentType)
+    const occupant = await WIKI.models.tree.getEntryAt({
+      siteId,
+      locale,
+      parentPath,
+      fileName: storedName
+    })
+    if (occupant?.type === 'asset') {
+      throw new CustomError(
+        'pageNameTakenByAsset',
+        `A file named ${storedName} already exists here, which is where this page would be stored.`,
+        409
+      )
+    }
+  }
+
+  /**
+   * Refuse a page that would land in a feedback board's folder without being one of its ideas, or a
+   * board that would land on a folder already holding something else — see `feedback.refuseNonIdea`.
+   *
+   * @param path Slash-separated path the page is going to
+   * @throws `feedbackIdeasOnly`
+   */
+  private async guardFeedbackBoards(
+    siteId: string,
+    locale: string,
+    path: string,
+    editor: string
+  ): Promise<void> {
+    WIKI.models.feedback.refuseNonIdea(siteId, locale, {
+      kind: 'page',
+      parentPath: path.split('/').slice(0, -1).join('/'),
+      editor
+    })
+    if (editor === FEEDBACK_EDITOR) {
+      await WIKI.models.feedback.guardBoardFolder(siteId, locale, path)
+    }
+  }
+
+  /*
+    A page always lives in its own row, and none of what follows changes that. What it does is keep a
+    copy of the page on every storage target configured to hold `pages` — the local disk, today —
+    which is a backup of content the database owns rather than a place it has moved to. Nothing here
+    is ever read back: `getPage` goes to the row, as it always has.
+
+    That is why every one of these calls is fired after the database write has succeeded and none of
+    them is allowed to fail the operation; `WIKI.models.storage` swallows and logs a target that could
+    not keep up. A wiki whose backup disk filled up is a wiki with a stale backup, not one that has
+    stopped accepting edits.
+  */
+
+  /**
+   * A page in the shape a storage target takes it.
+   *
+   * @param content The source, which the caller has to hand: it is not on the `Page` a mutation
+   *   returns unless the read asked for it, and re-reading the row to get it back would cost a query
+   *   per save for something the caller just wrote.
+   * @param reason The reason for change the save was given, if any
+   */
+  private toStoragePage(
+    siteId: string,
+    actorId: string | undefined,
+    page: {
+      id: string
+      locale: string
+      path: string
+      title: string
+      description?: string | null
+      editor: string
+      contentType: string
+      tags?: string[]
+      publishState: string
+      createdAt: Date
+      updatedAt: Date
+    },
+    content: string,
+    reason?: string | null
+  ): { ref: StoragePageRef; content: StoragePageContent } {
+    return {
+      ref: {
+        id: page.id,
+        siteId,
+        actorId,
+        ...(reason?.trim() ? { reason: reason.trim() } : {}),
+        locale: page.locale,
+        path: page.path,
+        contentType: page.contentType
+      },
+      content: {
+        title: page.title,
+        description: page.description ?? '',
+        editor: page.editor,
+        tags: page.tags ?? [],
+        // -> A scheduled page is not published yet, whatever its dates say it will be
+        isPublished: page.publishState === 'published',
+        createdAt: page.createdAt,
+        updatedAt: page.updatedAt,
+        content
+      }
+    }
+  }
+
+  /**
+   * Every page of a site, in the shape a storage target takes them.
+   *
+   * What a target's `dump` action walks in order to write copies of content that predates it being
+   * enabled. Reads the source of every page at once, which is what makes this a maintenance action
+   * rather than something to call on a request.
+   */
+  async listForStorage(
+    siteId: string
+  ): Promise<{ ref: StoragePageRef; content: StoragePageContent }[]> {
+    const rows = await WIKI.db
+      .select({
+        id: pagesTable.id,
+        locale: pagesTable.locale,
+        path: pagesTable.path,
+        title: pagesTable.title,
+        description: pagesTable.description,
+        editor: pagesTable.editor,
+        contentType: pagesTable.contentType,
+        tags: pagesTable.tags,
+        publishState: pagesTable.publishState,
+        createdAt: pagesTable.createdAt,
+        updatedAt: pagesTable.updatedAt,
+        content: pagesTable.content
+      })
+      .from(pagesTable)
+      .where(eq(pagesTable.siteId, siteId))
+
+    return rows.map((row) => this.toStoragePage(siteId, undefined, row, row.content ?? ''))
+  }
+
+  /**
+   * Take a page a storage target holds and the wiki does not into the database.
+   *
+   * The direction that makes a target a peer store rather than a write-only backup: pages arrive here
+   * from a folder restored onto the disk, and — once a module exists that can hear about them — from
+   * commits somebody else pushed. What comes back is an ordinary page, because that is the only kind
+   * there is: it lands in `pages`, gets a tree entry and is served from the row like every other.
+   *
+   * A path the wiki already has a page at is left alone rather than overwritten, unless `overwrite`
+   * says the file is to win. Off, this is the safe direction: the wiki's copy is the one an author has
+   * been editing, and reconciling a file that changed on both sides is a merge, which is a target's
+   * business and not this model's. On, the file is taken as the authority — for a restore, where what
+   * is in the folder is what the wiki is supposed to say.
+   *
+   * An overwrite is an ordinary save, not a special path: it records a version like any other, so the
+   * copy it replaced is in the page's history and an administrator who did not mean it can put it
+   * back. Two things it does not take from the file, both because a save anywhere else in this model
+   * does not either — the page's **editor**, so a `.md` file cannot turn a redirection into markdown
+   * by landing on it, and its **path**, since that is what identified it in the first place.
+   *
+   * @param overwrite Replace a page already at this path instead of leaving it alone
+   * @returns The imported page, or null when there is already one at that path and `overwrite` is not
+   *   set
+   */
+  async adoptStoredPage({
+    siteId,
+    locale,
+    path,
+    title,
+    description,
+    editor,
+    tags,
+    isPublished,
+    content,
+    createdAt,
+    updatedAt,
+    authorId,
+    overwrite
+  }: {
+    siteId: string
+    locale: string
+    path: string
+    title: string
+    description?: string
+    editor: string
+    tags?: string[]
+    isPublished?: boolean
+    content: string
+    createdAt?: Date
+    updatedAt?: Date
+    authorId: string
+    overwrite?: boolean
+  }): Promise<Page | null> {
+    // -> A page written before underscores became hyphens is found under its own path, and one written
+    //    since under the path this file would be written as — so that a tree the wiki exported itself
+    //    comes back in onto the pages it came from, rather than beside them
+    const asWritten = normalizePagePath(path)
+    const existing = await WIKI.db
+      .select({ id: pagesTable.id, path: pagesTable.path })
+      .from(pagesTable)
+      .where(
+        and(
+          eq(pagesTable.siteId, siteId),
+          eq(pagesTable.locale, locale),
+          inArray(pagesTable.path, [asWritten, normalizeNewPagePath(path)])
+        )
+      )
+      .orderBy(desc(sql`${pagesTable.path} = ${asWritten}`))
+      .limit(1)
+    if (existing.length > 0 && !overwrite) {
+      return null
+    }
+    const normalized = existing[0]?.path ?? normalizePath(path)
+
+    /*
+      Imported content is rendered with NO script or style permission, whoever ran the import.
+
+      What those two allow is a `<script>` or a `<style>` surviving sanitization, and the file this
+      came out of was not necessarily written by the administrator who pressed the button — the whole
+      point of the feature is content arriving from somewhere else, which for a future git target
+      means commits from whoever can push. Granting the importer's own privileges to it would turn
+      "restore my pages" into stored XSS for every reader. An administrator who does want scripts on
+      an imported page saves it once themselves, deliberately.
+    */
+    const actor = { id: authorId, permissions: [] }
+    // -> The one difference between the two directions, and deliberately the only one: a page that is
+    //    there is *saved*, through the same method an editor saves through, so it gets a history entry
+    //    and a re-render and a mirrored copy without any of that being reimplemented here
+    const change = existing[0]
+      ? await this.updatePage(
+          siteId,
+          existing[0].id,
+          // -> No `render`: the page keeps the HTML it has until the queued render replaces it. Stale
+          //    for a moment is better than blank — and blank for good if that render never lands,
+          //    which is every pull on an instance without the Puppeteer extension.
+          {
+            title,
+            description,
+            content,
+            tags,
+            publishState: isPublished === false ? 'draft' : 'published'
+          } as Partial<PageInput>,
+          actor
+        )
+      : await this.createPage(
+          siteId,
+          {
+            path: normalized,
+            locale,
+            title,
+            description,
+            editor,
+            content,
+            tags,
+            publishState: isPublished === false ? 'draft' : 'published',
+            // -> No stored HTML: the source is all a file carries, and what a reader sees is produced
+            //    from it by the render queue below
+            render: ''
+          } as PageInput,
+          actor
+        )
+    // -> Only if the page went away between the two statements above
+    if (!change) {
+      return null
+    }
+    const page = change.page
+
+    // -> A restore should not report every page as written today. Applied after the fact because the
+    //    two dates are not something an API client may set, only something a file can carry back.
+    if (createdAt || updatedAt) {
+      const dates = {
+        ...(createdAt ? { createdAt } : {}),
+        ...(updatedAt ? { updatedAt } : {})
+      }
+      await WIKI.db.update(pagesTable).set(dates).where(eq(pagesTable.id, page.id))
+      // -> The tree row keeps its own pair, and those are the ones a folder listing and the file
+      //    manager show. Left alone they said the whole of an imported wiki was created today.
+      await WIKI.db.update(treeTable).set(dates).where(eq(treeTable.id, page.id))
+      // -> Writing the page already put a copy on every target holding pages, stamped with the dates
+      //    it had for the moment it existed with the wrong ones
+      const restored = this.toStoragePage(
+        siteId,
+        actor.id,
+        { ...page, createdAt: createdAt ?? page.createdAt, updatedAt: updatedAt ?? page.updatedAt },
+        content
+      )
+      await WIKI.models.storage.mirrorPage(restored.ref, restored.content)
+    }
+
+    // -> A new page has no HTML until something renders it, and an overwritten one still has the HTML
+    //    of its previous content. Rendering takes a headless browser this instance may not have. Best
+    //    effort: the page is in the wiki either way, and a re-render can be asked for once one is.
+    try {
+      await this.queueRerender(siteId, page.id, actor)
+    } catch (err: any) {
+      WIKI.logger.warn(`Could not queue a render for the imported page ${normalized} [ SKIPPED ]`)
+      WIKI.logger.warn(err.message)
+    }
+
+    return page
+  }
+
+  /**
+   * Ask for a page to be rendered again from its source, without going through an editor.
+   *
+   * Needed when a stored render has gone stale — the markdown config changed, or the renderer itself
+   * did — and there is nobody with the page open to re-save it. The rendering goes through the very
+   * same frontend pipeline, driven in a headless browser, so the result is what the editor would have
+   * produced; because that costs a browser it is queued rather than done here, one page at a time
+   * across the whole instance. See `models/rendering.ts`.
+   *
+   * What the render may carry is settled here, while there is still an actor to ask, and travels with
+   * the queued request.
+   *
+   * @returns False when there is no such page
+   * @throws `renderUnsupportedEditor` for a page the server cannot render, or
+   *         `renderPuppeteerMissing` when nothing here could drain the queue
+   */
+  async queueRerender(siteId: string, id: string, actor: PageActor): Promise<boolean> {
+    const page = await this.getPage({ siteId, id })
+    if (!page) {
+      return false
+    }
+    await WIKI.models.rendering.ensureCanRender(page.editor)
+
+    await WIKI.models.rendering.queuePage({
+      siteId,
+      pageId: page.id,
+      permissions: {
+        scripts: hasPermission(actor, 'write:scripts'),
+        styles: hasPermission(actor, 'write:styles')
+      },
+      requestedById: actor.id
+    })
+    return true
+  }
+
+  /**
+   * Store HTML the renderer produced for a page, and re-index it.
+   *
+   * The counterpart to `queueRerender`: the drain calls this once the browser has been through the
+   * content. Post-processed like any other render — it came from a browser either way — against the
+   * permissions the person who asked for it had.
+   */
+  async storeRender(
+    siteId: string,
+    id: string,
+    html: string,
+    permissions: RenderPermissions
+  ): Promise<void> {
+    const { render, toc, text, links } = await WIKI.models.rendering.postProcess(
+      siteId,
+      html,
+      permissions
+    )
+
+    /*
+      `updatedAt` is deliberately not touched. It says when the page last CHANGED, and a render does
+      not change it: the same source went through the pipeline again, because the markdown config
+      moved or because the page arrived without HTML. Bumping it here re-dated every page an import
+      brought in — the render lands seconds later and overwrites the date the package carried — and
+      told the sitemap a page had been modified when nothing about it had. For a save it made no
+      difference either way, since `updatePage` has already set it a moment earlier.
+    */
+    const updated = await WIKI.db
+      .update(pagesTable)
+      .set({ render, toc, searchContent: text })
+      .where(and(eq(pagesTable.id, id), eq(pagesTable.siteId, siteId)))
+      .returning({ locale: pagesTable.locale })
+
+    // -> Nothing was updated when the page went while it sat in the queue
+    if (updated[0]) {
+      await WIKI.models.search.indexPage(id, updated[0].locale)
+      // -> An imported page is saved with no render at all and gets one from here, so this is where
+      //    its links first appear
+      await WIKI.models.pageLinks.refreshById(siteId, id, links)
+      // -> This is the column the injected copy of a page IS, so a re-render changes it
+      invalidateAppShellCache()
+    }
+  }
+
+  /**
+   * Resolve a page alias to its path, or null if nothing claims that alias.
+   */
+  async getPathFromAlias(
+    siteId: string,
+    alias: string
+  ): Promise<{ id: string; path: string; locale: string; tags: string[] } | null> {
+    // -> The locale and the tags come back alongside the path because the caller has to decide
+    //    whether this reader may know the page exists, and a rule reads all three
+    const results = await WIKI.db
+      .select({
+        id: pagesTable.id,
+        path: pagesTable.path,
+        locale: pagesTable.locale,
+        tags: pagesTable.tags
+      })
+      .from(pagesTable)
+      .where(and(eq(pagesTable.siteId, siteId), eq(pagesTable.alias, alias)))
+      .limit(1)
+    return results[0] ?? null
+  }
+
+  /**
+   * Where the page with this id lives, for the short link that names it.
+   *
+   * The id half of `getPathFromAlias`, and it answers with the same four fields for the same reason:
+   * the caller has to decide whether this reader may be told the page exists, and a page rule reads
+   * the path, the locale and the tags to say so.
+   *
+   * An id is the one name for a page that never changes — an alias can be retyped and a path can be
+   * moved — which is what makes it worth a link of its own.
+   */
+  async getPathFromId(
+    siteId: string,
+    id: string
+  ): Promise<{ id: string; path: string; locale: string; tags: string[] } | null> {
+    const results = await WIKI.db
+      .select({
+        id: pagesTable.id,
+        path: pagesTable.path,
+        locale: pagesTable.locale,
+        tags: pagesTable.tags
+      })
+      .from(pagesTable)
+      .where(and(eq(pagesTable.siteId, siteId), eq(pagesTable.id, id)))
+      .limit(1)
+    return results[0] ?? null
+  }
+
+  /**
+   * The locale a page belongs to when the request does not say.
+   */
+  private defaultLocale(siteId: string): string {
+    return WIKI.sites[siteId]?.config?.locales?.primary ?? 'en'
+  }
+
+  /**
+   * Check an alias is well formed and unclaimed, and normalize an empty one to null.
+   */
+  private async validateAlias(
+    siteId: string,
+    alias: string | undefined,
+    exceptPageId?: string
+  ): Promise<string | null> {
+    const value = (alias ?? '').trim()
+    if (!value) {
+      return null
+    }
+    if (!reAlias.test(value)) {
+      throw new CustomError(
+        'pageInvalidAlias',
+        'An alias may only contain alphanumeric, hyphen and underscore characters.'
+      )
+    }
+    const conditions = [eq(pagesTable.siteId, siteId), eq(pagesTable.alias, value)]
+    if (exceptPageId) {
+      conditions.push(ne(pagesTable.id, exceptPageId))
+    }
+    const duplicate = await WIKI.db
+      .select({ id: pagesTable.id })
+      .from(pagesTable)
+      .where(and(...conditions))
+      .limit(1)
+    if (duplicate.length > 0) {
+      throw new CustomError('pageDuplicateAlias', 'Another page already uses this alias.', 409)
+    }
+    return value
+  }
+
+  /**
+   * Fold the flat display options back into the `config` blob they are stored in.
+   */
+  private buildConfig(
+    input: Partial<PageInput>,
+    siteId: string,
+    existing: Record<string, any> = {}
+  ): Record<string, any> {
+    const defaults = WIKI.sites[siteId]?.config?.defaults ?? {}
+    return {
+      allowBacklinks: input.allowBacklinks ?? existing.allowBacklinks ?? true,
+      allowComments: input.allowComments ?? existing.allowComments ?? true,
+      allowContributions: input.allowContributions ?? existing.allowContributions ?? true,
+      allowGlossaryLinks: input.allowGlossaryLinks ?? existing.allowGlossaryLinks ?? true,
+      allowRatings: input.allowRatings ?? existing.allowRatings ?? true,
+      iconColor: input.iconColor ?? existing.iconColor ?? '',
+      showLastEditedBy: input.showLastEditedBy ?? existing.showLastEditedBy ?? true,
+      showSidebar: input.showSidebar ?? existing.showSidebar ?? true,
+      showTags: input.showTags ?? existing.showTags ?? true,
+      showToc: input.showToc ?? existing.showToc ?? true,
+      tocDepth: input.tocDepth ?? existing.tocDepth ?? defaults.tocDepth ?? { min: 1, max: 2 }
+    }
+  }
+
+  /**
+   * Same for the per-page scripts — which only an author holding the matching permission may set.
+   *
+   * Silently dropped rather than refused, as with the rest of the sanitizing: an author pasting a
+   * page template that carries scripts should get their page, minus the scripts.
+   */
+  private buildScripts(
+    input: Partial<PageInput>,
+    actor: PageActor,
+    existing: Record<string, any> = {}
+  ): Record<string, any> {
+    const mayScript = hasPermission(actor, 'write:scripts')
+    const mayStyle = hasPermission(actor, 'write:styles')
+    return {
+      jsLoad: mayScript ? (input.scriptJsLoad ?? existing.jsLoad ?? '') : (existing.jsLoad ?? ''),
+      jsUnload: mayScript
+        ? (input.scriptJsUnload ?? existing.jsUnload ?? '')
+        : (existing.jsUnload ?? ''),
+      css: mayStyle ? (input.scriptCss ?? existing.css ?? '') : (existing.css ?? '')
+    }
+  }
+
+  /**
+   * What a page's tree entry carries about it, so a folder listing needs no join.
+   *
+   * Public so that the page problem scan can tell a stale copy from a current one by the same rule
+   * that writes it.
+   */
+  treeMeta(page: any): Record<string, any> {
+    return {
+      authorId: page.authorId,
+      contentType: page.contentType,
+      creatorId: page.creatorId ?? page.authorId,
+      description: page.description ?? '',
+      editor: page.editor,
+      isBrowsable: page.isBrowsable,
+      publishState: page.publishState,
+      publishEndDate: page.publishEndDate ?? null,
+      publishStartDate: page.publishStartDate ?? null
+    }
+  }
+}
+
+export const pages = new Pages()

@@ -1,0 +1,660 @@
+import fs from 'node:fs/promises'
+import path from 'node:path'
+import { load } from 'js-yaml'
+import { asc, eq } from 'drizzle-orm'
+import { isSensitiveMask, parseModuleProps } from '../helpers/common.ts'
+import { authentication as authenticationTable, groups as groupsTable } from '../db/schema.ts'
+import type { ModuleProp } from '../helpers/common.ts'
+import type { SystemIds } from './types.ts'
+
+/** An authentication module, as declared by its `definition.yml`. */
+export interface AuthModule {
+  key: string
+  title: string
+  description: string
+  logo?: string
+  icon?: string
+  color?: string
+  isAvailable: boolean
+  useForm: boolean
+  /**
+   * Whether the provider answers by having the browser POST a form to the callback rather than by
+   * sending it back with a query string. SAML does; nothing else here does.
+   *
+   * The framework reads it in one place — `api/authentication.ts` gives such a strategy's login flow
+   * a cookie a cross-site POST will actually carry.
+   */
+  postCallback?: boolean
+  usernameType: string
+  props: Record<string, ModuleProp>
+  refs?: Record<string, { title?: string; hint?: string; icon?: string; value: string }>
+}
+
+/**
+ * What a redirect-based module is handed to build its authorization URL.
+ *
+ * The framework owns these values rather than each module inventing them: they are generated once per
+ * login, kept on the session, and checked when the provider comes back — which is what makes the
+ * answer belong to the browser that started the flow. A module that has no use for `nonce` or
+ * `codeVerifier` (a plain OAuth2 provider) simply ignores them.
+ */
+export interface AuthFlow {
+  /** Where the provider sends the browser back. Registered with the provider by the administrator. */
+  redirectUri: string
+  state: string
+  nonce: string
+  /** PKCE verifier, whose challenge goes on the authorization request. */
+  codeVerifier: string
+}
+
+/**
+ * Where a redirect login sends the browser to sign in.
+ *
+ * A URL for every protocol that has one, which is nearly all of them. SAML's other request binding
+ * has no URL to give: the AuthnRequest is a form the browser submits to the identity provider, so a
+ * module using it answers with the page carrying that form and the route sends it as the response.
+ */
+export type AuthRequestTarget = string | { html: string }
+
+/** The same flow, once the provider has come back with an answer. */
+export interface AuthFlowCallback extends AuthFlow {
+  /** The callback URL as it arrived, query string included — what an OIDC library validates against. */
+  currentUrl: string
+  /** The authorization code, for a module that reads it directly rather than through a library. */
+  code?: string
+  /**
+   * The form the provider had the browser post, for a module whose protocol answers that way — a
+   * SAML assertion is far too big for a query string. Absent on the query-string bindings.
+   */
+  body?: Record<string, string>
+}
+
+/**
+ * What a module is handed to build the URL that ends the session at its provider.
+ */
+export interface AuthLogout {
+  /**
+   * Where the wiki sends the browser after a logout when no provider is involved: the Logout Redirect
+   * of the user's groups or of the site, made absolute. A module whose protocol lets it may ask the
+   * provider to send the browser on there once its own session has ended.
+   */
+  returnTo: string
+}
+
+/**
+ * Who signed in, as a module reports them.
+ *
+ * `id` is the provider's own identifier for the account and never changes; `email` is what the user is
+ * matched or created by here. A module must not return an address it has not established belongs to
+ * the person — an unverified one is how somebody signs in as somebody else.
+ */
+export interface ProviderProfile {
+  id: string
+  email: string
+  name: string
+  /**
+   * Absolute URL of the person's picture at the provider, when it offers one and the module is
+   * configured to take it. Fetched and stored as the account's avatar, once per URL.
+   */
+  picture?: string
+  /**
+   * The picture itself, for a provider that holds the bytes rather than a link to them — a directory
+   * with a `jpegPhoto` attribute. Stored as the avatar, once per distinct image. Takes precedence
+   * over `picture`, since a module offering both has already read the one it means.
+   */
+  pictureData?: Buffer
+  /**
+   * The groups the provider says this person is in, by name.
+   *
+   * Absent when the module does not map groups at all, which is not the same as an empty array —
+   * that is the provider naming none, and with `groupsExclusive` set it costs the user every
+   * mapped membership they had.
+   */
+  groups?: string[]
+  /**
+   * Whether `groups` is the whole truth about this person's membership. Set, a group the claim does
+   * not name is taken away again; unset, the claim only ever adds.
+   */
+  groupsExclusive?: boolean
+  /**
+   * Profile fields the provider is the authority for, written over the account's own on every login.
+   *
+   * A key is present only when the module is configured to map it AND the provider answered with a
+   * value — an empty string included, which clears the field. A key that is absent leaves what the
+   * person set here alone, which is the default: these are theirs to fill in unless an administrator
+   * has said otherwise. Values are trimmed and held to the profile form's length on the way in, so a
+   * module passes on what the provider said.
+   */
+  meta?: Partial<Record<ProviderProfileMetaKey, string>>
+}
+
+/** The `users.meta` keys a provider may fill in. */
+export const PROVIDER_PROFILE_META_KEYS = ['location', 'jobTitle', 'pronouns'] as const
+export type ProviderProfileMetaKey = (typeof PROVIDER_PROFILE_META_KEYS)[number]
+
+/** A configured instance of an authentication module. */
+export interface AuthStrategy {
+  id: string
+  module: string
+  displayName: string
+  isEnabled: boolean
+  registration: boolean
+  allowedEmailRegex: string
+  autoEnrollGroups: string[]
+  config: Record<string, any>
+}
+
+/** The module every wiki ships with. */
+const LOCAL_MODULE = 'local'
+
+/**
+ * Whether this is the strategy the instance was seeded with.
+ *
+ * Not merely "a local strategy": every account's password is stored under this exact strategy ID
+ * (see `models/users.ts`), so it is the one that cannot be disabled or deleted. A second instance of
+ * the local module holds no credentials and is as disposable as any other strategy.
+ */
+function isBuiltInLocal(id: string): boolean {
+  return id === WIKI.data.systemIds.localAuthId
+}
+
+/**
+ * The instance-wide authentication settings, i.e. the half of the `auth` settings blob a person
+ * sets. The rest of that blob — the session secret, the signing keypair, the seeded IDs — is the
+ * installation's own and is never read or written through here.
+ */
+export const AUTH_CONFIG_FIELDS = [
+  'allowPasskeys',
+  'allowProfileEditing',
+  'allowPersonalTokens'
+] as const
+
+/**
+ * Authentication model
+ */
+class Authentication {
+  /**
+   * The instance-wide authentication settings, as the admin area expects them
+   */
+  getConfig(): Record<string, any> {
+    const auth = WIKI.config.auth ?? {}
+    const config: Record<string, any> = {}
+    for (const field of AUTH_CONFIG_FIELDS) {
+      config[field] = auth[field] !== false
+    }
+    return config
+  }
+
+  /**
+   * Keep only the fields this model owns, dropping anything else a client sends.
+   *
+   * Which is what keeps the secrets in the same blob out of reach: `certs` and `secret` are not
+   * fields of this configuration, so no route that goes through here can be talked into writing one.
+   */
+  pickFields(body: Record<string, any>): Record<string, any> {
+    const patch: Record<string, any> = {}
+    for (const field of AUTH_CONFIG_FIELDS) {
+      if (body[field] !== undefined) {
+        patch[field] = Boolean(body[field])
+      }
+    }
+    return patch
+  }
+
+  /**
+   * Save a patch of the instance-wide settings.
+   *
+   * @returns Whether the settings were saved
+   */
+  async updateConfig(patch: Record<string, any>): Promise<boolean> {
+    const previousAuth = WIKI.config.auth
+    WIKI.config.auth = { ...previousAuth, ...patch }
+
+    if (!(await WIKI.configSvc.saveToDb(['auth']))) {
+      WIKI.config.auth = previousAuth
+      return false
+    }
+    return true
+  }
+
+  /**
+   * Whether a passkey may be registered or signed in with.
+   *
+   * Turned off, the passkeys already registered are left where they are rather than deleted — this
+   * is a setting an administrator can turn back on, and a wiki that forgot every passkey in the
+   * meantime would have made that a one-way door.
+   */
+  arePasskeysAllowed(): boolean {
+    return WIKI.config.auth?.allowPasskeys !== false
+  }
+
+  /**
+   * Whether a user may edit their own profile.
+   *
+   * Instance-wide rather than per site: the profile is one record on one account, and an account
+   * that reaches two sites of an instance cannot have it editable on one of them and not the other.
+   */
+  isProfileEditingAllowed(): boolean {
+    return WIKI.config.auth?.allowProfileEditing !== false
+  }
+
+  /**
+   * Whether personal access tokens may be created and used.
+   *
+   * Both, not only created: an administrator turning this off wants the tokens already out there to
+   * stop working, and the alternative way to get that — regenerating the certificates — would take
+   * every system API key down with them. The tokens are kept, so turning it back on restores them.
+   */
+  arePersonalTokensAllowed(): boolean {
+    return WIKI.config.auth?.allowPersonalTokens !== false
+  }
+
+  async getStrategy(module: string) {
+    return WIKI.db.select().from(authenticationTable).where(eq(authenticationTable.module, module))
+  }
+
+  async getStrategies({ enabledOnly = false }: { enabledOnly?: boolean } = {}) {
+    return WIKI.db
+      .select()
+      .from(authenticationTable)
+      .where(enabledOnly ? eq(authenticationTable.isEnabled, true) : undefined)
+  }
+
+  /**
+   * The authentication modules found on disk, in the order the admin area lists them
+   */
+  getModules(): AuthModule[] {
+    return [...((WIKI.data.authentication ?? []) as AuthModule[])].sort((a, b) =>
+      a.key === LOCAL_MODULE ? -1 : b.key === LOCAL_MODULE ? 1 : a.title.localeCompare(b.title)
+    )
+  }
+
+  /**
+   * A single module definition, or null when nothing on disk declares that key
+   */
+  getModule(key: string): AuthModule | null {
+    return this.getModules().find((m) => m.key === key) ?? null
+  }
+
+  /**
+   * Every configured strategy, the built-in local one first, then alphabetically by display name.
+   *
+   * Config values are completed from the module's declared defaults, so a prop added to a module
+   * after a strategy was configured is returned with its default rather than as a missing key.
+   *
+   * **These are the real values, client secrets included** — they are what a module is handed when it
+   * authenticates somebody. A route answering with them owes the client `maskSensitiveProps` first;
+   * see `api/authentication.ts`.
+   */
+  async getActiveStrategies(): Promise<AuthStrategy[]> {
+    const strategies = await WIKI.db
+      .select()
+      .from(authenticationTable)
+      .orderBy(asc(authenticationTable.displayName))
+    return strategies
+      .map((stg) => ({
+        ...stg,
+        autoEnrollGroups: stg.autoEnrollGroups ?? [],
+        config: this.buildConfig(stg.module, {}, stg.config as Record<string, any>)
+      }))
+      .sort((a, b) => (isBuiltInLocal(a.id) ? -1 : isBuiltInLocal(b.id) ? 1 : 0))
+  }
+
+  /**
+   * A single configured strategy, or null if there is no such strategy
+   */
+  async getStrategyById(id: string): Promise<AuthStrategy | null> {
+    return (await this.getActiveStrategies()).find((stg) => stg.id === id) ?? null
+  }
+
+  /**
+   * A strategy as it is offered on one site, or null when it is not offered there at all.
+   *
+   * The self-service flows — registering, and asking for a password reset — resolve their strategy
+   * through this rather than merely checking that the ID names one, because otherwise a strategy an
+   * administrator has taken off a site would still create accounts on it for anyone who kept the ID.
+   *
+   * Being on the site is what is asked, not being *visible* on it: `isVisible` decides whether the
+   * login screen offers a strategy, and a wiki that hides its local login while still allowing it
+   * must not thereby lose password resets. That matches `login()`, which does not consult visibility
+   * either — and which resolves through `WIKI.auth.strategies` rather than through here, because it
+   * needs the live module instance instead of the stored row.
+   */
+  async getSiteStrategy(siteId: string, strategyId: string): Promise<AuthStrategy | null> {
+    const site = await WIKI.models.sites.getSiteById({ id: siteId })
+    if (!site) {
+      return null
+    }
+    const strategy = await this.getStrategyById(strategyId)
+    if (!strategy?.isEnabled) {
+      return null
+    }
+    // -> A site created before it had strategies configured has no list at all
+    const configured = (site.config.authStrategies ?? []) as { id: string }[]
+    return configured.some((s) => s.id === strategyId) ? strategy : null
+  }
+
+  /**
+   * Merge incoming config values onto the ones already stored, keeping only what the module declares.
+   *
+   * Read-only props are never taken from the client: they are declarations of something the server
+   * does not support changing, so the stored value (or the module default) always wins.
+   *
+   * A sensitive prop that comes back as the mask is left alone for the same reason — that is the
+   * value the client was handed in place of the secret, so sending it back says "unchanged" and
+   * storing it would overwrite a client secret with a row of dots. An empty string is not the mask
+   * and does clear it. On a *create* there is nothing to keep, so a masked value stays unset, which
+   * is the right answer for a form that was never given a secret to send.
+   */
+  buildConfig(
+    moduleKey: string,
+    incoming: Record<string, any> = {},
+    existing: Record<string, any> = {}
+  ): Record<string, any> {
+    const props = this.getModule(moduleKey)?.props ?? {}
+    const config: Record<string, any> = {}
+    for (const [key, prop] of Object.entries(props)) {
+      const current = existing[key] !== undefined ? existing[key] : prop.default
+      const keep =
+        prop.readOnly || incoming[key] === undefined || isSensitiveMask(prop, incoming[key])
+      config[key] = keep ? current : incoming[key]
+    }
+    return config
+  }
+
+  /**
+   * Check incoming config values against what the module declares.
+   *
+   * The props are a runtime declaration read from a YAML file, so no JSON Schema can cover them —
+   * without this, a boolean prop would happily store the string `"maybe"`.
+   *
+   * @returns The reason it is invalid, or null when it is fine
+   */
+  validateConfig(moduleKey: string, incoming: Record<string, any> = {}): string | null {
+    const props = this.getModule(moduleKey)?.props ?? {}
+    for (const [key, value] of Object.entries(incoming)) {
+      const prop = props[key]
+      // -> Unknown keys are dropped by buildConfig rather than refused: a module losing a prop must
+      //    not make the admin area unable to save, and the mask is the value a client is given for a
+      //    secret rather than one it is setting — `buildConfig` keeps what is stored for both
+      if (!prop || prop.readOnly || value === undefined || isSensitiveMask(prop, value)) {
+        continue
+      }
+      if (prop.enum) {
+        // -> Enum entries are declared as `value` or `value|label`
+        const allowed = prop.enum.map((entry) => entry.split('|')[0])
+        if (!allowed.includes(`${value}`)) {
+          return `"${value}" is not a valid value for ${prop.title}.`
+        }
+        continue
+      }
+      switch (prop.type) {
+        case 'boolean':
+          if (typeof value !== 'boolean') {
+            return `${prop.title} must be true or false.`
+          }
+          break
+        case 'number':
+          if (typeof value !== 'number' || !Number.isFinite(value)) {
+            return `${prop.title} must be a number.`
+          }
+          break
+        default:
+          if (typeof value !== 'string') {
+            return `${prop.title} must be a string.`
+          }
+      }
+    }
+    return null
+  }
+
+  /**
+   * Check the fields shared by every strategy, whichever module it uses.
+   *
+   * @param strategy The values as they will end up stored, i.e. already merged with the current ones
+   * @returns The reason it is invalid, or null when it is fine
+   */
+  async validateStrategy(strategy: {
+    /** Omitted when the strategy does not exist yet, i.e. on create. */
+    id?: string
+    module: string
+    displayName?: string
+    isEnabled?: boolean
+    allowedEmailRegex?: string
+    autoEnrollGroups?: string[]
+  }): Promise<string | null> {
+    if (strategy.displayName !== undefined && strategy.displayName.trim().length < 1) {
+      return 'The display name cannot be empty.'
+    }
+    if (strategy.id && isBuiltInLocal(strategy.id) && strategy.isEnabled === false) {
+      return 'The built-in local strategy cannot be disabled, as it would leave no way to log in.'
+    }
+    if (strategy.allowedEmailRegex) {
+      try {
+        new RegExp(strategy.allowedEmailRegex)
+      } catch (err: any) {
+        return `The allowed email pattern is not a valid regular expression: ${err.message}`
+      }
+    }
+    if (strategy.autoEnrollGroups && strategy.autoEnrollGroups.length > 0) {
+      if (strategy.autoEnrollGroups.includes(WIKI.data.systemIds.guestsGroupId)) {
+        return 'The guests group cannot be used for auto-enrollment.'
+      }
+      const existing = await WIKI.db.select({ id: groupsTable.id }).from(groupsTable)
+      const existingIds = existing.map((g) => g.id)
+      const unknown = strategy.autoEnrollGroups.find((id) => !existingIds.includes(id))
+      if (unknown) {
+        return `Group ${unknown} does not exist.`
+      }
+    }
+    return null
+  }
+
+  /**
+   * Configure a new instance of a module
+   *
+   * @returns The new strategy's ID
+   */
+  async createStrategy(values: {
+    module: string
+    displayName?: string
+    isEnabled?: boolean
+    registration?: boolean
+    allowedEmailRegex?: string
+    autoEnrollGroups?: string[]
+    config?: Record<string, any>
+  }): Promise<string> {
+    const mod = this.getModule(values.module)!
+    const result = await WIKI.db
+      .insert(authenticationTable)
+      .values({
+        module: values.module,
+        displayName: values.displayName?.trim() || mod.title,
+        isEnabled: values.isEnabled ?? true,
+        registration: values.registration ?? false,
+        allowedEmailRegex: values.allowedEmailRegex ?? '',
+        autoEnrollGroups: values.autoEnrollGroups ?? [],
+        config: this.buildConfig(values.module, values.config)
+      })
+      .returning({ id: authenticationTable.id })
+
+    await this.activateStrategies()
+    return result[0].id
+  }
+
+  /**
+   * Update a configured strategy.
+   *
+   * The strategies are reloaded afterwards, so a config change takes effect on the next login rather
+   * than on the next restart.
+   *
+   * @returns Whether a strategy was updated
+   */
+  async updateStrategy(
+    id: string,
+    patch: {
+      displayName?: string
+      isEnabled?: boolean
+      registration?: boolean
+      allowedEmailRegex?: string
+      autoEnrollGroups?: string[]
+      config?: Record<string, any>
+    }
+  ): Promise<boolean> {
+    const current = await this.getStrategyById(id)
+    if (!current) {
+      return false
+    }
+
+    const values: Partial<typeof authenticationTable.$inferInsert> = {}
+    if (patch.displayName !== undefined) {
+      values.displayName = patch.displayName.trim()
+    }
+    if (patch.isEnabled !== undefined) {
+      values.isEnabled = patch.isEnabled
+    }
+    if (patch.registration !== undefined) {
+      values.registration = patch.registration
+    }
+    if (patch.allowedEmailRegex !== undefined) {
+      values.allowedEmailRegex = patch.allowedEmailRegex
+    }
+    if (patch.autoEnrollGroups !== undefined) {
+      values.autoEnrollGroups = patch.autoEnrollGroups
+    }
+    if (patch.config !== undefined) {
+      values.config = this.buildConfig(current.module, patch.config, current.config)
+    }
+    if (Object.keys(values).length < 1) {
+      return false
+    }
+
+    const result = await WIKI.db
+      .update(authenticationTable)
+      .set(values)
+      .where(eq(authenticationTable.id, id))
+    if ((result.rowCount ?? 0) < 1) {
+      return false
+    }
+
+    await this.activateStrategies()
+    return true
+  }
+
+  /**
+   * Delete a configured strategy, and stop every site from offering it.
+   *
+   * Users whose only credentials belong to this strategy lose their way in, which is why the built-in
+   * local strategy — the one every account is seeded against — cannot be deleted.
+   *
+   * @returns Whether a strategy was deleted
+   */
+  async deleteStrategy(id: string): Promise<boolean> {
+    const result = await WIKI.db.delete(authenticationTable).where(eq(authenticationTable.id, id))
+    if ((result.rowCount ?? 0) < 1) {
+      return false
+    }
+
+    // -> Sites keep their own ordered list of strategy IDs, which would otherwise keep a dangling one
+    for (const site of await WIKI.models.sites.getAllSites()) {
+      const configured = ((site.config as Record<string, any>)?.authStrategies ?? []) as Array<{
+        id: string
+      }>
+      if (configured.some((s) => s.id === id)) {
+        await WIKI.models.sites.updateSite(site.id, {
+          config: { authStrategies: configured.filter((s) => s.id !== id) }
+        })
+      }
+    }
+
+    await this.activateStrategies()
+    return true
+  }
+
+  async refreshStrategiesFromDisk(): Promise<void> {
+    try {
+      // -> Fetch definitions from disk
+      const authenticationDirs = await fs.readdir(
+        path.join(WIKI.SERVERPATH, 'modules/authentication')
+      )
+      WIKI.data.authentication = []
+      for (const dir of authenticationDirs) {
+        const def = await fs.readFile(
+          path.join(WIKI.SERVERPATH, 'modules/authentication', dir, 'definition.yml'),
+          'utf8'
+        )
+        const defParsed = load(def) as Record<string, any>
+        if (!defParsed.isAvailable) {
+          continue
+        }
+        defParsed.key = dir
+        defParsed.props = parseModuleProps(defParsed.props)
+        WIKI.data.authentication.push(defParsed)
+        WIKI.logger.debug(`Loaded authentication module definition ${dir} [ OK ]`)
+      }
+
+      WIKI.logger.info(
+        `Loaded ${WIKI.data.authentication.length} authentication module definitions [ OK ]`
+      )
+    } catch (err: any) {
+      WIKI.logger.error('Failed to scan or load authentication module definitions [ FAILED ]')
+      WIKI.logger.error(err)
+    }
+  }
+
+  async activateStrategies(): Promise<void> {
+    WIKI.logger.info('Activating authentication strategies...')
+
+    // Unload any active strategies
+    try {
+      for (const strKey in WIKI.auth.strategies) {
+        const strategy = WIKI.auth.strategies[strKey] as any
+        if (typeof strategy.destroy === 'function') {
+          await strategy.destroy()
+        }
+      }
+    } catch (err: any) {
+      WIKI.logger.warn(`Failed to unload active strategies [ FAILED ]`)
+      WIKI.logger.warn(err)
+    }
+    WIKI.auth.strategies = {}
+
+    // Load enabled strategies
+    const enabledStrategies = await this.getStrategies({ enabledOnly: true })
+    for (const stg of enabledStrategies) {
+      try {
+        const StrategyModule = (
+          await import(`../modules/authentication/${stg.module}/authentication.ts`)
+        ).default
+        const strategy = new StrategyModule(stg.id, stg.config)
+        WIKI.auth.strategies[stg.id] = strategy
+        strategy.module = stg.module
+        if (typeof strategy.init === 'function') {
+          await strategy.init()
+        }
+
+        WIKI.logger.info(`Enabled authentication strategy ${stg.displayName} [ OK ]`)
+      } catch (err: any) {
+        WIKI.logger.error(
+          `Failed to enable authentication strategy ${stg.displayName} (${stg.id}) [ FAILED ]`
+        )
+        WIKI.logger.error(err)
+      }
+    }
+  }
+
+  async init(ids: SystemIds): Promise<void> {
+    await WIKI.db.insert(authenticationTable).values({
+      id: ids.authModuleId,
+      module: 'local',
+      isEnabled: true,
+      displayName: 'Local Authentication',
+      config: {
+        emailValidation: true,
+        enforceTfa: false
+      }
+    })
+  }
+}
+
+export const authentication = new Authentication()

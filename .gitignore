@@ -14,20 +14,15 @@ npm/node_modules
 .npm
 .node_repl_history
 npm-debug.log*
-.yarn
+/.yarn
+/.pnpm-store
 
 # Generated assets
 /assets
-server/views/master.pug
-server/views/legacy/master.pug
-server/views/setup.pug
-
-# Webpack
-.webpack-cache
-.fusebox
 
 # Config Files
 /config.yml
+/localazy.keys.json
 
 # Data directories
 /repo
@@ -35,6 +30,7 @@ server/views/setup.pug
 /uploads
 /content
 /temp
+/tmp
 *.sqlite
 
 # IDE exclude
@@ -46,4 +42,8 @@ test-results/
 .scannerwork
 
 # Localization Resources
-/server/locales/**/*.yml
+/server/locales/*.json
+!/server/locales/en.json
+
+cloudflared.deb
+/.claude

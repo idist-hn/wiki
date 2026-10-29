@@ -1,0 +1,604 @@
+<template>
+  <!--
+    `flex flex-col` in place of the `column` this carried: that was Quasar's flex helper and nothing
+    defines it any more, so the rail was a plain block. Which is why `items-stretch` never stretched
+    the buttons to its width, and why `<w-space />` -- a `flex-grow: 1` spacer -- could not push the
+    last group to the bottom.
+  -->
+  <!--
+    Page Properties keeps the rail's full square; every other button is 48px. The primary action for
+    the page reads as the largest target, and the rest sit quieter beneath it.
+  -->
+  <div
+    class="page-actions flex flex-col items-stretch order-last"
+    :class="editorStore.isActive ? `is-editor` : ``">
+    <template v-if="userStore.can(`write:pages`)">
+      <!--
+        Off for a redirection: the panel is contents, tags, ratings, comments and scripts, all of them
+        about a page somebody reads. Disabled rather than hidden, because it is the rail's primary
+        action and the square it occupies is what the rest of the buttons are arranged under.
+      -->
+      <w-btn
+        class="aspect-square"
+        flat
+        square
+        icon="la:pen-nib"
+        :color="editorStore.isActive ? `white` : `deep-orange-9`"
+        :disable="isRedirect"
+        aria-label="Page Properties"
+        @click="togglePageProperties">
+        <w-tooltip anchor="center left" self="center right">Page Properties</w-tooltip>
+      </w-btn>
+      <w-btn
+        class="h-12"
+        v-if="flagsStore.experimental"
+        flat
+        square
+        icon="la:project-diagram"
+        :color="editorStore.isActive ? `white` : `deep-orange-9`"
+        aria-label="Page Data"
+        @click="togglePageData"
+        disable>
+        <w-tooltip anchor="center left" self="center right">Page Data</w-tooltip>
+      </w-btn>
+      <!-- -> Nothing can be pasted or dropped onto a redirection: it is a form, not a document -->
+      <w-btn
+        class="h-12"
+        v-if="editorStore.isActive && !isRedirect"
+        flat
+        square
+        color="white"
+        :text-color="hasPendingAssets ? `white` : `deep-orange-3`"
+        aria-label="Pending Asset Uploads">
+        <!-- Outside the icon for the same reason as the review badge above -->
+        <w-icon name="mdi:image-sync-outline" />
+        <w-badge
+          class="page-actions-pending-badge"
+          v-if="hasPendingAssets"
+          color="white"
+          text-color="orange-9"
+          rounded
+          floating>
+          <strong>{{ editorStore.pendingAssets.length * 1 }}</strong>
+        </w-badge>
+        <w-tooltip anchor="center left" self="center right">Pending Asset Uploads</w-tooltip>
+        <w-menu ref="menuPendingAssets" anchor="top left" self="top right" :offset="[10, 0]">
+          <w-card style="width: 450px">
+            <w-card-section class="card-header">
+              <w-icon name="img:/_assets/icons/color-data-pending.svg" left size="sm" />
+              <span>Pending Asset Uploads</span>
+            </w-card-section>
+            <w-card-section v-if="!hasPendingAssets"
+              >There are no assets pending uploads.</w-card-section
+            >
+            <w-list v-else separator>
+              <w-item v-for="item of editorStore.pendingAssets" :key="item.id">
+                <w-item-section side><w-icon name="la:file-image" /></w-item-section>
+                <w-item-section>{{ item.file.name }}</w-item-section>
+                <w-item-section side>
+                  <w-btn
+                    class="acrylic-btn"
+                    color="negative"
+                    round
+                    icon="la:times"
+                    size="xs"
+                    flat
+                    @click="removePendingAsset(item)" />
+                </w-item-section>
+              </w-item>
+            </w-list>
+            <w-card-section class="card-actions">
+              <em class="text-caption"
+                >Assets that are pasted or dropped onto this page will be held here until the page
+                is saved.</em
+              >
+            </w-card-section>
+          </w-card>
+        </w-menu>
+      </w-btn>
+      <!-- -> A rule with nothing under it is just a line: the three groups below can each be absent —
+              on a redirection, on a page that has never been saved, and inside the editor -->
+      <w-separator class="my-2" v-if="showHistory || showSource || showPageActions" inset />
+    </template>
+    <!--
+      The three below are all about a page's TEXT: what it used to say, what it says in source, and
+      the things that can be done to that text. Each carries its own test now rather than sharing a
+      wrapper, because they are absent for three different reasons — see `showHistory`, `showSource`
+      and `showPageActions`. A redirection loses all three either way: its content is a target, the
+      form above is the whole of it, and there is no render for any of these to be about.
+    -->
+    <!--
+      `read:history` is the permission that exists to say who may see what a page used to contain, so
+      the button follows it rather than page read access. The API asks the same question.
+    -->
+    <w-btn
+      class="h-12"
+      v-if="showHistory"
+      flat
+      square
+      icon="la:history"
+      :color="editorStore.isActive ? `white` : `grey`"
+      aria-label="Page History"
+      @click="viewPageHistory">
+      <w-tooltip anchor="center left" self="center right">Page History</w-tooltip>
+    </w-btn>
+    <!--
+      `read:source` likewise, granted per path by a rule — so guests have it wherever a rule says so,
+      and the API answers the overlay behind this button on exactly that permission.
+    -->
+    <w-btn
+      class="h-12"
+      v-if="showSource"
+      flat
+      square
+      icon="la:code"
+      :color="editorStore.isActive ? `white` : `grey`"
+      aria-label="Page Source"
+      @click="viewPageSource">
+      <w-tooltip anchor="center left" self="center right">Page Source</w-tooltip>
+    </w-btn>
+    <!-- -> `showPageActions` takes the rule with it: a separator over a button that opens nothing is a
+            line drawn for its own sake -->
+    <template v-if="showPageActions">
+      <!-- -> And only where there is something above to separate it FROM -->
+      <w-separator class="my-2" v-if="showHistory || showSource" inset />
+      <w-btn
+        class="h-12"
+        flat
+        square
+        icon="la:ellipsis-h"
+        :color="editorStore.isActive ? `deep-orange-2` : `grey`"
+        aria-label="Page Actions">
+        <w-tooltip anchor="center left" self="center right">Page Actions</w-tooltip>
+        <!--
+          Literal colour classes, not WIcon's `color` prop: that builds `text-<name>` at runtime and
+          Tailwind only emits a utility it can see spelled out, so these three icons had been drawing
+          in the inherited text colour rather than the rail's orange.
+        -->
+        <w-menu
+          class="translucent-menu"
+          anchor="top left"
+          self="top right"
+          auto-close
+          transition-show="jump-left">
+          <w-list padding style="min-width: 225px">
+            <!--
+              Only where there is somewhere to convert TO: `convertibleTo` is the editors that produce
+              this page's content type, and the site has to have one of them turned on. A redirection
+              has no peer at all, which is why this is absent rather than disabled on one.
+            -->
+            <w-item
+              clickable
+              v-if="userStore.can(`write:pages`) && canConvert"
+              @click="convertPage">
+              <w-item-section class="items-center" avatar>
+                <w-icon class="text-deep-orange-9" name="la:atom" size="sm" />
+              </w-item-section>
+              <w-item-section
+                ><w-item-label>{{ t('convertPage.action') }}</w-item-label></w-item-section
+              >
+            </w-item>
+            <!-- -> Nothing to render on a page whose content is a settings document rather than an
+                    article, and the endpoint behind this refuses any editor but markdown anyway -->
+            <w-item clickable v-if="userStore.can(`write:pages`) && hasBody" @click="rerenderPage">
+              <w-item-section class="items-center" avatar>
+                <w-icon class="text-deep-orange-9" name="la:magic" size="sm" />
+              </w-item-section>
+              <w-item-section><w-item-label>Rerender Page</w-item-label></w-item-section>
+            </w-item>
+            <w-item clickable disabled v-if="flagsStore.experimental">
+              <w-item-section class="items-center" avatar>
+                <w-icon class="text-deep-orange-9" name="la:sun" size="sm" />
+              </w-item-section>
+              <w-item-section><w-item-label>View Backlinks</w-item-label></w-item-section>
+            </w-item>
+          </w-list>
+        </w-menu>
+      </w-btn>
+    </template>
+    <w-space />
+    <!--
+      Hidden outright while a suggestion is being written: duplicating, moving or deleting the page is
+      not part of suggesting a change to it, and a submitter who happens to hold those rights elsewhere
+      would otherwise find them here.
+    -->
+    <template v-if="!(editorStore.isActive && [`create`, `suggest`].includes(editorStore.mode))">
+      <w-btn
+        class="h-12"
+        v-if="userStore.can(`write:pages`)"
+        flat
+        square
+        icon="la:copy"
+        :color="editorStore.isActive ? `deep-orange-2` : `grey`"
+        aria-label="Duplicate Page"
+        @click="duplicatePage">
+        <w-tooltip anchor="center left" self="center right">Duplicate Page</w-tooltip>
+      </w-btn>
+      <w-btn
+        class="h-12"
+        v-if="userStore.can(`manage:pages`)"
+        flat
+        square
+        icon="la:share"
+        :color="editorStore.isActive ? `deep-orange-2` : `grey`"
+        aria-label="Rename / Move Page"
+        @click="renamePage">
+        <w-tooltip anchor="center left" self="center right">Rename / Move Page</w-tooltip>
+      </w-btn>
+      <w-btn
+        class="h-12"
+        v-if="userStore.can(`delete:pages`)"
+        flat
+        square
+        icon="la:trash"
+        :color="editorStore.isActive ? `deep-orange-2` : `grey`"
+        aria-label="Delete Page"
+        @click="deletePage">
+        <w-tooltip anchor="center left" self="center right">Delete Page</w-tooltip>
+      </w-btn>
+    </template>
+    <!-- What the rail says instead: which of the two write modes the editor is in. -->
+    <span class="page-actions-mode" v-else>{{
+      editorStore.mode === `suggest`
+        ? t('common.actions.suggestedEdit')
+        : t('common.actions.newPage')
+    }}</span>
+  </div>
+</template>
+
+<script setup>
+import { computed, defineAsyncComponent, ref } from 'vue'
+import { useRouter, useRoute } from 'vue-router'
+import { useI18n } from 'vue-i18n'
+
+import { dialog } from '@/composables/dialog'
+import { notify } from '@/composables/notify'
+import { notifyRelinked } from '@/helpers/pageRelink'
+
+import { useEditorStore } from '@/stores/editor'
+import { useFlagsStore } from '@/stores/flags'
+import { usePageStore } from '@/stores/page'
+import { useSiteStore } from '@/stores/site'
+import { useUserStore } from '@/stores/user'
+
+// STORES
+
+const editorStore = useEditorStore()
+const flagsStore = useFlagsStore()
+const pageStore = usePageStore()
+const siteStore = useSiteStore()
+const userStore = useUserStore()
+
+// ROUTER
+
+const router = useRouter()
+const route = useRoute()
+
+// I18N
+
+const { t } = useI18n()
+
+// REFS
+
+const menuPendingAssets = ref(null)
+
+// DATA
+
+// COMPUTED
+
+const hasPendingAssets = computed(() => editorStore.pendingAssets?.length > 0)
+
+/**
+ * Whether this page has anywhere to be converted to.
+ *
+ * Both halves matter: the server says which editors produce this page's content type, and the site
+ * says which of those anybody can open. A redirection satisfies neither.
+ */
+const canConvert = computed(() =>
+  (pageStore.convertibleTo ?? []).some((editor) => siteStore.activeEditors.includes(editor))
+)
+
+/**
+ * Whether the page this rail is for is a redirection — one being read, edited or created alike, since
+ * `pageCreate` puts the editor on the page store as well.
+ *
+ * A redirection has no text, so most of this rail is about something that is not there: see the
+ * individual buttons for what each one loses.
+ */
+const isRedirect = computed(() => pageStore.editor === 'redirect')
+
+/**
+ * Whether the page on screen holds text somebody wrote.
+ *
+ * False for the editors that keep a settings document where a page keeps content: a redirection
+ * holds where it points, a blog how it lists the posts under it and a feedback board how it lists its
+ * ideas. None has a source worth showing a reader, and none can be re-rendered — the endpoint refuses
+ * any editor but markdown.
+ */
+const hasBody = computed(() => !['redirect', 'blog', 'feedback'].includes(pageStore.editor))
+
+/**
+ * Whether the "..." menu has anything to show.
+ *
+ * The disjunction of the three entries' own conditions, spelled out, because with none of them true
+ * it opened an empty panel -- which is what a guest got on every page. Rerender Page needs
+ * `write:pages` and a page with a body; Convert Page needs `write:pages` and somewhere to convert to;
+ * View Backlinks needs the experimental flag. Keep this in step with the entries themselves.
+ */
+const hasPageActions = computed(
+  () =>
+    (userStore.can('write:pages') && (canConvert.value || hasBody.value)) || flagsStore.experimental
+)
+
+/*
+  Whoever may write the page may read its source too — the editor is what opens it — so the button is
+  not hidden from an author whose rule grants the one and not the other. The API decides the same way.
+*/
+const canViewSource = computed(
+  () =>
+    userStore.can('read:source') || userStore.can('write:pages') || userStore.can('manage:pages')
+)
+
+/**
+ * Whether this page exists on the server yet.
+ *
+ * `id` is `0` until the first save — see `pageCreate` — and the two buttons below it gate are both
+ * questions about a stored page: what it used to say, and what it says in source. Asked of a page
+ * that has never been saved, the API has nothing to answer with and both overlays open on an error.
+ *
+ * The id rather than `mode === 'create'`, because the question is about the page and not about how
+ * the editor was opened.
+ */
+const isSaved = computed(() => Boolean(pageStore.id))
+
+/** What a page's stored TEXT can be asked about, which needs a stored page and a page with text. */
+const showHistory = computed(
+  () => !isRedirect.value && isSaved.value && userStore.can('read:history')
+)
+const showSource = computed(() => hasBody.value && isSaved.value && canViewSource.value)
+
+/**
+ * Whether the "..." menu is offered at all.
+ *
+ * Never while an editor is open, whatever the page. Converting a page rewrites the source under the
+ * editor holding it, and re-rendering it acts on the version that is STORED — so both are answers to
+ * a question about the saved page, asked from a screen showing an unsaved one. Neither belongs beside
+ * Save and Discard.
+ */
+const showPageActions = computed(
+  () => hasPageActions.value && !isRedirect.value && !editorStore.isActive
+)
+
+// METHODS
+
+function togglePageProperties() {
+  siteStore.$patch({
+    sideDialogComponent: 'PagePropertiesDialog',
+    sideDialogShown: true
+  })
+}
+
+function togglePageData() {
+  siteStore.$patch({
+    sideDialogComponent: 'PageDataDialog',
+    sideDialogShown: true
+  })
+}
+
+function viewPageHistory() {
+  siteStore.$patch({ overlay: 'PageHistory', overlayOpts: {} })
+}
+
+function viewPageSource() {
+  siteStore.$patch({ overlay: 'PageSource', overlayOpts: {} })
+}
+
+/**
+ * Move the page to a different editor.
+ *
+ * The dialog is what decides whether that is safe — see `PageConvertDialog`, which rewrites the source
+ * and compares the two renders before offering to go ahead. Nothing is reloaded here: the dialog does
+ * it, because it knows whether anything was written.
+ */
+function convertPage() {
+  dialog({
+    component: defineAsyncComponent(() => import('../components/PageConvertDialog.vue'))
+  })
+}
+
+function rerenderPage() {
+  dialog({
+    component: defineAsyncComponent(() => import('../components/RerenderPageDialog.vue')),
+    componentProps: {
+      id: pageStore.id
+    }
+  }).onOk(() => {
+    pageStore.pageLoad({ id: pageStore.id })
+  })
+}
+
+function duplicatePage() {
+  dialog({
+    component: defineAsyncComponent(() => import('../components/TreeBrowserDialog.vue')),
+    componentProps: {
+      mode: 'duplicatePage',
+      folderPath: '',
+      itemId: pageStore.id,
+      itemTitle: pageStore.title,
+      itemFileName: pageStore.path,
+      locale: pageStore.locale
+    }
+  }).onOk((newPageOpts) => {
+    pageStore.pageDuplicate({
+      sourcePageId: pageStore.id,
+      path: newPageOpts.path,
+      title: newPageOpts.title,
+      locale: newPageOpts.locale
+    })
+  })
+}
+
+function renamePage() {
+  dialog({
+    component: defineAsyncComponent(() => import('../components/TreeBrowserDialog.vue')),
+    componentProps: {
+      mode: 'renamePage',
+      folderPath: '',
+      itemId: pageStore.id,
+      itemTitle: pageStore.title,
+      itemFileName: pageStore.path,
+      locale: pageStore.locale
+    }
+  }).onOk(async (renamedPageOpts) => {
+    try {
+      // -> The destination is a locale as well as a path: the same path in another locale is a move
+      if (renamedPageOpts.path === pageStore.path && renamedPageOpts.locale === pageStore.locale) {
+        await pageStore.pageRename({ id: pageStore.id, title: renamedPageOpts.title })
+        notify({
+          type: 'positive',
+          message: 'Page renamed successfully.'
+        })
+      } else {
+        const relinked = await pageStore.pageMove({
+          id: pageStore.id,
+          path: renamedPageOpts.path,
+          title: renamedPageOpts.title,
+          locale: renamedPageOpts.locale,
+          updateLinks: renamedPageOpts.updateLinks
+        })
+        notify({
+          type: 'positive',
+          message: 'Page moved successfully.'
+        })
+        notifyRelinked(relinked, t)
+      }
+    } catch (err) {
+      notify({
+        type: 'negative',
+        message: err.message
+      })
+    }
+  })
+}
+
+function deletePage() {
+  dialog({
+    component: defineAsyncComponent(() => import('../components/PageDeleteDialog.vue')),
+    componentProps: {
+      pageId: pageStore.id,
+      pageName: pageStore.title
+    }
+  }).onOk(() => {
+    router.replace('/')
+  })
+}
+
+function removePendingAsset(item) {
+  URL.revokeObjectURL(item.blobUrl)
+  editorStore.pendingAssets = editorStore.pendingAssets.filter((a) => a.id !== item.id)
+  if (editorStore.pendingAssets.length < 1) {
+    menuPendingAssets.value.hide()
+  }
+}
+</script>
+
+<style lang="scss">
+/*
+  Just under the width at which the site's nav sidebar stops taking a column of its own -- the number
+  `MainLayout` hands its drawer as `overlayBelow`, and the same one `NavSidebar` states for its own use.
+  Below it the corner button lands in this rail; see the padding rule.
+*/
+$sidebar-overlay-max: 1199.98px;
+
+/** One row of this rail, which is what the bottom group has to clear. Matches the buttons' `h-12`. */
+$action-btn-height: 3rem;
+
+.page-actions {
+  // -> The editors' insert rail is the same width; see `$rail-width` in `css/_theme.scss`
+  flex: 0 0 $rail-width;
+
+  /*
+    Room at the foot of the rail for the button in the corner of the window -- scroll-to-top, or the
+    contents panel's opener below 750px (`MainLayout` and `pages/Index.vue` respectively). While the nav
+    sidebar has a column of its own that button is a disc straddling the sidebar's inner edge, nowhere
+    near this rail; once the sidebar overlays instead, the button is flush in the bottom-right corner,
+    which is exactly where this rail ends -- and it was landing on top of Delete Page. A tap at the middle
+    of that button's box reached the corner button instead, so the last action in the rail was the one
+    action a reader could not take.
+
+    Padding on the rail rather than a margin on the last button: what is last here depends on the reader's
+    permissions and on whether the editor is open, and the space is owed to whichever of them it turns out
+    to be. The rail scrolls its own overflow, so this is inside what scrolls and cannot be scrolled behind.
+  */
+  @media (max-width: $sidebar-overlay-max) {
+    padding-bottom: $action-btn-height;
+  }
+
+  /*
+    Gone on a phone while a page is being read: the rail is a column of icon buttons whose labels only
+    ever appear in a tooltip, which a touch screen has no way to show -- so it reads as six unexplained
+    glyphs down the edge of an already narrow article.
+
+    Not while the editor is open (`is-editor`), where the rail holds the properties panel and the pending
+    asset queue, and taking it away would leave an author with no way to reach either.
+  */
+  @media (max-width: $breakpoint-xs-max) {
+    &:not(.is-editor) {
+      display: none;
+    }
+  }
+
+  @at-root .body--light & {
+    background-color: $grey-3;
+  }
+  @at-root .body--dark & {
+    background-color: $dark-4;
+  }
+
+  &.is-editor {
+    /*
+      The height of the bar along the top of every editor -- the Render Preview strip of the Markdown
+      and AsciiDoc editors, the Visual editor's formatting bar -- each stated as 32px in its own
+      stylesheet. Page Properties then starts level with the content below that bar rather than beside
+      it, and the brickwork at the bar's right end steps into a plain stretch of orange.
+    */
+    padding-top: 32px;
+
+    @at-root .body--light & {
+      background-color: $deep-orange-9;
+    }
+    @at-root .body--dark & {
+      background-color: $deep-orange-9;
+    }
+  }
+
+  /* -> Taller than the shell only on a very short window, and then it scrolls rather than clipping */
+  overflow-y: auto;
+  scrollbar-width: none;
+
+  &-mode {
+    writing-mode: vertical-rl;
+    text-orientation: mixed;
+    // -> Centred across the rail: a line of this text is 24px, with half of what is left either side
+    padding: 1.75rem calc(($rail-width - 24px) / 2) 1.75rem 0;
+    color: $deep-orange-3;
+    font-weight: 500;
+  }
+
+  &-pending-badge {
+    animation: pageActionsBadgePulsate 2s ease infinite;
+  }
+}
+
+@keyframes pageActionsBadgePulsate {
+  0% {
+    transform: translate(0, 0);
+  }
+  50% {
+    transform: translate(3px, -3px);
+  }
+  100% {
+    transform: translate(0, 0);
+  }
+}
+</style>

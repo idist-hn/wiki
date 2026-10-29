@@ -1,0 +1,392 @@
+<template>
+  <div class="site-header bg-header text-white">
+    <div class="flex flex-nowrap">
+      <w-toolbar style="height: 64px">
+        <!-- -> `to` still does the navigating, so the logo stays a real link -- middle click, open in
+                a new tab, the address in the status bar. The handler is only what a navigation cannot
+                do on its own; see `leaveEditorForHome` -->
+        <w-btn dense flat :to="homePath" @click="leaveEditorForHome">
+          <w-avatar v-if="siteStore.logoText" size="34px" square>
+            <img :src="`/_site/current/logo`" />
+          </w-avatar>
+          <img v-else :src="`/_site/current/logo`" style="height: 34px" />
+        </w-btn>
+        <div v-if="siteStore.logoText" class="site-title text-h6 ml-2 min-w-0 flex-1 truncate">
+          {{ siteStore.title }}
+        </div>
+      </w-toolbar>
+      <!-- -> Inline between the title and the actions only where there is room for all three; on a
+              phone the field gets a row of its own at the bottom of this header instead -->
+      <header-search v-if="!isSearchCollapsed" />
+      <w-toolbar style="height: 64px">
+        <w-space />
+        <transition name="syncing">
+          <w-spinner v-show="commonStore.routerLoading" size="20px" class="text-accent" />
+        </transition>
+        <!--
+          The two halves of the right-hand group collapse at different widths, so they are separate tests
+          rather than one phone/desktop switch: the field is the first thing that stops fitting beside the
+          site title, and the five buttons hold out for another 300px.
+        -->
+        <w-btn
+          v-if="isSearchCollapsed && siteStore.features.search"
+          class="ml-4"
+          flat
+          round
+          dense
+          :icon="searchRowIsOpen ? `la:times` : `la:search`"
+          color="white"
+          :aria-label="searchRowIsOpen ? t(`common.actions.close`) : t(`common.header.search`)"
+          :aria-expanded="searchRowIsOpen"
+          @click="toggleSearchRow" />
+        <!--
+          One button for the five. Icon buttons whose meaning is only in a tooltip are not something a
+          touch screen can offer at all, and by 900px they are also crowding the site title.
+        -->
+        <header-actions-menu v-if="isActionsCollapsed" />
+        <template v-else>
+          <w-btn
+            v-if="canCreate"
+            class="ml-4"
+            flat
+            round
+            dense
+            icon="la:plus-circle"
+            color="blue-4"
+            :aria-label="t(`common.header.create`)">
+            <w-tooltip>{{ t('common.header.create') }}</w-tooltip>
+            <new-menu offer-live-note />
+          </w-btn>
+          <!-- -> Shown to everyone: Tags and the Glossary are for readers, and the menu holds back its
+                  File Manager row by itself; see `HeaderLibraryMenu` -->
+          <w-btn
+            class="ml-4"
+            flat
+            round
+            dense
+            icon="mdi:museum-outline"
+            color="positive"
+            :aria-label="t(`common.header.library`)">
+            <w-tooltip>{{ t('common.header.library') }}</w-tooltip>
+            <header-library-menu />
+          </w-btn>
+          <w-btn
+            v-if="userStore.authenticated"
+            class="ml-4"
+            flat
+            round
+            dense
+            icon="mdi:inbox-full"
+            color="amber"
+            to="/_inbox"
+            :aria-label="inboxLabel">
+            <!-- -> The unread count, which `boot/notifications.js` keeps current -->
+            <w-badge
+              v-if="notificationsStore.badge"
+              color="negative"
+              rounded
+              floating
+              :label="notificationsStore.badge" />
+            <w-tooltip>{{ inboxLabel }}</w-tooltip>
+          </w-btn>
+          <w-btn
+            v-if="userStore.can(`access:admin`)"
+            class="ml-4"
+            flat
+            round
+            dense
+            icon="la:tools"
+            color="pink"
+            to="/_admin"
+            :aria-label="t(`common.header.admin`)">
+            <w-tooltip>{{ t('common.header.admin') }}</w-tooltip>
+          </w-btn>
+
+          <!-- USER BUTTON / DROPDOWN -->
+          <account-menu v-if="userStore.authenticated" />
+          <w-btn
+            v-else
+            class="ml-4"
+            flat
+            rounded
+            icon="la:sign-in-alt"
+            color="white"
+            :label="$t(`common.actions.login`)"
+            :aria-label="$t(`common.actions.login`)"
+            to="/login"
+            padding="sm"
+            no-caps />
+        </template>
+      </w-toolbar>
+    </div>
+    <!--
+      The phone search field, in a row of its own under the bar. Unmounted on the way out, so there is
+      never a second field bound to the same query.
+
+      Focused from `@after-enter` rather than on mount: focusing the field is what draws the suggestions
+      panel under it, and doing that while the row is still sliding put a fresh layout and a
+      `backdrop-filter` blur into the middle of the animation -- which is what made it stutter.
+    -->
+    <transition name="header-search-row" @after-enter="searchRow?.focus()">
+      <div v-if="isSearchCollapsed && searchRowIsOpen" class="header-search-row">
+        <header-search ref="searchRow" row />
+      </div>
+    </transition>
+  </div>
+</template>
+
+<script setup>
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
+import { useI18n } from 'vue-i18n'
+
+import { confirmDiscardUnsaved } from '@/composables/editorBuffer'
+import { useMinWidth } from '@/composables/screen'
+import { splitLocalePath } from '@/helpers/pagePaths'
+
+import { useCommonStore } from '@/stores/common'
+import { useEditorStore } from '@/stores/editor'
+import { useLiveNoteStore } from '@/stores/liveNote'
+import { useNotificationsStore } from '@/stores/notifications'
+import { usePageStore } from '@/stores/page'
+import { useSiteStore } from '@/stores/site'
+import { useUserStore } from '@/stores/user'
+
+import AccountMenu from '@/components/AccountMenu.vue'
+import NewMenu from '@/components/PageNewMenu.vue'
+import HeaderActionsMenu from '@/components/HeaderActionsMenu.vue'
+import HeaderLibraryMenu from '@/components/HeaderLibraryMenu.vue'
+import HeaderSearch from '@/components/HeaderSearch.vue'
+
+/**
+ * Site header content.
+ *
+ * Content only, for the same reason as `FooterNav`: the enclosing layout supplies the header
+ * element, so layouts sharing this component can migrate independently.
+ */
+
+// STORES
+
+const commonStore = useCommonStore()
+const editorStore = useEditorStore()
+const liveNoteStore = useLiveNoteStore()
+const pageStore = usePageStore()
+const siteStore = useSiteStore()
+const userStore = useUserStore()
+const notificationsStore = useNotificationsStore()
+
+// ROUTER
+
+const route = useRoute()
+
+// I18N
+
+const { t } = useI18n()
+
+// REFS
+
+/** The phone search field, for the one thing this component does to it: focus it once it is down. */
+const searchRow = ref(null)
+
+// DATA
+
+/** Whether the phone search row is down. Never consulted above the breakpoint. */
+const searchRowIsOpen = ref(false)
+
+// COMPUTED
+
+/**
+ * Below the `sm` breakpoint (`css/tailwind.css`), where the search field gives up its place between the
+ * site title and the actions and becomes a button that opens a row of its own.
+ */
+const isAtLeastSm = useMinWidth(600)
+/*
+  Home, in the locale being read: `/fr/...` goes back to `/fr`, not to the English site root. Taken
+  off the route rather than off the page store, because the logo is the way out of a screen where
+  there may be no page -- a path with nothing behind it, a locale whose home page is not written yet.
+  Empty prefix on a site that does not bracket its URLs, which leaves the root as it was.
+*/
+const homePath = computed(() => {
+  const current = splitLocalePath(route.path, siteStore.localePrefixes)
+  return (current && siteStore.localeUrlPrefix(current.locale)) || '/'
+})
+
+const isSearchCollapsed = computed(() => !isAtLeastSm.value)
+
+/** The inbox button's name, which says how many are unread so that a screen reader hears the badge. */
+const inboxLabel = computed(() =>
+  notificationsStore.badge
+    ? t('notifications.unreadLabel', { title: t('inbox.title'), count: notificationsStore.badge })
+    : t('inbox.title')
+)
+
+/**
+ * Below 900px, where the five action buttons become the one overflow menu.
+ *
+ * A separate question from the search field above, and a wider one: the field is what stops fitting
+ * first, while the buttons are 5 × 40px that only start crowding the title around here. The same 900 the
+ * profile and search cards collapse their sidebars at, which is coincidence rather than a shared cause —
+ * it is simply where a window stops being a desktop one.
+ */
+const isAtLeast900 = useMinWidth(900)
+const isActionsCollapsed = computed(() => !isAtLeast900.value)
+
+/**
+ * Whether the New button is shown: to somebody who may write pages somewhere, or create live notes
+ * here. A notes-only user gets a menu holding New Live Note and nothing else -- see `PageNewMenu`.
+ */
+const canCreate = computed(() => userStore.can('write:pages') || liveNoteStore.canCreate)
+
+// WATCHERS
+
+/*
+  Whether this session may create live notes, asked here rather than by the New menu: the button that
+  opens that menu is shown on the answer, so it has to be known before there is a menu to ask it. Asked
+  again whenever the answer could have changed -- see `accessKey`. The overflow menu below 900px reads
+  the same answer, and is only ever mounted inside this header.
+*/
+watch(
+  () => liveNoteStore.accessKey,
+  () => {
+    liveNoteStore.ensureAccess()
+  },
+  { immediate: true }
+)
+
+/*
+  The search row closes on arriving somewhere, which is what pressing Enter in it does: the results are
+  the answer, and a field still hanging under the header is one more thing to put away by hand.
+*/
+watch(
+  () => route.path,
+  () => {
+    searchRowIsOpen.value = false
+  }
+)
+
+// MOUNTED
+
+onMounted(() => {
+  window.addEventListener('keydown', onKeydown)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onKeydown)
+})
+
+// METHODS
+
+/**
+ * Out of the editor, on the way home. The navigation itself is the link's.
+ *
+ * The logo is the way out of any screen the wiki can get into, which is why it is drawn in every one
+ * of them -- so it has to be a way out of the editor as well. Almost always the link does that on its
+ * own: the editor has a path of its own (`/_edit/...`, `/_create/...`), so the click is a real
+ * navigation, the page view's guard asks about anything unsaved, and its route watcher closes the
+ * editor. Nothing is done here in that case, and must not be: closing the editor before the router
+ * runs left the guard looking at no editor at all, so unsaved edits were thrown away without a word.
+ *
+ * What is left is the click that goes NOWHERE, which no guard or watcher will ever see: a suggestion
+ * being written on the home page, which is written at the page's own address. The router treats the
+ * push as a duplicate, so this asks the guard's question itself, then closes the editor. The page is
+ * re-read in that case too, since nothing else is going to: the store holds what the editor last wrote
+ * into it -- the source AND the render -- and closing the editor over it would draw somebody's
+ * unsaved draft as though it were the page.
+ */
+async function leaveEditorForHome() {
+  if (!editorStore.isActive || route.path !== homePath.value) {
+    return
+  }
+  if (!(await confirmDiscardUnsaved(t))) {
+    return
+  }
+  editorStore.closeEditor()
+  if (pageStore.id) {
+    // -> Failing to put the page back is not a reason to keep the reader in an editor they have just
+    //    left; the view draws what it has
+    pageStore.pageLoad({ id: pageStore.id }).catch(() => {})
+  }
+}
+
+/*
+  Ctrl+K below 600px, where the field is not mounted and so cannot claim the shortcut itself: this
+  opens the row, and `HeaderSearch` focuses on mount. Above the breakpoint, and while the row is
+  already down, the field's own handler is the one that answers -- see `HeaderSearch.handleKeyPress`.
+*/
+function onKeydown(ev) {
+  if (!isSearchCollapsed.value || searchRowIsOpen.value || !siteStore.features.search) {
+    return
+  }
+  if (ev.ctrlKey && ev.key === 'k' && !siteStore.overlayIsShown) {
+    ev.preventDefault()
+    searchRowIsOpen.value = true
+  }
+}
+
+function toggleSearchRow() {
+  searchRowIsOpen.value = !searchRowIsOpen.value
+}
+</script>
+
+<style scoped lang="scss">
+/*
+  The site name, a step down on a phone: `text-h6` is 20px, which is a heading's size next to a 34px
+  logo and two buttons on a 390px bar. Slight on purpose -- the title is still the first thing the bar
+  says.
+*/
+@media (max-width: $breakpoint-xs-max) {
+  .site-title {
+    font-size: 1.0625rem;
+  }
+}
+
+/*
+  The site's sidebar colour, which is what says this IS a second row rather than more of the bar: the
+  header's colour is the site's to choose and is black by default, so against an identical black the
+  field read as a pill floating in one tall bar -- generously padded above and cropped below.
+
+  The sidebar's rather than any other: on a phone the sidebar is the panel this same header opens, so the
+  two things that come out from behind the bar are the one colour.
+
+  Through `--color-sidebar` rather than the `bg-sidebar` utility, so the row follows a site that themes
+  its colours at runtime (the variable is rewritten in place; see `tailwind.css`).
+*/
+.header-search-row {
+  background-color: var(--color-sidebar);
+}
+
+/*
+  The search row sliding out from under the bar.
+
+  `max-height` rather than `height`, because the row is a `WToolbar` and carries `min-height: 50px` of
+  its own -- which a height of 0 loses to, and a max-height overrules. 52px is the height the row is
+  given in `HeaderSearch`; the two have to agree, or the slide stops short of the row's full height and
+  jumps the rest of the way.
+
+  `overflow: hidden` for the duration only, so that the search panel -- which hangs BELOW this row and
+  is positioned against it -- is not clipped once the row is open.
+*/
+.header-search-row-enter-active,
+.header-search-row-leave-active {
+  overflow: hidden;
+  transition:
+    max-height 0.2s var(--ease-standard),
+    opacity 0.2s var(--ease-standard);
+}
+.header-search-row-enter-from,
+.header-search-row-leave-to {
+  max-height: 0;
+  opacity: 0;
+}
+.header-search-row-enter-to,
+.header-search-row-leave-from {
+  max-height: 52px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .header-search-row-enter-active,
+  .header-search-row-leave-active {
+    transition-duration: 0.01ms;
+  }
+}
+</style>

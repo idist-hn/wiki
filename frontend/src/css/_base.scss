@@ -1,0 +1,380 @@
+@use 'sass:color';
+@use 'palette';
+@use 'theme';
+
+// app global css in SCSS form
+// ------------------------------------------------------------------
+// SCROLLBAR
+// ------------------------------------------------------------------
+
+html {
+  --scrollbarBG: #ccc;
+  --thumbBG: #999;
+}
+body::-webkit-scrollbar {
+  width: 7px;
+}
+body {
+  scrollbar-width: thin;
+  scrollbar-color: var(--thumbBG) var(--scrollbarBG);
+}
+body::-webkit-scrollbar-track {
+  background: var(--scrollbarBG);
+}
+body::-webkit-scrollbar-thumb {
+  background-color: var(--thumbBG);
+  border-radius: 6px;
+  border: 1px solid var(--scrollbarBG);
+}
+
+// ------------------------------------------------------------------
+// FONTS
+// ------------------------------------------------------------------
+
+@font-face {
+  font-family: 'Roboto Mono';
+  src: url(/_assets/fonts/roboto-mono/roboto-mono.woff2);
+}
+
+.font-robotomono {
+  font-family: 'Roboto Mono', Consolas, 'Liberation Mono', Courier, monospace;
+}
+
+.text-wordbreak-all {
+  word-break: break-all;
+}
+
+// ------------------------------------------------------------------
+// THEME COLORS
+// ------------------------------------------------------------------
+
+:root {
+  --q-header: #000;
+  --q-sidebar: #1976d2;
+}
+
+.header,
+.bg-header {
+  background: #000;
+  background: var(--q-header);
+}
+.sidebar,
+.bg-sidebar {
+  background: #1976d2;
+  background: var(--q-sidebar);
+}
+
+.bg-dark-6 {
+  background-color: #070a0d;
+}
+.bg-dark-5 {
+  background-color: #0d1117;
+}
+.bg-dark-4 {
+  background-color: #161b22;
+}
+.bg-dark-3 {
+  background-color: #1e232a;
+}
+.bg-dark-2 {
+  background-color: #292f39;
+}
+.bg-dark-1 {
+  background-color: #343b48;
+}
+
+// ------------------------------------------------------------------
+// FORMS
+// ------------------------------------------------------------------
+
+.v-textarea.is-monospaced textarea {
+  font-family: 'Roboto Mono', 'Courier New', Courier, monospace;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.q-field.denser .q-field__control {
+  height: 36px;
+
+  .q-field__prepend {
+    height: 36px;
+  }
+}
+
+.q-field.fill-outline .q-field__control {
+  background-color: #fff;
+
+  @at-root .body--light & {
+    background-color: #fff;
+  }
+  @at-root .body--dark & {
+    background-color: theme.$dark;
+  }
+}
+
+.q-field--dark .q-field__control:before {
+  background-color: theme.$dark-5;
+  border-color: rgba(255, 255, 255, 0.25);
+}
+
+// ------------------------------------------------------------------
+// ICONS SIZE FIX
+// ------------------------------------------------------------------
+
+.q-btn .q-icon {
+  &.fa-solid,
+  &.fa-regular {
+    font-size: 1.3em;
+  }
+}
+
+.q-select__dropdown-icon {
+  font-size: 16px;
+}
+
+// ------------------------------------------------------------------
+// BUTTONS
+// ------------------------------------------------------------------
+
+.q-btn.acrylic-btn {
+  .q-focus-helper {
+    background-color: currentColor;
+    opacity: 0.1;
+  }
+
+  &:hover .q-focus-helper {
+    opacity: 0.3 !important;
+  }
+}
+
+// The same frosted treatment for WBtn, which has no focus-helper child to tint -- it draws its
+// own hover state -- so the tint is a background on the button itself. Kept alongside the rule
+// above rather than replacing it, because both kinds of button are in play until Quasar is gone.
+//
+// Unlayered (this file is plain CSS, not a Tailwind layer), so it beats the hover-tint utility WBtn
+// carries for its flat variant, which would otherwise cancel the hover step out.
+//
+// `--w-btn-color` rather than `currentcolor`: that is the button's `color` prop, which is the label
+// too unless a `text-color` says otherwise -- and where it does, the fill is meant to stay with the
+// button rather than follow the text. WBtn always sets it, falling back to `currentcolor` itself,
+// so a Quasar-era button that somehow reaches this rule still tints.
+.w-btn.acrylic-btn {
+  background-color: color-mix(in srgb, var(--w-btn-color, currentcolor) 10%, transparent);
+}
+
+@media (hover: hover) {
+  .w-btn.acrylic-btn:hover {
+    background-color: color-mix(in srgb, var(--w-btn-color, currentcolor) 30%, transparent);
+  }
+}
+
+// A button that sits IN a corner of the viewport rather than floating near it: square on the two edges
+// it is flush against, and still fully round on the one corner that faces the page.
+//
+// `round` stays on the button, because that is what gives it its 3em square box and drops its padding --
+// only the radius is restated here. Unlayered (this file is plain CSS, not a Tailwind layer), which is
+// what lets it beat the `rounded-full` utility WBtn emits without `!important`.
+//
+// `50%` rather than a fixed radius: at half the box the curve runs from the middle of one edge to the
+// middle of the next, so the corner is as round as the disc it was -- which is the point. A fixed value
+// would have to be re-picked whenever the button's `size` changed.
+//
+// Here rather than in a layout, because three screens draw one: the site sidebar's opener and
+// scroll-to-top in `MainLayout`, the contents panel's opener in `pages/Index.vue`, and the admin
+// sidebar's opener in `AdminLayout` -- which is in a different layout tree and would otherwise see none
+// of it. Which corner is the one facing the page depends on which corner the button is in, so the side is
+// a modifier, stated after the base rule so each wins for its own corner.
+.corner-btn {
+  border-radius: 0;
+}
+.corner-btn--left {
+  border-top-right-radius: 50%;
+}
+.corner-btn--right {
+  border-top-left-radius: 50%;
+}
+
+// The fade a corner button gives way with as the panel it opens slides over it. Same duration and easing
+// as `WDrawer`'s own slide, so the two read as one movement.
+.corner-btn-enter-active,
+.corner-btn-leave-active {
+  transition: opacity 0.2s var(--ease-standard);
+}
+.corner-btn-enter-from,
+.corner-btn-leave-to {
+  opacity: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .corner-btn-enter-active,
+  .corner-btn-leave-active {
+    transition-duration: 0.01ms;
+  }
+}
+
+// ------------------------------------------------------------------
+// ICONS
+// ------------------------------------------------------------------
+
+.blueprint-icon {
+  &-alt {
+    filter: hue-rotate(100);
+  }
+}
+
+// ------------------------------------------------------------------
+// DIALOGS
+// ------------------------------------------------------------------
+
+.card-header {
+  display: flex;
+  align-items: center;
+  font-weight: 500;
+  font-size: 0.9rem;
+  background-color: theme.$dark-3;
+  background-image: radial-gradient(at bottom right, theme.$dark-3, theme.$dark-5);
+  color: #fff;
+
+  @at-root .body--light & {
+    border-bottom: 1px solid theme.$dark-3;
+    box-shadow: 0 1px 0 0 theme.$dark-6;
+  }
+  @at-root .body--dark & {
+    border-bottom: 1px solid #000;
+    box-shadow: 0 1px 0 0 color.adjust(theme.$dark-3, $lightness: 2%);
+  }
+}
+
+.card-negative {
+  display: flex;
+  align-items: center;
+  font-size: 0.9rem;
+
+  @at-root .body--light & {
+    background-color: palette.$red-1;
+    background-image: radial-gradient(
+      at bottom center,
+      color.adjust(palette.$red-1, $lightness: 2%),
+      color.adjust(palette.$red-2, $lightness: 2%)
+    );
+    border-bottom: 1px solid palette.$red-3;
+    text-shadow: 0 0 4px #fff;
+    color: palette.$red-9;
+  }
+  @at-root .body--dark & {
+    background-color: palette.$red-9;
+    background-image: radial-gradient(at bottom center, palette.$red-7, palette.$red-9);
+    border-bottom: 1px solid palette.$red-7;
+    text-shadow: 0 0 4px color.adjust(palette.$red-9, $lightness: -10%);
+    color: #fff;
+  }
+}
+
+.card-actions {
+  @at-root .body--light & {
+    background-color: #fafafa;
+    background-image: linear-gradient(to bottom, #fcfcfc, #f0f0f0);
+    color: theme.$dark-3;
+    border-top: 1px solid #eee;
+    box-shadow: inset 0 1px 0 0 #fff;
+  }
+  @at-root .body--dark & {
+    background-color: theme.$dark-3;
+    background-image: radial-gradient(at top left, theme.$dark-3, theme.$dark-5);
+    border-top: 1px solid #000;
+    box-shadow: 0 -1px 0 0 color.adjust(theme.$dark-3, $lightness: 2%);
+  }
+}
+
+// ------------------------------------------------------------------
+// CARDS
+// ------------------------------------------------------------------
+
+.q-card {
+  box-shadow:
+    0 1px 3px rgba(0, 0, 0, 0.2),
+    0 1px 1px rgba(0, 0, 0, 0.14),
+    0 2px 1px -1px rgba(0, 0, 0, 0.12);
+
+  &.q-card--dark {
+    box-shadow:
+      0 1px 3px rgba(0, 0, 0, 0.2),
+      0 1px 1px rgba(0, 0, 0, 0.14),
+      0 2px 1px -1px rgba(0, 0, 0, 0.12);
+  }
+
+  .q-separator--dark {
+    background-color: rgba(0, 0, 0, 0.7);
+  }
+}
+
+// ------------------------------------------------------------------
+// DROPDOWN MENUS
+// ------------------------------------------------------------------
+
+// A gradient rather than one flat translucency: glassy at the top, fully opaque from halfway down.
+//
+// The flat version read well over a pale page and poorly over a dark or busy one, where whatever sat
+// behind the menu showed through its text. Keeping the original alpha at the very top preserves the
+// glass effect where the menu meets its trigger, and everything below the midpoint gets a solid
+// surface to sit on -- which is where a menu's content actually is.
+//
+// The last stop carries on to the bottom edge, so a taller menu stays opaque rather than fading back
+// out; only the position where it becomes solid is proportional.
+.translucent-menu {
+  backdrop-filter: blur(10px) saturate(180%);
+
+  // `background-color: transparent` is load-bearing: WMenu paints an OPAQUE surface of its own with
+  // a `bg-[…]` utility, and the flat rule this replaces worked by overriding that colour outright. A
+  // gradient is a background IMAGE, which composites over that colour rather than replacing it -- so
+  // on its own it changed nothing at all, the top included. Clearing the colour makes the gradient the
+  // only background layer, which is what lets the top be translucent.
+  @at-root .body--light & {
+    background-color: transparent;
+    background-image: linear-gradient(to bottom, rgba(255, 255, 255, 0.8) 0%, #fff 50%);
+  }
+  @at-root .body--dark & {
+    background-color: transparent;
+    background-image: linear-gradient(to bottom, rgba(theme.$dark, 0.7) 0%, theme.$dark 50%);
+  }
+
+  // The panel inside has to let the blur through. `!important` because WCard sets its background
+  // with a utility class; both spellings are listed while q-card and w-card coexist.
+  > .q-card,
+  > .w-card {
+    background-color: transparent !important;
+  }
+}
+
+.q-menu--dark {
+  box-shadow:
+    0 1px 3px rgba(0, 0, 0, 0.2),
+    0 1px 1px rgba(0, 0, 0, 0.14),
+    0 2px 1px -1px rgba(0, 0, 0, 0.12);
+}
+
+// ------------------------------------------------------------------
+// LOADING ANIMATIONS
+// ------------------------------------------------------------------
+
+.syncing-enter-active {
+  animation: syncing-anim 0.1s;
+}
+.syncing-leave-active {
+  animation: syncing-anim 1s reverse;
+}
+@keyframes syncing-anim {
+  0% {
+    opacity: 0;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+.loading-darker {
+  .q-loading__backdrop {
+    opacity: 0.75;
+  }
+}

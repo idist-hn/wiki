@@ -1,0 +1,525 @@
+import type { FastifyInstance } from 'fastify'
+
+export async function registerSchemas(app: FastifyInstance): Promise<void> {
+  /**
+   * SITE
+   */
+  app.addSchema({
+    $id: 'Site',
+    type: 'object',
+    properties: {
+      id: {
+        type: 'string',
+        format: 'uuid'
+      },
+      hostname: {
+        type: 'string',
+        format: 'hostname'
+      },
+      isEnabled: {
+        type: 'boolean'
+      },
+      title: {
+        type: 'string'
+      },
+      description: {
+        type: 'string'
+      },
+      company: {
+        type: 'string'
+      },
+      contentLicense: {
+        type: 'string'
+      },
+      footerExtra: {
+        type: 'string'
+      },
+      banner: {
+        type: 'object',
+        description:
+          'A notice shown above the contents of every page of this site, styled as a caution admonition. The content is markdown, and is rendered by the app rather than stored as HTML.',
+        properties: {
+          isEnabled: {
+            type: 'boolean'
+          },
+          title: {
+            type: 'string',
+            maxLength: 255
+          },
+          content: {
+            type: 'string',
+            maxLength: 8192
+          }
+        }
+      },
+      pageExtensions: {
+        type: 'array',
+        items: {
+          type: 'string'
+        }
+      },
+      showAiBadge: {
+        type: 'boolean',
+        description:
+          'Whether a page version an AI assistant wrote through the MCP server is marked with an AI badge, in page history and on the page. Instance-wide (Admin → MCP), carried here because it is drawn per page. Which versions an assistant wrote is recorded either way — see `via` on a history entry.'
+      },
+      colorizeBrokenLinks: {
+        type: 'boolean',
+        description:
+          'Whether links to pages that do not exist are drawn in red. Display only: every saved render marks those links with the `is-broken-link` class either way, and this decides whether the page view colours them.'
+      },
+      discoverable: {
+        type: 'boolean'
+      },
+      defaults: {
+        type: 'object',
+        properties: {
+          tocDepth: {
+            type: 'object',
+            properties: {
+              min: {
+                type: 'number'
+              },
+              max: {
+                type: 'number'
+              }
+            }
+          }
+        }
+      },
+      features: {
+        type: 'object',
+        properties: {
+          backlinks: {
+            type: 'boolean',
+            description:
+              'Whether a page shows what links to it. Off hides the Links tab across the site and closes the route behind it; a page can still opt out on its own with `allowBacklinks`. Nothing about how links are recorded changes either way — the table is written by every save regardless, so turning this back on shows a list rather than an empty tab.'
+          },
+          browse: {
+            type: 'boolean'
+          },
+          collaborativeEditing: {
+            type: 'boolean'
+          },
+          ratingsMode: {
+            type: 'string',
+            enum: ['off', 'stars', 'thumbs'],
+            description:
+              'Whether readers may rate pages, and on which scale. Off by default. A page can still opt out on its own with `allowRatings`; only a logged in reader who may read the page can rate it.'
+          },
+          comments: {
+            type: 'boolean',
+            description:
+              'Whether this site has comments at all. Which provider handles them is `comments.provider`; this turns every one of them off without losing that choice, and a page can still opt out on its own with `allowComments`.'
+          },
+          glossary: {
+            type: 'boolean',
+            description:
+              'Whether this site has a glossary. On by default. Off hides it everywhere — the Library menu has no Glossary row and the glossary routes answer as though there were no terms — and keeps every term for when it is turned back on. Who may read it is the `read:glossary` page permission, and who may edit it `manage:glossary`, both granted per locale.'
+          },
+          glossaryAutoLink: {
+            type: 'boolean',
+            description:
+              'Whether terms are linked to the glossary where they occur in page text, in the reader’s browser. On by default; does nothing while `glossary` is off. A term can opt out with its own `autoLink`, and a page with `allowGlossaryLinks`. A link written by hand to `?glossary=<term>` is shown either way.'
+          },
+          lastEditedBy: {
+            type: 'boolean',
+            description:
+              'Whether a page may show who last edited it, in its sidebar. A page can still opt out on its own with `showLastEditedBy`.'
+          },
+          liveNotes: {
+            type: 'boolean',
+            description:
+              'Whether this site has live notes: markdown documents written together in real time at `/n/<key>` by whoever holds the URL, and kept with a history of revisions. On by default. Who may open one is the `read:notes` page permission and who may create and write in one `write:notes`, both granted per site, in its primary locale; a guest may be granted the first and never the second. Needs `collaborativeEditing` as well, since a note is a collaboration room that keeps its contents; with that off, notes are unreachable but kept.'
+          },
+          listFolderChildren: {
+            type: 'boolean',
+            description:
+              'Whether a path with no page of its own but pages under it lists them, under the notice that the page does not exist. On by default. Only the entries the user may read are listed — the same answer `/tree/browse` gives, which this also opens to readers while the `browse` feature is off.'
+          },
+          notifications: {
+            type: 'boolean',
+            description:
+              'Whether this site sends notifications at all — in-app or by email. Off, nothing that happens on the site is recorded for anybody, emails already waiting are dropped, and the inbox is hidden; entries already there are kept for when it is turned back on. What each person receives is theirs to choose, under Profile → Notifications.'
+          },
+          reasonForChange: {
+            type: 'string',
+            enum: ['off', 'optional', 'required']
+          },
+          search: {
+            type: 'boolean'
+          }
+        }
+      },
+      comments: {
+        type: 'object',
+        description:
+          'What a browser is told about this site’s comments, and all it is told: which provider is selected, and — for a third-party one — the markup to mount under the article. Built by `models/comments.ts`; the stored configuration behind it is not serialized anywhere, because the built-in provider’s holds an Akismet key.',
+        properties: {
+          provider: {
+            type: 'string',
+            description:
+              'Key of the selected provider, or an empty string when this site has comments turned off — which is also the answer for a provider that is selected but not finished being configured.'
+          },
+          isBuiltIn: {
+            type: 'boolean',
+            description:
+              'Whether the provider is the wiki’s own. Only for that one is the Talk tab drawn beside the article; every other provider is mounted under it.'
+          },
+          code: {
+            type: 'object',
+            description:
+              'The third-party markup, with everything but the page placeholders already substituted. Empty for the built-in provider.',
+            properties: {
+              head: { type: 'string' },
+              main: { type: 'string' },
+              body: { type: 'string' }
+            }
+          },
+          cooldownSeconds: {
+            type: 'integer',
+            description:
+              'How long the composer makes a reader wait between two comments. Built-in only, and 0 when there is no cooldown.'
+          },
+          maxLength: {
+            type: 'integer',
+            description: 'The longest a comment may be, in characters of markdown source.'
+          }
+        }
+      },
+      uploads: {
+        type: 'object',
+        properties: {
+          conflictBehavior: {
+            type: 'string',
+            description:
+              'What an upload does about a file already at the name it wants: replace it in place, refuse the upload, or store the arrival as the next free `name-1.ext`.',
+            enum: ['overwrite', 'reject', 'new']
+          },
+          pastedDestination: {
+            type: 'string',
+            maxLength: 2048,
+            description:
+              "Where a file pasted or dropped into the editor is filed when the page is saved. Empty is the page's own folder. A relative path is a folder under it — `assets` files them in `<page folder>/assets`. A path starting with `/` is from the site root, so every page's pasted files land in the one place. Missing folders are created on the first upload. Normalized on save: doubled slashes and `.`/`..` segments go, and a leading slash is kept because it is what tells the two apart."
+          }
+        }
+      },
+      logoUrl: {
+        type: 'string'
+      },
+      logoText: {
+        type: 'boolean'
+      },
+      sitemap: {
+        type: 'boolean'
+      },
+      robots: {
+        type: 'object',
+        properties: {
+          index: {
+            type: 'boolean'
+          },
+          follow: {
+            type: 'boolean'
+          }
+        }
+      },
+      auth: {
+        type: 'object',
+        description: 'Login experience for this site. Redirects can be overridden per group.',
+        properties: {
+          autoLogin: {
+            type: 'boolean'
+          },
+          bypassUnauthorized: {
+            type: 'boolean'
+          },
+          hideLocal: {
+            type: 'boolean'
+          },
+          loginRedirect: {
+            type: 'string',
+            maxLength: 255
+          },
+          welcomeRedirect: {
+            type: 'string',
+            maxLength: 255
+          },
+          logoutRedirect: {
+            type: 'string',
+            maxLength: 255
+          }
+        }
+      },
+      authStrategies: {
+        type: 'array',
+        description: 'Which authentication strategies this site offers, in display order.',
+        items: {
+          type: 'object',
+          properties: {
+            id: {
+              type: 'string',
+              format: 'uuid'
+            },
+            order: {
+              type: 'integer',
+              minimum: 0
+            },
+            isVisible: {
+              type: 'boolean'
+            }
+          }
+        }
+      },
+      locales: {
+        type: 'object',
+        properties: {
+          primary: {
+            type: 'string'
+          },
+          active: {
+            type: 'array',
+            items: {
+              type: 'string'
+            }
+          },
+          forcePrefix: {
+            type: 'boolean'
+          },
+          showMenu: {
+            type: 'boolean',
+            description:
+              'Whether the sidebar offers a locale selector to switch between the active locales.'
+          }
+        }
+      },
+      navigation: {
+        type: 'object',
+        description:
+          'How the navigation menus of this site follow changes to its content. All on for a new site; a site that predates them has them off.',
+        properties: {
+          addPagesToParentMenu: {
+            type: 'boolean',
+            description:
+              "Add a link to a new page at the end of the menu owned by its folder — the locale's own menu at the site root. With `createFolderMenus` as well, a new folder's menu is added there as a menu item."
+          },
+          removePagesFromParentMenu: {
+            type: 'boolean',
+            description:
+              'Remove the links to a deleted page from the menu owned by its folder, and the menu items opening a deleted folder from the menu owned by the folder above it.'
+          },
+          migrateLinksOnMove: {
+            type: 'boolean',
+            description:
+              "Move a moved page's link from the menu of the folder it left to the menu of the folder it arrived in (not put back where that folder owns none), and point every other link to it — or, for a moved or renamed folder, to anything under it — at where it now is."
+          },
+          updateLabelsOnRename: {
+            type: 'boolean',
+            description:
+              "Rename the links to a page, and the menu items opening a page's or folder's menu, when its title changes — those whose label was the old title exactly, and no others."
+          },
+          createFolderMenus: {
+            type: 'boolean',
+            description:
+              'Give a folder an empty menu of its own (override, for it and everything under it) when it comes into existence, created on its own or along the way of something written under it.'
+          },
+          deleteOrphanedMenus: {
+            type: 'boolean',
+            description:
+              "Delete, on a schedule, every menu that is not a locale's own, is the sidebar of no page or folder, and is opened by no menu item."
+          },
+          showParentLink: {
+            type: 'boolean',
+            description:
+              'Show a "Go up" link at the top of every menu that is not a locale\'s root menu, to the page or folder above the one owning it — unless the menu was opened from a menu item, where "Go back" takes its place.'
+          },
+          includeStorageOperations: {
+            type: 'boolean',
+            description:
+              'Also run the automations for what an import or a storage sync does. Off, they run for what a person does and nothing else.'
+          }
+        }
+      },
+      assets: {
+        type: 'object',
+        description:
+          'Which images have been uploaded for this site. The images themselves are served from `/_site/<siteId>/<logo|favicon|loginBg>`, which falls back to the built-in default wherever the flag is false.',
+        properties: {
+          logo: {
+            type: 'boolean'
+          },
+          favicon: {
+            type: 'boolean'
+          },
+          loginBg: {
+            type: 'boolean'
+          }
+        }
+      },
+      editors: {
+        type: 'object',
+        description:
+          'Per-editor state. `config` is free-form and specific to each editor implementation.',
+        properties: {
+          asciidoc: {
+            type: 'object',
+            properties: {
+              isActive: {
+                type: 'boolean'
+              },
+              config: {
+                type: 'object',
+                additionalProperties: true
+              }
+            }
+          },
+          blog: {
+            type: 'object',
+            properties: {
+              isActive: {
+                type: 'boolean'
+              },
+              config: {
+                type: 'object',
+                additionalProperties: true
+              }
+            }
+          },
+          feedback: {
+            type: 'object',
+            properties: {
+              isActive: {
+                type: 'boolean'
+              },
+              config: {
+                type: 'object',
+                additionalProperties: true
+              }
+            }
+          },
+          excalidraw: {
+            type: 'object',
+            properties: {
+              isActive: {
+                type: 'boolean'
+              },
+              config: {
+                type: 'object',
+                additionalProperties: true
+              }
+            }
+          },
+          markdown: {
+            type: 'object',
+            properties: {
+              isActive: {
+                type: 'boolean'
+              },
+              config: {
+                type: 'object',
+                additionalProperties: true
+              }
+            }
+          },
+          redirect: {
+            type: 'object',
+            properties: {
+              isActive: {
+                type: 'boolean'
+              },
+              config: {
+                type: 'object',
+                additionalProperties: true
+              }
+            }
+          },
+          visual: {
+            type: 'object',
+            properties: {
+              isActive: {
+                type: 'boolean'
+              },
+              config: {
+                type: 'object',
+                additionalProperties: true
+              }
+            }
+          }
+        }
+      },
+      theme: {
+        type: 'object',
+        properties: {
+          dark: {
+            type: 'boolean'
+          },
+          codeBlocksTheme: {
+            type: 'string',
+            description: 'Name of a highlight.js stylesheet, e.g. `github-dark`.',
+            maxLength: 255
+          },
+          colorPrimary: {
+            type: 'string',
+            format: 'hexcolor'
+          },
+          colorSecondary: {
+            type: 'string',
+            format: 'hexcolor'
+          },
+          colorAccent: {
+            type: 'string',
+            format: 'hexcolor'
+          },
+          colorHeader: {
+            type: 'string',
+            format: 'hexcolor'
+          },
+          colorSidebar: {
+            type: 'string',
+            format: 'hexcolor'
+          },
+          injectCSS: {
+            type: 'string'
+          },
+          injectHead: {
+            type: 'string'
+          },
+          injectBody: {
+            type: 'string'
+          },
+          contentWidth: {
+            type: 'string',
+            enum: ['centered', 'full']
+          },
+          sidebarPosition: {
+            type: 'string',
+            enum: ['off', 'left', 'right']
+          },
+          tocPosition: {
+            type: 'string',
+            enum: ['off', 'left', 'right']
+          },
+          showPrintBtn: {
+            type: 'boolean'
+          },
+          showPageProgress: {
+            type: 'boolean',
+            description:
+              'Draw a thin progress bar along the top of the viewport while a page loads.'
+          },
+          pageTransitions: {
+            type: 'boolean',
+            description:
+              'Cross-fade between pages, and between the views of a page, where the browser supports view transitions.'
+          },
+          baseFont: {
+            type: 'string'
+          },
+          contentFont: {
+            type: 'string'
+          }
+        }
+      }
+    }
+  })
+}

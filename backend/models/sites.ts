@@ -1,0 +1,700 @@
+import { mergeWith, toMerged } from 'es-toolkit/object'
+import { keyBy } from 'es-toolkit/array'
+import {
+  blocks as blocksTable,
+  siteAssets as siteAssetsTable,
+  sites as sitesTable,
+  storage as storageTable
+} from '../db/schema.ts'
+import { and, eq } from 'drizzle-orm'
+import { invalidateAppShellCache } from '../helpers/appShell.ts'
+import { detectImageMime, detectSvg, normalizeImage, svgMimeType } from '../helpers/images.ts'
+import type { ImageNormalization } from '../helpers/images.ts'
+import type { SystemIds } from './types.ts'
+
+/**
+ * The images a site can have uploaded for it. Each name is also the flag in the site's
+ * `config.assets` saying whether there is one — which is what the cached site config is asked before
+ * the bytes are ever looked up — and the name the image is addressed by, both to upload it and to
+ * serve it.
+ */
+export const siteAssetKinds = ['logo', 'favicon', 'loginBg'] as const
+
+export type SiteAssetKind = (typeof siteAssetKinds)[number]
+
+/**
+ * The size and format each image is stored at, i.e. what a browser is eventually handed. Every one
+ * is far smaller than what an administrator is likely to upload: these are a header logo, a tab icon
+ * and a login backdrop, not artwork to be kept at its original resolution.
+ */
+const SITE_ASSET_NORMALIZATION: Record<SiteAssetKind, ImageNormalization> = {
+  // -> A logo is whatever shape its owner made it, so it is fitted rather than cropped
+  logo: { width: 512, height: 512, fit: 'inside', format: 'webp' },
+  // -> PNG rather than WebP: a favicon is read by whatever the browser's tab strip, bookmark list and
+  //    home screen are made of, some of it much older than the page itself
+  favicon: { width: 180, height: 180, fit: 'cover', format: 'png' },
+  loginBg: { width: 1920, height: 1080, fit: 'cover', format: 'webp' }
+}
+
+/**
+ * Sites model
+ */
+class Sites {
+  async getSiteById({ id, forceReload = false }: { id: string; forceReload?: boolean }) {
+    if (forceReload) {
+      await WIKI.models.sites.reloadCache()
+    }
+    return WIKI.sites[id]
+  }
+
+  async getSiteByHostname({
+    hostname,
+    forceReload = false,
+    strict = false
+  }: {
+    hostname: string
+    forceReload?: boolean
+    strict?: boolean
+  }) {
+    if (forceReload) {
+      await WIKI.models.sites.reloadCache()
+    }
+    const siteId = strict
+      ? WIKI.sitesMappings[hostname]
+      : WIKI.sitesMappings[hostname] || WIKI.sitesMappings['*']
+    if (siteId) {
+      return WIKI.sites[siteId]
+    }
+    return null
+  }
+
+  async isHostnameUnique(hostname: string): Promise<boolean> {
+    return (await WIKI.db.$count(sitesTable, eq(sitesTable.hostname, hostname))) === 0
+  }
+
+  async getAllSites() {
+    return WIKI.db.select().from(sitesTable).orderBy(sitesTable.hostname)
+  }
+
+  async reloadCache(): Promise<void> {
+    WIKI.logger.info('Reloading site configurations...')
+    const sites = await WIKI.db.select().from(sitesTable).orderBy(sitesTable.id)
+    WIKI.sites = keyBy(sites, (s) => s.id)
+    WIKI.sitesMappings = {}
+    for (const site of sites) {
+      WIKI.sitesMappings[site.hostname] = site.id
+    }
+    /*
+      Sitemap lists and app shell fragments are held per site for minutes at a time, and `WIKI.cache`
+      has no expiry sweeper — an entry is only dropped when its own key is next read. So a site that
+      was deleted, or whose sitemap was just switched off, would hold its last list for the life of the
+      process: nothing will ever ask for that key again. This is also the one place every create,
+      update and delete of a site's settings passes through, and those settings are in both — the
+      site's own title and description, whether it wants to be indexed, how it brackets URLs by
+      locale. So it is the place to let them go.
+    */
+    WIKI.models.pages.invalidateSitemaps()
+    invalidateAppShellCache()
+    WIKI.logger.info(`Loaded ${sites.length} site configurations [ OK ]`)
+  }
+
+  /**
+   * Reload the site caches here, and tell every other instance of an HA set to do the same.
+   *
+   * `WIKI.sitesMappings` is what turns a request's hostname into a site, and an instance that never
+   * heard about a change goes on answering from what it loaded at boot. For a site added beside a
+   * catch-all `*` that is the wrong site rather than no site: its hostname is not in the mapping
+   * there, so the lookup falls through to the catch-all, and which site a reader gets depends on which
+   * instance the load balancer picked. Every write to the sites table goes through here for that
+   * reason; `reloadCache` itself does not emit, or two instances would answer each other for ever.
+   */
+  async reloadCacheEverywhere(): Promise<void> {
+    await this.reloadCache()
+    WIKI.events.outbound.emit('reloadSites')
+  }
+
+  async createSite(hostname: string, config: Record<string, any> = {}) {
+    /*
+      The whole configuration the site is created with, defaults and caller's together. Read back
+      below rather than reading `config` again: the caller supplies the handful of fields the create
+      form asks for, so anything else looked up there is undefined — which is what made creating a
+      site through the API fail on `locales.primary` every time.
+    */
+    const siteConfig = toMerged(
+      {
+        title: 'My Wiki Site',
+        description: '',
+        company: '',
+        contentLicense: '',
+        footerExtra: '',
+        banner: {
+          isEnabled: false,
+          title: '',
+          content: ''
+        },
+        pageExtensions: ['md', 'html', 'txt'],
+        colorizeBrokenLinks: true,
+        discoverable: false,
+        defaults: {
+          tocDepth: {
+            min: 1,
+            max: 2
+          }
+        },
+        features: {
+          // -> On, because what a wiki is for is pages that point at each other, and what points at
+          //    the page in front of you is worth knowing by default. It gates the TAB and the route
+          //    behind it; links are recorded either way, so turning it off and on again shows the
+          //    same list rather than an empty one.
+          backlinks: true,
+          browse: true,
+          collaborativeEditing: true,
+          ratingsMode: 'off',
+          // -> On, because what decides whether a site has comments is whether a provider has
+          //    been picked. This is the switch that turns them all off without losing that
+          //    choice, which is only useful to somebody who has already made it.
+          comments: true,
+          // -> On: a glossary with no terms costs a reader nothing, and the menu row that opens it is
+          //    also gated on `read:glossary`, which nobody but a fresh install's users holds
+          glossary: true,
+          // -> On: a term is linked only where its own `autoLink` is on as well, and only for a reader
+          //    who may read the glossary, so this changes nothing until somebody writes a term
+          glossaryAutoLink: true,
+          lastEditedBy: true,
+          // -> On: a reader who follows a link to a folder rather than a page is better served by
+          //    what is in it than by a notice that there is nothing there
+          listFolderChildren: true,
+          // -> On: who may open a note and who may start one are the `read:notes` and `write:notes`
+          //    page rules, and only administrators can start one until somebody grants the second
+          liveNotes: true,
+          // -> On: a reader who watches a page or is mentioned expects to be told. What each person
+          //    receives, and how, is theirs to choose under Profile → Notifications
+          notifications: true,
+          reasonForChange: 'optional',
+          search: true
+        },
+        /*
+              The wiki's own provider, so that a site with comments turned on has somewhere for them
+              to go without an administrator having to choose first. Every alternative is somebody
+              else's service with an account to open; this one needs nothing set up. Whether there
+              are comments at all is `features.comments` above -- see `models/comments.ts`.
+            */
+        comments: {
+          provider: 'default',
+          providers: {}
+        },
+        // -> The MCP server's settings that belong to a site rather than to the instance. Empty
+        //    `guidelinesPath` is no guidelines page — see `models/mcp.ts`
+        mcp: {
+          guidelinesPath: ''
+        },
+        logoUrl: '',
+        logoText: true,
+        sitemap: true,
+        robots: {
+          index: true,
+          follow: true
+        },
+        // -> Local authentication is the only strategy guaranteed to exist at this point
+        authStrategies: [{ id: WIKI.data.systemIds.localAuthId, order: 0, isVisible: true }],
+        auth: {
+          autoLogin: false,
+          bypassUnauthorized: false,
+          hideLocal: false,
+          loginRedirect: '/',
+          welcomeRedirect: '/',
+          logoutRedirect: '/'
+        },
+        locales: {
+          primary: 'en',
+          active: ['en'],
+          forcePrefix: false,
+          showMenu: true
+        },
+        // -> All on for a site created now; one that predates the automations keeps them off, as its
+        //    migrations set them, rather than starting to rewrite menus nobody asked it to touch
+        navigation: {
+          addPagesToParentMenu: true,
+          removePagesFromParentMenu: true,
+          migrateLinksOnMove: true,
+          updateLabelsOnRename: true,
+          createFolderMenus: true,
+          deleteOrphanedMenus: true,
+          includeStorageOperations: true,
+          showParentLink: true
+        },
+        assets: {
+          logo: false,
+          favicon: false,
+          loginBg: false
+        },
+        theme: {
+          dark: false,
+          codeBlocksTheme: 'github-dark',
+          colorPrimary: '#1976D2',
+          colorSecondary: '#02C39A',
+          colorAccent: '#FF9800',
+          colorHeader: '#000000',
+          colorSidebar: '#1976D2',
+          injectCSS: '',
+          injectHead: '',
+          injectBody: '',
+          contentWidth: 'full',
+          sidebarPosition: 'left',
+          tocPosition: 'right',
+          showPrintBtn: true,
+          showPageProgress: true,
+          pageTransitions: true,
+          baseFont: 'roboto',
+          contentFont: 'roboto'
+        },
+        editors: {
+          asciidoc: {
+            isActive: true,
+            config: {
+              math: 'katex',
+              minimap: false
+            }
+          },
+          /*
+            No config of its own: how a blog behaves is set up per blog, on its own front page, which
+            is where somebody who wants a blog is already standing. This flag is only whether the site
+            offers `New Blog` at all.
+          */
+          blog: {
+            isActive: true,
+            config: {}
+          },
+          /*
+            How a board behaves is set up on its own front page, for the blog's reason. What is set
+            here is the site's: how long an account waits between two submitted ideas
+            (`feedback.submissionIntervalFor`), a duration, `0` for no limit.
+          */
+          feedback: {
+            isActive: true,
+            config: {
+              submissionInterval: '1m'
+            }
+          },
+          /*
+            No config of its own: a drawing is drawn rather than written, so there is no syntax, no
+            pipeline and nothing about how it is authored to set per site. This flag is only whether
+            the site offers `New Drawing` at all.
+          */
+          excalidraw: {
+            isActive: true,
+            config: {}
+          },
+          markdown: {
+            isActive: true,
+            config: {
+              allowHTML: true,
+              lineBreaks: true,
+              linkify: true,
+              multimdTable: true,
+              quotes: 'english',
+              tabWidth: 2,
+              minimap: false,
+              typographer: false,
+              underline: true,
+              wikiLinks: true,
+              inlineMath: 'katex'
+            }
+          },
+          /*
+            No config of its own: a redirection is a page with a target instead of a body, so there is
+            nothing about how it is written to configure. This flag is only whether the site offers
+            `New Redirection` at all — turning it off leaves the redirections a site already has
+            working and editable, and stops new ones being made.
+          */
+          redirect: {
+            isActive: true,
+            config: {}
+          },
+          /*
+            No config of its own, deliberately. The Visual editor writes markdown and its preview is
+            rendered by the markdown pipeline, so it reads `markdown.config` — two settings blobs that
+            had to agree would only be a way for them to disagree.
+          */
+          visual: {
+            isActive: true,
+            config: {}
+          }
+        },
+        uploads: {
+          conflictBehavior: 'overwrite',
+          pastedDestination: ''
+        },
+        storage: {
+          largeThreshold: '25MB',
+          sitePrefix: false,
+          localePrefix: true,
+          stripLeadingH1: false,
+          mapReadmeToHome: false,
+          syncInterval: '5m',
+          directAccessFallback: 'stream'
+        },
+        // -> Keyed by the directory name under `modules/analytics`. Empty until an administrator
+        //    turns a provider on; the model completes each one from the module's declared props.
+        analytics: {
+          providers: {}
+        }
+      },
+      config
+    )
+
+    const result = await WIKI.db
+      .insert(sitesTable)
+      .values({
+        hostname,
+        isEnabled: true,
+        config: siteConfig
+      })
+      .returning({ id: sitesTable.id })
+
+    const newSite = result[0]
+
+    // -> The menu every page of the site inherits, one per locale. Empty to begin with, but it has to
+    //    exist before a page can point at it, and a site starts with its primary locale — the rest get
+    //    one the first time a page is written in them
+    WIKI.logger.debug(`Creating new root navigation for site ${newSite.id}`)
+    await WIKI.models.navigation.siteNavId(newSite.id, siteConfig.locales.primary)
+
+    // -> Site lookups by id / hostname are served from cache, which must know about the new site
+    await WIKI.models.sites.reloadCacheEverywhere()
+
+    // -> Otherwise the new site would have no blocks until the next restart
+    await WIKI.models.blocks.syncSite(newSite.id)
+
+    // -> Same for storage: the site needs its database target from the moment it can hold content
+    await WIKI.models.storage.syncSite(newSite.id)
+
+    return newSite
+  }
+
+  async updateSite(
+    id: string,
+    patch: { hostname?: string; isEnabled?: boolean; config?: Record<string, any> }
+  ): Promise<boolean> {
+    const values: Partial<typeof sitesTable.$inferInsert> = {}
+    if (patch.hostname !== undefined) {
+      values.hostname = patch.hostname
+    }
+    if (patch.isEnabled !== undefined) {
+      values.isEnabled = patch.isEnabled
+    }
+    if (patch.config) {
+      // -> Config is a JSONB blob, so it must be read and merged rather than partially assigned.
+      // Arrays are replaced rather than merged index-wise, otherwise removing an entry (e.g. a page
+      // extension) would leave the original value in place.
+      const current = await WIKI.db
+        .select({ config: sitesTable.config })
+        .from(sitesTable)
+        .where(eq(sitesTable.id, id))
+      if (current.length < 1) {
+        return false
+      }
+      values.config = mergeWith(
+        current[0].config as Record<string, any>,
+        patch.config,
+        (_targetValue, sourceValue) => (Array.isArray(sourceValue) ? sourceValue : undefined)
+      )
+    }
+    if (Object.keys(values).length < 1) {
+      return false
+    }
+
+    const updatedResult = await WIKI.db.update(sitesTable).set(values).where(eq(sitesTable.id, id))
+    if ((updatedResult.rowCount ?? 0) < 1) {
+      return false
+    }
+
+    await WIKI.models.sites.reloadCacheEverywhere()
+    return true
+  }
+
+  /**
+   * The bytes of an image uploaded for a site, if there is one.
+   *
+   * What was stored depends on what the upload could be normalized to — Sharp is an optional
+   * extension, and an SVG is never re-encoded at all — so the type is read back off the bytes rather
+   * than assumed.
+   */
+  async getAsset(
+    siteId: string,
+    kind: SiteAssetKind
+  ): Promise<{ data: Buffer; mime: string } | null> {
+    const rows = await WIKI.db
+      .select({ data: siteAssetsTable.data })
+      .from(siteAssetsTable)
+      .where(and(eq(siteAssetsTable.siteId, siteId), eq(siteAssetsTable.kind, kind)))
+      .limit(1)
+    const data = rows[0]?.data
+    if (!data) {
+      return null
+    }
+    const mime =
+      detectImageMime(data) ?? (detectSvg(data) ? svgMimeType : 'application/octet-stream')
+    return { data, mime }
+  }
+
+  /**
+   * Replace one of a site's images.
+   *
+   * A raster upload is brought down to the size and format it will be served at, per
+   * `SITE_ASSET_NORMALIZATION` — there is no reason to hand every visitor the multi-megabyte
+   * original of an image displayed 34 pixels tall. That needs the Sharp extension, so without it the
+   * uploaded bytes are stored as they came in, which is what the admin area's "requires Sharp"
+   * indicator is warning about. An SVG is stored as it came in either way: it is markup, it already
+   * scales to any size, and rasterizing it would throw away the only reason to use one.
+   *
+   * @param data The uploaded image, already known to be one of the supported formats
+   */
+  async setAsset(siteId: string, kind: SiteAssetKind, data: Buffer): Promise<void> {
+    const normalized = detectSvg(data)
+      ? data
+      : ((await normalizeImage(data, SITE_ASSET_NORMALIZATION[kind])) ?? data)
+    await WIKI.db
+      .insert(siteAssetsTable)
+      .values({ siteId, kind, data: normalized })
+      .onConflictDoUpdate({
+        target: [siteAssetsTable.siteId, siteAssetsTable.kind],
+        set: { data: normalized }
+      })
+    // -> Serving reads this flag off the cached site config before it looks for any bytes
+    await WIKI.models.sites.updateSite(siteId, { config: { assets: { [kind]: true } } })
+  }
+
+  /**
+   * Remove one of a site's images, leaving the built-in default to be served again.
+   */
+  async clearAsset(siteId: string, kind: SiteAssetKind): Promise<void> {
+    await WIKI.db
+      .delete(siteAssetsTable)
+      .where(and(eq(siteAssetsTable.siteId, siteId), eq(siteAssetsTable.kind, kind)))
+    await WIKI.models.sites.updateSite(siteId, { config: { assets: { [kind]: false } } })
+  }
+
+  async deleteSite(id: string): Promise<boolean> {
+    // -> Block, storage and uploaded image rows belong to the site rather than to its content, and
+    //    their FK has no cascade, so they would otherwise block the delete. Content tables (pages,
+    //    assets, ...) deliberately still do — see the conflict handling in the route.
+    await WIKI.db.delete(blocksTable).where(eq(blocksTable.siteId, id))
+    await WIKI.db.delete(storageTable).where(eq(storageTable.siteId, id))
+    await WIKI.db.delete(siteAssetsTable).where(eq(siteAssetsTable.siteId, id))
+
+    const deletedResult = await WIKI.db.delete(sitesTable).where(eq(sitesTable.id, id))
+    if ((deletedResult.rowCount ?? 0) < 1) {
+      return false
+    }
+
+    await WIKI.models.sites.reloadCacheEverywhere()
+    return true
+  }
+
+  async countSites() {
+    return WIKI.db.$count(sitesTable)
+  }
+
+  async init(ids: SystemIds): Promise<void> {
+    WIKI.logger.info('Inserting default site...')
+
+    await WIKI.db.insert(sitesTable).values({
+      id: ids.siteId,
+      hostname: '*',
+      isEnabled: true,
+      config: {
+        title: 'Default Site',
+        description: '',
+        company: '',
+        contentLicense: '',
+        footerExtra: '',
+        banner: {
+          isEnabled: false,
+          title: '',
+          content: ''
+        },
+        pageExtensions: ['md', 'html', 'txt'],
+        colorizeBrokenLinks: true,
+        discoverable: false,
+        defaults: {
+          tocDepth: {
+            min: 1,
+            max: 2
+          }
+        },
+        features: {
+          backlinks: true,
+          browse: true,
+          collaborativeEditing: true,
+          ratingsMode: 'off',
+          comments: true,
+          glossary: true,
+          glossaryAutoLink: true,
+          lastEditedBy: true,
+          listFolderChildren: true,
+          liveNotes: true,
+          notifications: true,
+          reasonForChange: 'optional',
+          search: true
+        },
+        comments: {
+          provider: 'default',
+          providers: {}
+        },
+        mcp: {
+          guidelinesPath: ''
+        },
+        logoText: true,
+        sitemap: true,
+        robots: {
+          index: true,
+          follow: true
+        },
+        authStrategies: [{ id: ids.authModuleId, order: 0, isVisible: true }],
+        auth: {
+          autoLogin: false,
+          bypassUnauthorized: false,
+          hideLocal: false,
+          loginRedirect: '/',
+          welcomeRedirect: '/',
+          logoutRedirect: '/'
+        },
+        locales: {
+          primary: 'en',
+          active: ['en'],
+          forcePrefix: false,
+          showMenu: true
+        },
+        // -> All on for a site created now; one that predates the automations keeps them off, as its
+        //    migrations set them, rather than starting to rewrite menus nobody asked it to touch
+        navigation: {
+          addPagesToParentMenu: true,
+          removePagesFromParentMenu: true,
+          migrateLinksOnMove: true,
+          updateLabelsOnRename: true,
+          createFolderMenus: true,
+          deleteOrphanedMenus: true,
+          includeStorageOperations: true,
+          showParentLink: true
+        },
+        assets: {
+          logo: false,
+          favicon: false,
+          loginBg: false
+        },
+        editors: {
+          asciidoc: {
+            isActive: true,
+            config: {
+              math: 'katex',
+              minimap: false
+            }
+          },
+          /*
+            No config of its own: how a blog behaves is set up per blog, on its own front page, which
+            is where somebody who wants a blog is already standing. This flag is only whether the site
+            offers `New Blog` at all.
+          */
+          blog: {
+            isActive: true,
+            config: {}
+          },
+          /*
+            How a board behaves is set up on its own front page, for the blog's reason. What is set
+            here is the site's: how long an account waits between two submitted ideas
+            (`feedback.submissionIntervalFor`), a duration, `0` for no limit.
+          */
+          feedback: {
+            isActive: true,
+            config: {
+              submissionInterval: '1m'
+            }
+          },
+          /*
+            No config of its own: a drawing is drawn rather than written, so there is no syntax, no
+            pipeline and nothing about how it is authored to set per site. This flag is only whether
+            the site offers `New Drawing` at all.
+          */
+          excalidraw: {
+            isActive: true,
+            config: {}
+          },
+          markdown: {
+            isActive: true,
+            config: {
+              allowHTML: true,
+              lineBreaks: true,
+              linkify: true,
+              multimdTable: true,
+              quotes: 'english',
+              tabWidth: 2,
+              minimap: false,
+              typographer: false,
+              underline: true,
+              wikiLinks: true,
+              inlineMath: 'katex'
+            }
+          },
+          /*
+            No config of its own: a redirection is a page with a target instead of a body, so there is
+            nothing about how it is written to configure. This flag is only whether the site offers
+            `New Redirection` at all — turning it off leaves the redirections a site already has
+            working and editable, and stops new ones being made.
+          */
+          redirect: {
+            isActive: true,
+            config: {}
+          },
+          /*
+            No config of its own, deliberately. The Visual editor writes markdown and its preview is
+            rendered by the markdown pipeline, so it reads `markdown.config` — two settings blobs that
+            had to agree would only be a way for them to disagree.
+          */
+          visual: {
+            isActive: true,
+            config: {}
+          }
+        },
+        theme: {
+          dark: false,
+          codeBlocksTheme: 'github-dark',
+          colorPrimary: '#1976D2',
+          colorSecondary: '#02C39A',
+          colorAccent: '#FF9800',
+          colorHeader: '#000000',
+          colorSidebar: '#1976D2',
+          injectCSS: '',
+          injectHead: '',
+          injectBody: '',
+          contentWidth: 'full',
+          sidebarPosition: 'left',
+          tocPosition: 'right',
+          showPrintBtn: true,
+          showPageProgress: true,
+          pageTransitions: true,
+          baseFont: 'roboto',
+          contentFont: 'roboto'
+        },
+        uploads: {
+          conflictBehavior: 'overwrite',
+          pastedDestination: ''
+        },
+        storage: {
+          largeThreshold: '25MB',
+          sitePrefix: false,
+          localePrefix: true,
+          stripLeadingH1: false,
+          mapReadmeToHome: false,
+          syncInterval: '5m',
+          directAccessFallback: 'stream'
+        },
+        analytics: {
+          providers: {}
+        }
+      }
+    })
+  }
+}
+
+export const sites = new Sites()

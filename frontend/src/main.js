@@ -1,0 +1,52 @@
+import { createApp } from 'vue'
+import { initializeRouter } from './router'
+import { initializeStore } from './stores'
+import { initializeApi } from './boot/api'
+import { initializeComponents } from './boot/components'
+import { initializeEventBus } from './boot/eventbus'
+import { initializeExternals } from './boot/externals'
+import { initializeI18n } from './boot/i18n'
+import { initializeIconify } from './boot/iconify'
+import { initializeMonaco } from './boot/monaco'
+import { initializeNotifications } from './boot/notifications'
+import { initializeTemporal } from './boot/temporal'
+import { initializeHairlines } from './helpers/hairline'
+
+import './css/tailwind.css'
+import './css/app.scss'
+/*
+  The `@font-face` rules for the fonts a drawing is lettered in, generated at build time from the
+  Excalidraw package — see `excalidrawAssets` in `vite.config.js`. Here rather than in the editor's own
+  chunk because a READER of a drawing never loads the editor: the page holds the SVG it exported, which
+  names its fonts and does not carry them. About a kilobyte, and it fetches nothing until a glyph on
+  the page actually calls for one.
+*/
+import 'virtual:excalidraw-fonts.css'
+
+import RootApp from './App.vue'
+
+// Must come first: everything below may use Temporal, directly or indirectly.
+await initializeTemporal()
+
+const router = initializeRouter()
+const store = initializeStore(router)
+
+const app = createApp(RootApp)
+app.use(store)
+app.use(router)
+
+initializeHairlines()
+initializeApi()
+initializeComponents(app)
+initializeEventBus()
+initializeIconify()
+// -> Before any editor is opened, which is the first thing that asks for a worker
+initializeMonaco()
+initializeExternals(router, store)
+initializeI18n(app, store)
+initializeNotifications(router)
+// The server's copy of the page, for clients that never get this far -- see
+// `backend/helpers/appShell.ts`. It has done its job by now, and Vue is about to draw the real thing.
+document.getElementById('wiki-prerender')?.remove()
+
+app.mount('#app')

@@ -1,0 +1,224 @@
+key: oidc
+title: OpenID Connect / OAuth2
+description: OpenID Connect 1.0 is a simple identity layer on top of the OAuth 2.0 protocol.
+author: requarks.io
+logo: https://static.requarks.io/logo/oidc.svg
+icon: /_assets/icons/ultraviolet-openid.svg
+color: blue-grey-8
+isAvailable: true
+useForm: false
+usernameType: email
+props:
+  clientId:
+    type: String
+    title: Client ID
+    hint: Application Client ID, as the provider issued it.
+    icon: key
+    order: 1
+  clientSecret:
+    type: String
+    title: Client Secret
+    hint: Application Client Secret, as the provider issued it.
+    icon: password
+    sensitive: true
+    order: 2
+  issuer:
+    type: String
+    title: Issuer
+    hint: The provider's issuer URL, e.g. https://id.example.com. Everything else is discovered from it.
+    icon: internet
+    order: 3
+  useDiscovery:
+    type: Boolean
+    title: Use Discovery
+    hint: Read the endpoints and signing keys from the issuer's /.well-known/openid-configuration. Turn off only for a provider that does not publish one, and fill in the endpoints below.
+    icon: rescan-document
+    default: true
+    order: 4
+  authorizationURL:
+    type: String
+    title: Authorization Endpoint URL
+    hint: Where the browser is sent to log in.
+    icon: enter
+    order: 5
+    if:
+      - { key: 'useDiscovery', eq: false }
+  tokenURL:
+    type: String
+    title: Token Endpoint URL
+    hint: Where the authorization code is exchanged for tokens.
+    icon: exit
+    order: 6
+    if:
+      - { key: 'useDiscovery', eq: false }
+  userInfoURL:
+    type: String
+    title: User Info Endpoint URL
+    hint: Optional - the ID token alone can carry everything needed.
+    icon: contact
+    order: 7
+    if:
+      - { key: 'useDiscovery', eq: false }
+  useQueryStringForAccessToken:
+    type: Boolean
+    title: Pass access token via GET query string to User Info Endpoint
+    hint: Pass the access token in an `access_token` parameter attached to the GET query string of the User Info Endpoint URL. Otherwise the access token will be passed in the Authorization header.
+    icon: download-from-cloud
+    default: false
+    order: 8
+  jwksURL:
+    type: String
+    title: JSON Web Key Set URL
+    hint: Where the keys that signed the ID token are published. Without it the ID token cannot be verified and logins are refused.
+    icon: fingerprint-scan
+    order: 9
+    if:
+      - { key: 'useDiscovery', eq: false }
+  logoutURL:
+    type: String
+    title: Logout URL
+    hint: Optional - Where the browser is sent once the wiki has logged somebody out, so that the provider's own session ends too — its `end_session_endpoint`. Discovery finds this on its own, which is why it is only asked for here. Without it, signing out leaves the provider still signed in and the next login goes through without a password being asked for.
+    icon: exit
+    order: 10
+    if:
+      - { key: 'useDiscovery', eq: false }
+  returnAfterLogout:
+    type: Boolean
+    title: Return After Logout
+    hint: Ask the provider to send the browser back to the wiki once its own session has ended, to the Logout Redirect of the user's group or of the site, rather than leaving them on the provider's signed-out page. Register that address with the provider as a post-logout redirect URI first — the full URL, e.g. https://wiki.example.com/ for a Logout Redirect of `/` — and one for each group's Logout Redirect too. An address it does not have registered is refused, and the provider shows an error instead of logging out.
+    icon: back
+    default: false
+    order: 11
+  scopes:
+    type: String
+    title: Scopes
+    hint: Space-separated. `openid` is required; `email` is what an account is matched on here.
+    icon: rules
+    default: 'openid profile email'
+    order: 12
+  useAcrValues:
+    type: Boolean
+    title: Use ACR Values
+    hint: Optional - Ask the provider for a particular kind of sign-in — two-factor, a smart card, a specific policy — by naming the authentication context this wiki wants.
+    icon: pin-pad
+    default: false
+    order: 13
+  acrValues:
+    type: String
+    title: ACR Values
+    hint: Space-separated Authentication Context Class References, most preferred first, as the provider documents them. e.g. `urn:mace:incommon:iap:silver`, or a policy name the provider defines.
+    icon: rules
+    default: ''
+    order: 14
+    if:
+      - { key: 'useAcrValues', eq: true }
+  requireAcr:
+    type: Boolean
+    title: Require the authentication context
+    hint: Refuse a login whose `acr` claim is not one of the values above. Off, they are only a request — OpenID Connect lets a provider ignore them and still answer with a valid token, so without this the setting expresses a preference rather than a requirement. Turn it on once the provider is known to return the claim, since one that returns none refuses everybody.
+    icon: secure
+    default: false
+    order: 15
+    if:
+      - { key: 'useAcrValues', eq: true }
+  idClaim:
+    type: String
+    title: ID Claim
+    hint: Which claim carries the provider's own identifier for the account. Usually sub or id, which never changes.
+    icon: key
+    default: sub
+    order: 16
+  emailClaim:
+    type: String
+    title: Email Claim
+    hint: Which claim carries the email address.
+    icon: envelope
+    default: email
+    order: 17
+  requireVerifiedEmail:
+    type: Boolean
+    title: Require Verified Email
+    hint: Refuse a login or registration unless the provider says it has verified the email address. An account here is matched by address, so an unverified one says nothing about who holds the mailbox — on a provider that lets people type in any address they like, it is a way into somebody else's account.
+    icon: secure
+    default: false
+    order: 18
+  verifiedEmailClaim:
+    type: String
+    title: Verified Email Claim
+    hint: Which claim says the email address was verified. Only `true` (also as the string "true", in any casing) or `1` counts; anything else, the claim missing included, refuses the login.
+    icon: email-open
+    default: email_verified
+    order: 19
+    if:
+      - { key: 'requireVerifiedEmail', eq: true }
+  displayNameClaim:
+    type: String
+    title: Display Name Claim
+    hint: Which claim carries the name to show. Falls back to the email address when the claim is absent.
+    icon: person
+    default: name
+    order: 20
+  pictureClaim:
+    type: String
+    title: Picture Claim
+    hint: Which claim carries the URL of the account's picture, fetched on login and stored as the avatar. Leave empty to let people keep whatever avatar they set here.
+    icon: image
+    default: picture
+    order: 21
+  locationClaim:
+    type: String
+    title: Location Claim
+    hint: Optional - Which claim carries where the person is, e.g. a custom `office` claim. Copied to their profile on every login, replacing what was set here. Leave empty to let people set their own.
+    icon: geography
+    default: ''
+    order: 22
+  jobTitleClaim:
+    type: String
+    title: Job Title Claim
+    hint: Optional - Which claim carries the person's job title, e.g. `job_title`. Copied to their profile on every login, replacing what was set here. Leave empty to let people set their own.
+    icon: new-job
+    default: ''
+    order: 23
+  pronounsClaim:
+    type: String
+    title: Pronouns Claim
+    hint: Optional - Which claim carries the person's pronouns. Copied to their profile on every login, replacing what was set here. Leave empty to let people set their own.
+    icon: gender
+    default: ''
+    order: 24
+  mapGroups:
+    type: Boolean
+    title: Map Groups
+    hint: Put the user in the wiki groups a claim names, on every login. Only groups that already exist here are matched, by name and ignoring case — nothing is created.
+    icon: user-groups
+    default: false
+    order: 25
+  groupsClaim:
+    type: String
+    title: Groups Claim
+    hint: Which claim carries the group names. Either one name or a list of them.
+    icon: rules
+    default: groups
+    order: 26
+    if:
+      - { key: 'mapGroups', eq: true }
+  unassignMissingGroups:
+    type: Boolean
+    title: Unassign from groups no longer present in claim
+    hint: Off adds what the claim names and takes nothing away, so a membership granted here survives. On makes the provider the authority instead, and a group it stops naming is taken back — bar the ones this strategy auto-enrolls into, which are granted here to everyone it lets in.
+    icon: unfriend
+    default: false
+    order: 27
+    if:
+      - { key: 'mapGroups', eq: true }
+refs:
+  callbackUrl:
+    title: Authorization Callback URL
+    hint: Register this as the redirect / callback URI at the provider. If you have multiple sites using this strategy, you must register all the site hostnames as well.
+    icon: back
+    value: '{host}/_api/auth/{id}/callback'
+  logoutUrl:
+    title: Post Logout URL
+    hint: Register this as the post logout redirect / callback URI at the provider. If you have multiple sites using this strategy, you must register all the site hostnames as well. Note that if you override the logout URL in the site login settings or at the group level, you must also allow these URLs or use a wildcard match.
+    icon: back
+    value: '{host}/'

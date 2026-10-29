@@ -1,0 +1,736 @@
+/*
+  The chrome a page view is drawn in: the breadcrumb bar, the title header, and the column the article
+  and its footer scroll inside. Plus the placeholder screen that stands in for the article when there
+  is nothing to draw there.
+
+  Here rather than in `pages/Index.vue`, where all of it began, because there is now more than one view
+  wearing it -- `pages/PageVersion.vue` draws a historical snapshot in the same chrome. An SFC's
+  unscoped styles ship in that component's own lazily-imported chunk, so a second view reusing these
+  class names got the markup and none of the rules, which is the way this goes wrong invisibly: the
+  header renders, and it is a plain box with no gradient, no border and no height.
+
+  The contents column is here too, panel behaviour and all: both views have one, and the version view's
+  is the same column drawing the same list from the same `toc`. What stayed behind in `Index.vue` is
+  only what a snapshot has no use for -- the toggle on the tags heading, tags being editable on a page
+  and not on a record of one.
+*/
+
+/*
+  The Sass variables, loaded explicitly. `vite.config.js` injects both of these into every SFC through
+  `additionalData`, but that reaches only the files Vite itself hands to Sass -- a partial pulled in by
+  `@use` from `app.scss` is resolved by Sass and arrives without it. Same note as `_page-contents.scss`,
+  which is here for the same reason.
+
+  Both, not just the palette: the greys and the breakpoint come from `_palette.scss`, the `$dark-*` ramp
+  these gradients are built on from `_theme.scss`.
+*/
+@use 'palette' as *;
+@use 'theme' as *;
+
+/*
+  One edge of a box drawn as a hairline -- one DEVICE pixel, like `.w-hairline` -- in the colour held
+  by the custom property `$color-var`. `$pseudo` is which of the box's two pseudo-elements draws it,
+  so a box can have a hairline on both edges.
+
+  The border is kept, transparent, so the box is exactly the size it was with a real one, and the line
+  is painted over that border area by a pseudo-element scaled by `1 / --w-dpr`. The scale runs towards
+  the box's OUTER edge, so two of these meeting at a seam -- a bar's underline and the top edge of the
+  bar below it -- sit against each other with nothing between them. What the scale leaves bare shows
+  the box's own background, which is why the gradients using this are `border-box`: under the default
+  `padding-box` origin a gradient repeats into the border area, and its first stop shows as a sliver.
+
+  Screen only: the print stylesheet redraws these edges as borders of its own.
+*/
+@mixin hairline-edge($side, $color-var, $pseudo: after) {
+  position: relative;
+  border-#{$side}: 1px solid transparent;
+
+  @media screen {
+    &::#{$pseudo} {
+      content: '';
+      position: absolute;
+      left: 0;
+      right: 0;
+      #{$side}: -1px;
+      height: 1px;
+      background-color: var(#{$color-var});
+      transform: scaleY(calc(1 / var(--w-dpr, 1)));
+      transform-origin: #{$side} left;
+      pointer-events: none;
+    }
+  }
+}
+
+/*
+  Where the contents column stops being able to afford 300px. A page view's own threshold, not one of the
+  app's -- `_palette.scss` is for the breakpoints the whole app shares, and this one is a function of a
+  page's two sidebars. Stated as a `max` value just under 1400px, the way the shared ones are.
+*/
+$toc-narrow-max: 1399.98px;
+
+/*
+  ...and where it stops being a column at all and becomes a panel over the article. The same boundary as
+  the 750px `useMinWidth` in each view, which decides whether that view renders the opener, and as the
+  one each layout uses to stand scroll-to-top down from this corner. They all have to agree.
+*/
+$toc-overlay-max: 749.98px;
+
+/*
+  The column in place of the article: the lock screen, the page that does not exist, and the
+  redirection on its way somewhere else. All three are the same shape -- a large faint icon, a
+  sentence, and the one button that does something about it -- and share the styling so they cannot
+  drift apart. `PageRedirect.vue` draws its own screens with these classes for that reason.
+*/
+.page-placeholder {
+  display: flex;
+  height: 100%;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  /* -> Off dead centre: the text reads better a little above the middle of the column */
+  padding: 0 24px 10vh;
+  text-align: center;
+
+  /*
+    Stated per theme, as everything else in this column is: the article's own colours come from
+    `_page-contents.scss`, so a plain block dropped in beside it inherits the document's black and
+    goes invisible on the dark surface. The icon below takes its colour from here as well.
+  */
+  @at-root .body--light & {
+    color: $grey-9;
+  }
+  @at-root .body--dark & {
+    color: #fff;
+  }
+}
+
+/*
+  The missing-page screen, which can hold more than a sentence and a button: the folder listing
+  `PageFolderChildren.vue` draws under them runs as long as the folder does. So it scrolls, and is
+  centred only while it fits -- plain centring puts an overflowing top out of reach above the
+  scrollport. The padding on top is for the case where it does not fit, so the icon is not flush
+  against the edge.
+*/
+.page-placeholder--scroll {
+  overflow-y: auto;
+  justify-content: safe center;
+  padding-top: 24px;
+}
+
+/*
+  Large and faint. It is the illustration on an otherwise empty column, not something to look at -- the
+  sentence under it is what the reader is here to read.
+*/
+.page-placeholder-icon {
+  margin-bottom: 24px;
+  font-size: 96px;
+  opacity: 0.12;
+}
+
+/*
+  The pair of lines between this bar and the page header under it -- this bar's underline, then the
+  header's top edge -- are hairlines drawn by `hairline-edge` rather than borders: a 1px border is 1.5
+  or 2 device pixels on a scaled display, twice the weight of every `.w-hairline` rule around it.
+*/
+.page-breadcrumbs {
+  @include hairline-edge(bottom, --page-breadcrumbs-rule);
+
+  @at-root .body--light & {
+    background: linear-gradient(to bottom, $grey-1 0%, $grey-3 100%) border-box;
+    --page-breadcrumbs-rule: #{$grey-4};
+  }
+  /*
+    The bar sets a background per theme, so it owes a foreground too: the LAST crumb -- the current
+    page -- deliberately inherits rather than taking `active-color`, and what it was inheriting in
+    dark mode was the document's black.
+  */
+  @at-root .body--light & {
+    color: var(--color-black);
+  }
+  @at-root .body--dark & {
+    background: linear-gradient(to bottom, $dark-3 0%, $dark-4 100%) border-box;
+    --page-breadcrumbs-rule: #{$dark-3};
+    color: var(--color-white);
+  }
+
+  /*
+    A point off the trail on a phone, on the bar rather than on the crumbs: `WBreadcrumbs` sets no size
+    of its own and its icons are 125% of whatever it inherits, so one declaration here takes the text and
+    the icons down together and keeps the two in proportion.
+
+    13px is where it stops. The trail is how a reader gets back out, and it is already the smallest type
+    on the screen -- what is wanted is a bar that gives way to the page under it, not one nobody can read.
+  */
+  @media (max-width: $breakpoint-xs-max) {
+    font-size: 0.8125rem;
+  }
+}
+
+/*
+  The version view's bar, which says which snapshot is on screen rather than where a page sits.
+
+  Indigo and not the page view's grey, because it is not the same statement: the trail on a page is
+  chrome a reader looks past, while this one is the only thing on screen saying that what is under it
+  is a RECORD of a page and not the page. A coloured band is what carries that at a glance, and indigo
+  is the colour the interface already gives history -- the Schedule tab's calendar, the version
+  timeline's own dots.
+
+  Both themes take the same treatment rather than the light one being tinted and the dark one left
+  dark: the point is a band that stands out from the chrome above and below it, and in the dark theme
+  a grey bar between a dark header and a dark article is exactly what does not.
+
+  Declared after the block above and overriding it at equal specificity, so source order is what
+  settles it -- one file, one place to look, and nothing depending on which chunk loaded last.
+
+  The foreground is stated once for everything in the bar, which is why the markup carries no colour
+  of its own: the icon paints with `currentColor` and the date inherits. `<strong>` is what marks the
+  date out, as it did when the bar was grey.
+*/
+.page-breadcrumbs--version {
+  @at-root .body--light & {
+    background: linear-gradient(to bottom, var(--color-indigo-6) 0%, var(--color-indigo-7) 100%)
+      border-box;
+    --page-breadcrumbs-rule: var(--color-indigo-9);
+    color: #fff;
+  }
+  /* -> A step down the same ramp, so the band reads as deliberate against a dark page rather than as
+        the light theme's bar left switched on */
+  @at-root .body--dark & {
+    background: linear-gradient(to bottom, var(--color-indigo-7) 0%, var(--color-indigo-9) 100%)
+      border-box;
+    --page-breadcrumbs-rule: var(--color-indigo-9);
+    color: #fff;
+  }
+}
+
+/*
+  The frame round the whole version view: 5px down both sides and along the bottom, with the bar above
+  closing the fourth. Together they box the screen in, which is the point -- the indigo says "what you
+  are reading is a RECORD of a page", and that is true of the whole view rather than of its first 30px.
+
+  Its colour is the DARK end of that bar's gradient in each theme, which is what makes the top corners
+  corners: the bar finishes on this exact value, so where the two meet there is no seam and the eye
+  reads one shape bent round the content. Picking the light end instead would draw a line across the
+  join.
+
+  No top width, since the bar is already there -- a border under it would be a second line saying the
+  same thing, and the bar has an underline of its own.
+
+  On the page element, which is what makes all three sides land where they should: it is a flex item in
+  `WPageContainer` that also claims `h-full`, so it is exactly as tall as the content cell, and the
+  bottom edge sits at the bottom of the window rather than below the fold. The article scrolls inside
+  its own box further in (`.page-container-scrl`), so the frame holds still while the content moves
+  behind it.
+
+  `box-sizing: border-box` is global (Tailwind's reset), so all 10px of the sides come out of the
+  content box and the view does not grow a scrollbar in either direction. That reset also declares
+  `border: 0 solid`, which is why a width and a colour are the whole of this -- and why the widths can
+  be stated once for both themes with only the colour switching.
+*/
+.page-version {
+  border-style: solid;
+  border-width: 0 5px 5px;
+
+  @at-root .body--light & {
+    border-color: var(--color-indigo-7);
+  }
+  @at-root .body--dark & {
+    border-color: var(--color-indigo-9);
+  }
+}
+
+/*
+  A feedback board and an idea hold their body to a measure in the middle of the article column, so
+  the header is held to the same box: the icon starts where that body does, and the title and
+  description end where it does rather than running on towards the window's edge. Both are measured,
+  not worked out here -- see `measureHeaderBounds` in `pages/Index.vue`.
+
+  The text column is what is capped, at the body's width less the icon's (whose column has padding at
+  its start only), and gives up its end padding so its words reach the body's edge and not 1rem short
+  of it. Capped, it no longer stretches to the actions, so they are pushed to the far end instead.
+
+  Narrower, a long description wraps where it used to run on, so the bar's 95px is a floor here rather
+  than a height: a second line grows the bar instead of spilling out of the bottom of it. Not on a
+  phone, which sizes the bar by its contents already (below).
+
+  `flex-shrink: 0` because the bar is an item of the page's column, beside an article row that asks
+  for all of it (`flex: 1 1 100%`). A stated `min-height` replaces the floor a flex item otherwise
+  keeps at its content's height, so without this the column squeezed the bar back to 95px and the
+  second line hung out of the bottom of it -- taking the actions down with it, since a wrapping row is
+  as tall as its content rather than as the bar.
+*/
+.page-header.is-aligned {
+  flex-shrink: 0;
+  height: auto;
+  min-height: 95px;
+
+  @media (max-width: $breakpoint-xs-max) {
+    min-height: 0;
+  }
+
+  .page-header-icon {
+    padding-inline-start: var(--page-header-inset);
+  }
+  .page-header-text {
+    max-width: calc(var(--page-header-measure) - var(--page-header-icon-size));
+    padding-inline-end: 0;
+  }
+  .page-header-actions {
+    margin-inline-start: auto;
+  }
+}
+
+/*
+  A feedback board's listing, centred and capped as a blog's is, so a wide window gets a list rather
+  than a strip. Here rather than on the board's own root (`PageFeedback.vue`) because the board is
+  loaded on demand while this frame is drawn with the page: the header lines itself up with it
+  (`.page-header.is-aligned` above), and a measure that only existed once the board had loaded drew the
+  header at the window's edge first and then jumped.
+*/
+.page-feedback-frame {
+  max-width: 960px;
+  margin-inline: auto;
+}
+
+.page-header {
+  height: 95px;
+  @include hairline-edge(top, --page-header-rule);
+  @include hairline-edge(bottom, --page-header-underline, before);
+
+  /*
+    Sized by its contents on a phone instead, which comes out around 70px: the 95px is pitched for a 64px
+    icon beside 34px display type, and holding it under the halved icon and title of the phone layout left
+    a band of empty gradient under the description.
+
+    `auto` rather than a smaller fixed height, because a fixed one is what the desktop bar can only just
+    afford: a title long enough to wrap has nowhere to go in it. Here the bar grows by a line instead, and
+    a page with no description gets a bar shorter still.
+  */
+  @media (max-width: $breakpoint-xs-max) {
+    height: auto;
+  }
+
+  /*
+    A hint of the page's own color, rising from the bottom-left corner -- under the icon drawn in
+    the same color. `--page-header-tint` is set by the header for a page that has one; unset, the
+    mix is of transparent with transparent and the layer draws nothing. Part of the one `background`
+    rather than a rule of its own, so that print, which sets this to `none`, takes it away too.
+  */
+  --page-header-glow: radial-gradient(
+    ellipse 55% 180% at 0% 100%,
+    color-mix(
+      in oklch,
+      var(--page-header-tint, transparent) var(--page-header-tint-strength),
+      transparent
+    ),
+    transparent
+  );
+
+  /*
+    And a line of it along the bottom edge, at half strength and fading out where the glow does --
+    the ellipse's horizontal radius is 55% of the bar. Drawn ON the underline in the light theme, which
+    paints over the background (`hairline-edge` above); the dark theme has no underline, so there it
+    is a layer of the background like the glow.
+  */
+  --page-header-line: linear-gradient(
+    to right,
+    color-mix(in oklch, var(--page-header-tint, transparent) 50%, transparent),
+    transparent 55%
+  );
+
+  @at-root .body--light & {
+    --page-header-tint-strength: 10%;
+    background:
+      var(--page-header-glow) border-box,
+      linear-gradient(to bottom, $grey-2 0%, $grey-1 100%) border-box;
+    --page-header-rule: #fff;
+    --page-header-underline: #{$grey-4};
+
+    &::before {
+      background-image: var(--page-header-line);
+    }
+  }
+  @at-root .body--dark & {
+    --page-header-tint-strength: 14%;
+    background:
+      var(--page-header-line) left bottom / 100% 1px no-repeat border-box,
+      var(--page-header-glow) border-box,
+      linear-gradient(to bottom, $dark-4 0%, $dark-3 100%) border-box;
+    // -> No underline in the dark theme, and no border holding a place for one either
+    border-bottom: 0;
+    --page-header-rule: #{$dark-6};
+  }
+
+  .no-height .q-field__control {
+    height: auto;
+  }
+
+  &-title {
+    /*
+      `text-h4` is a 34px display size written for a header the width of a desktop window: at 390px a
+      title of any length wrapped and pushed the description out of the bar. 24px is the step
+      `text-h5` takes, written as a value rather than as that class so the size sits beside the
+      breakpoint asking for it.
+
+      Here rather than in a header component's scoped block, where it started: scoped rules carry a
+      data attribute and reach only that one component's markup, so the second header wearing these
+      classes rendered a 34px title on a phone. The header's own `@media` block keeps what is its own
+      business -- which of ITS actions survive the narrow layout.
+    */
+    @media (max-width: $breakpoint-xs-max) {
+      font-size: 1.5rem;
+      line-height: 2rem;
+    }
+
+    @at-root .body--light & {
+      color: $grey-9;
+    }
+    @at-root .body--dark & {
+      color: #fff;
+    }
+  }
+  &-subtitle {
+    @at-root .body--light & {
+      color: $grey-7;
+    }
+    @at-root .body--dark & {
+      color: rgba(255, 255, 255, 0.6);
+    }
+  }
+}
+/*
+  The article and the footer under it, stacked inside the one box that scrolls.
+
+  `flex: 1 0 auto` on the article is what keeps the footer at the BOTTOM of a short page instead of
+  leaving it hanging under two lines of content: the article takes the leftover height, and past that
+  grows with its own content and pushes the footer out of view until the reader gets there. It must
+  not shrink either, or a long article would be squeezed to make room rather than scrolling.
+*/
+.page-container-scrl {
+  display: flex;
+  flex-direction: column;
+}
+.page-container-body {
+  flex: 1 0 auto;
+
+  /*
+    The other half of the padding change each view makes on a phone, where the article column pads by
+    8px a side instead of 16.
+
+    `--content-bleed` is how far the rule under an h1 reaches BACK through the padding of whatever holds
+    the content, so that it starts at the sidebar rather than at the text -- so it is a statement about
+    this surface's padding, and left at 1rem against 0.5rem of it the rule overhung the column by 8px.
+    `_page-contents.scss` declares the property expecting exactly this: a surface that pads differently
+    overrides the one property rather than the rule.
+
+    On the `.page-contents` element rather than here, because that is where the default is declared and a
+    custom property set on the parent would simply be shadowed by it. The editor's preview pane carries
+    the class itself and still pads 1rem, so it keeps the default.
+  */
+  @media (max-width: $breakpoint-xs-max) {
+    .page-contents {
+      --content-bleed: 0.5rem;
+    }
+  }
+
+  /*
+    The theme's Centered content width (`contentWidth`): the article held to a measure in the middle
+    of the column rather than running to its edges, the way the Talk view holds its threads
+    (`.page-talk`). `.page-measure` is the box inside the padding that wraps everything but the site
+    banner, which keeps its full width.
+
+    The title's rule stops reaching back through the padding: the article is now a block of its own
+    in the middle of the column, and a rule hanging 1rem out of its left side points at a sidebar
+    that is nowhere near it. After the phone rule above, and more specific, so it wins there too.
+  */
+  &.is-centered {
+    .page-measure {
+      max-width: $content-centered-max-width;
+      margin-inline: auto;
+    }
+    .page-contents {
+      --content-bleed: 0px;
+    }
+  }
+}
+
+/*
+  A hairline of the page's OWN background between the header and whatever the column starts with, in
+  each theme's colour -- so it is invisible against the article, which is that colour, and reads as one
+  pixel of daylight under anything that starts flush to the top of the column. A site banner does
+  exactly that, and against the header's bottom border it needs the gap.
+
+  Both themes: with the dark one left out the banner butted straight into the header there and not in
+  the light theme, which is the sort of difference that reads as a bug in whichever one you see second.
+*/
+.page-container {
+  /*
+    The colour of the edge drawn round the article: the line along the bottom of the Article / Talk
+    strip, the three sides of the tab raised out of it, and the rule down the right of the column
+    below -- see `.page-article-col` and `PageViewTabs.vue`. One custom property because they are one
+    edge: two of them are drawn by a component and one by this sheet, and a pair of values that have
+    to agree across two files is a pair of values that eventually will not.
+
+    Each theme's is the actions rail's own colour (`.page-actions` in `PageActionsCol.vue`: `$grey-3`
+    light, `$dark-4` dark) or a step off it: the rail closes the far side of the page, so drawing this
+    edge in what the rail is drawn in is what makes the two read as the same piece of chrome rather
+    than as two edges of slightly different greys. The light one stays a step down at `$grey-4`, where
+    the rail's own value is too near the strip to be seen against it.
+  */
+  @at-root .body--light & {
+    --page-chrome-rule: #{$grey-4};
+  }
+  @at-root .body--dark & {
+    /* -> Half a step above the rail's own `$dark-4`, which the edge was drawn in exactly and read a
+          shade too close to the strip it divides */
+    --page-chrome-rule: #{color-mix(in srgb, $dark-3 50%, $dark-4)};
+  }
+
+  @at-root .body--light & {
+    border-top: 1px solid #fff;
+  }
+  @at-root .body--dark & {
+    border-top: 1px solid $dark-6;
+  }
+}
+
+/*
+  The article column's own edge, which is the strip's rule turned the corner: the strip
+  closes the top of the column, this closes its side, and the two meet at the strip's bottom corner so
+  that what is drawn reads as one line round the content rather than as two borders that happen to
+  touch.
+
+  On the scrolling box rather than on the column that holds it, so it starts UNDER the strip: the
+  strip is the same grey as the contents column beside it and the two are meant to read as one
+  surface, which a line drawn between them for 44px would cut in half.
+
+  Worn whether or not there is a strip above it. What is on the other side is the contents column or
+  the actions rail, both of them chrome, and a column edge that appeared only on pages that take
+  comments would be a difference a reader cannot account for.
+
+  On the right, against the contents column or the rail -- or on the left when the contents are a
+  column there (`page-container--toc-left`, from `pages/Index.vue`), since the edge is drawn against
+  the contents wherever they are. Physical sides both, because which side the column is on is the
+  theme's setting and not the language's. `PageViewTabs.vue` turns the corner to meet it on the same
+  class.
+*/
+.page-article-col {
+  border-right: 1px solid var(--page-chrome-rule);
+
+  .page-container--toc-left & {
+    border-right: 0;
+    border-left: 1px solid var(--page-chrome-rule);
+  }
+}
+
+/*
+  The Talk view's surface: the pale end of the page header's gradient (`.page-header` above), so
+  the comments drawn on it as white cards (`PageComment.vue`) have something to stand off.
+
+  On the body rather than on the column, which also holds the footer: the footer is the same in
+  every view and should not change colour with the tab. The selected Talk tab is drawn in the same
+  value -- see the end of `PageViewTabs.vue` -- because the tab and what is under it are one surface.
+
+  A feedback board's front page stands on it too, for the same reason: its ideas are cards
+  (`PageFeedback.vue`), drawn the way the Talk view's comments are. And so does an idea, so that
+  following one from its board does not change the ground under it: its head is a card
+  (`PageFeedbackIdea.vue`) and its discussion is the Talk view's cards.
+*/
+.page-article-col.is-talk .page-container-body,
+.page-article-col.is-feedback-board .page-container-body,
+.page-article-col.is-idea .page-container-body {
+  @at-root .body--light & {
+    background-color: $grey-1;
+  }
+  @at-root .body--dark & {
+    background-color: $dark-3;
+  }
+}
+
+/*
+  The Talk view's column (`pages/Index.vue`): two headed groups of full-width buttons, comments and
+  then annotations, laid out from the top of the column like the article's own column is.
+*/
+.page-talk-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 1rem;
+
+  .w-btn {
+    justify-content: flex-start;
+    width: 100%;
+  }
+}
+
+.page-talk-actions-count {
+  margin-inline-start: auto;
+}
+
+.page-talk-actions-title {
+  display: flex;
+  align-items: center;
+}
+
+/* -> Edge to edge, as the separators between the article column's own sections are */
+.page-talk-actions-sep {
+  margin: 0.5rem -1rem;
+}
+
+.page-sidebar {
+  flex: 0 0 300px;
+
+  /*
+    Where the contents rail comes in from the article column's edge (`joined` on `PageToc`), as a
+    distance above the list: level with the rule along the bottom of the Article / Talk strip, so that
+    the strip's line carries straight on into the rail rather than turning down the article's edge and
+    back out a pixel lower. That rule is the bottom pixel of the 44px strip (`PageViewTabs.vue`), and
+    the list starts under the Contents heading's row -- 1rem of padding either side of a 1.25rem
+    caption line (`pages/Index.vue`).
+  */
+  --page-toc-lead: calc(1rem + 1.25rem + 1rem - 43px);
+
+  /*
+    Narrower once the window is: 300px is pitched for a wide desktop, where it is a tenth of the width, and
+    by 1200px it is a quarter of what is left after the nav sidebar. 200px still holds a heading of a few
+    words per line -- the contents list wraps rather than truncating (see `PageToc`) -- and hands the
+    article the other 100px.
+
+    1400px is this view's own threshold rather than one of the app's `--breakpoint-*`: it is where THIS
+    column starts crowding the article, which depends on its own width and the nav's.
+  */
+  @media (max-width: $toc-narrow-max) {
+    flex: 0 0 200px;
+  }
+
+  /*
+    And below 750px it stops being a column at all: even at 200px it is a third of a 600px window, and an
+    article is what the reader came for. It becomes a panel the width of the wide column, parked off the
+    right edge and slid in when asked for -- the same shape as the nav drawer on a narrow screen, and for
+    the same reason, so the two behave alike from opposite sides.
+
+    `position: fixed` is what takes it out of the row, so the article gets the whole width whether the
+    panel is open or not; the reader is never made to choose between the two, only to look at one at a
+    time. `transform` is what animates, being the one property that moves a box without laying anything
+    out again -- and the panel is out of flow, so there is nothing behind it to reflow anyway.
+
+    Right regardless of `tocPosition`: the opener is in the bottom-RIGHT corner, and a panel arriving from
+    the far side of the screen from the button that summoned it reads as something else appearing.
+  */
+  @media (max-width: $toc-overlay-max) {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 40;
+    /* -> The wide column's width, capped so it cannot take the whole of a small screen */
+    width: 300px;
+    max-width: 85vw;
+    transform: translateX(100%);
+    transition: transform 0.2s var(--ease-standard);
+    box-shadow: -2px 0 12px rgb(0 0 0 / 0.3);
+
+    &.is-open {
+      transform: none;
+    }
+  }
+
+  @at-root .body--light & {
+    background-color: $grey-2;
+  }
+  @at-root .body--dark & {
+    background-color: $dark-5;
+  }
+
+  /*
+    A bevel between two panels rather than a drawn line: a grey hairline over a light one on the light
+    sidebar, over a near-black one on the dark. The grey is `--page-chrome-rule`, the article column's
+    right-hand edge beside it -- `$grey-4` light, the lighter dark grey dark -- and the second line is
+    this separator's own `--w-hairline-color`.
+
+    One separator drawn two lines tall rather than two separators, so the hairline transform -- which
+    scales from the top -- thins both halves alike and they stay touching.
+  */
+  .w-separator {
+    --w-hairline-color: #fff;
+    height: 2px;
+
+    &::after {
+      background: linear-gradient(
+        to bottom,
+        var(--page-chrome-rule) 50%,
+        var(--w-hairline-color) 50%
+      );
+    }
+  }
+  @at-root .body--dark & .w-separator {
+    --w-hairline-color: #070a0d;
+  }
+
+  /*
+    The column is the height of the shell, so its own content scrolls when there is more of it than
+    there is room -- a long contents list, in practice. Nothing sticky is involved: the shell holds
+    still on its own, and the article beside this scrolls in its own box.
+  */
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: rgb(102 102 102 / 0.5) transparent;
+}
+
+/*
+  Behind the panel, and under it: the same tint and the same z-index as the nav drawer's scrim, one step
+  below the panel it dims. The opener is at z-30 as well and is not rendered while the panel is open, so
+  the two never overlap.
+*/
+.page-sidebar-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  background-color: rgb(0 0 0 / 0.4);
+}
+
+.page-sidebar-scrim-enter-active,
+.page-sidebar-scrim-leave-active,
+.toc-open-btn-enter-active,
+.toc-open-btn-leave-active {
+  transition: opacity 0.2s var(--ease-standard);
+}
+.page-sidebar-scrim-enter-from,
+.page-sidebar-scrim-leave-to,
+.toc-open-btn-enter-from,
+.toc-open-btn-leave-to {
+  opacity: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .page-sidebar,
+  .page-sidebar-scrim-enter-active,
+  .page-sidebar-scrim-leave-active,
+  .toc-open-btn-enter-active,
+  .toc-open-btn-leave-active {
+    transition-duration: 0.01ms;
+  }
+}
+
+/*
+  An annotated passage as it is quoted back: in the annotator's review (`PageAnnotator.vue`) and under
+  its comment in the Talk view (`PageComment.vue`). Here rather than in either, since both draw it. The
+  rule down the side is the colour the passage was painted in while it was picked
+  (`::highlight(wiki-annotation-pending)` in `_page-contents.scss`), so the two read as the same thing.
+*/
+.page-annotation-quote {
+  display: -webkit-box;
+  margin-bottom: 4px;
+  padding: 1px 0 1px 10px;
+  overflow: hidden;
+  border-left: 3px solid var(--q-warning);
+  font-size: 13px;
+  font-style: italic;
+  line-height: 1.5;
+  opacity: 0.8;
+  word-break: break-word;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+}

@@ -1,0 +1,2858 @@
+import { createHash } from 'node:crypto'
+import bcrypt from 'bcryptjs'
+import QRCode from 'qrcode'
+import {
+  authentication as authenticationTable,
+  comments as commentsTable,
+  groups as groupsTable,
+  sessions as sessionsTable,
+  userAvatars,
+  userGroups,
+  users as usersTable,
+  userKeys
+} from '../db/schema.ts'
+import { and, count, desc, eq, ilike, inArray, isNotNull, notExists, or, sql } from 'drizzle-orm'
+import { nanoid } from 'nanoid'
+import { flatten, uniq } from 'es-toolkit/array'
+import { detectImageMime, resizeImageToSquareJpeg } from '../helpers/images.ts'
+import { buildTotpUri, generateTotpSecret, verifyTotpCode } from '../helpers/totp.ts'
+import { CustomError } from '../helpers/common.ts'
+import { HANDLE_PATTERN } from './comments.ts'
+import type { AuthStrategy, ProviderProfile } from './authentication.ts'
+import type { SystemIds } from './types.ts'
+
+/** The essential user fields, mirroring the `UserCore` API schema. */
+export interface UserCore {
+  id: string
+  name: string
+  email: string
+  hasAvatar: boolean
+  isSystem: boolean
+  isActive: boolean
+  isVerified: boolean
+  /** Whether a SCIM client owns this account, which is what the admin list badges. */
+  isProvisioned: boolean
+  createdAt: Date
+  updatedAt: Date
+  lastLoginAt: Date | null
+}
+
+/** One page of users, with the total matching the filter rather than the page size. */
+export interface UserPage {
+  total: number
+  users: UserCore[]
+}
+
+/** A user and when they last signed in — all `getRecentLogins()` discloses. */
+export interface RecentLogin {
+  id: string
+  name: string
+  email: string
+  lastLoginAt: Date | null
+}
+
+/** A newly created account, as the admin dashboard lists it: identity and the moment only. */
+export interface NewestUser {
+  id: string
+  name: string
+  email: string
+  createdAt: Date
+}
+
+/**
+ * An authentication provider linked to a user, as exposed by the API. Secrets held in the stored
+ * `auth` blob (the password hash, the TFA secret) are never included — `isPasswordSet` and
+ * `isTfaSetup` report their state instead.
+ */
+export interface UserAuthProvider {
+  authId: string
+  authName: string
+  strategyKey: string
+  strategyIcon: string
+  config: Record<string, any>
+}
+
+/**
+ * One authentication provider as the user's own profile page sees it: enough to render what can be
+ * done with it, and nothing else. Unlike the administrator's view this carries no provider flags —
+ * only whether a password exists, whether 2FA is set up, and whether the user is allowed to turn it
+ * off again.
+ */
+export interface UserProfileAuthMethod {
+  authId: string
+  authName: string
+  strategyKey: string
+  strategyIcon: string
+  config: {
+    isPasswordSet: boolean
+    isTfaSetup: boolean
+    isTfaRequired: boolean
+    /** False once password login has been turned off, whether by the user or by an administrator. */
+    isPasswordLoginEnabled: boolean
+    /** Whether the account has another way in, and may therefore turn password login off. */
+    canDisablePasswordLogin: boolean
+    /** Whether the strategy lets a user change this password from their own profile. */
+    canChangePassword: boolean
+  }
+}
+
+/** The subset of user fields that may be modified. `isSystem` is deliberately absent. */
+export interface UserPatch {
+  name?: string
+  email?: string
+  /** The mention handle, or null to take it off. See the column in `db/schema.ts`. */
+  handle?: string | null
+  isActive?: boolean
+  isVerified?: boolean
+  /**
+   * SCIM's bookkeeping, and only SCIM writes either: whether a directory owns this account and what
+   * that directory calls it. The admin API's update route enumerates the fields it accepts, so
+   * neither is reachable from a browser — see `models/scim.ts`.
+   */
+  isProvisioned?: boolean
+  externalId?: string | null
+  meta?: Record<string, any>
+  prefs?: Record<string, any>
+}
+
+/**
+ * The self-service view of a user, flattening the `meta` and `prefs` blobs into the fields the
+ * profile page shows. Mirrors the `UserProfile` API schema.
+ */
+export interface UserProfile {
+  id: string
+  name: string
+  email: string
+  hasAvatar: boolean
+  /** The name this user is mentioned by in a comment, without the `@`. Empty when they have none. */
+  handle: string
+  location: string
+  jobTitle: string
+  pronouns: string
+  /**
+   * The language this wiki writes to this person in, or an empty string to be written to in
+   * whatever the site's own language is. See `prefs.locale` in `createUser`.
+   */
+  locale: string
+  timezone: string
+  dateFormat: string
+  timeFormat: string
+  appearance: string
+  cvd: string
+  /** Reduce motion whether or not the operating system asks for it. False follows the system. */
+  reduceMotion: boolean
+  /** Underline every link in page content, rather than only on hover. */
+  underlineLinks: boolean
+  /** How large page content is set: `default`, `large` or `larger`. The interface around it is not. */
+  contentTextSize: string
+}
+
+/**
+ * What a user's public profile page shows to whoever opens it.
+ *
+ * A strict subset of `UserProfile`, and deliberately not built by trimming one: the email is absent
+ * because a profile page is readable by anyone who can read the wiki, and every preference that only
+ * decides how the wiki is DRAWN for its owner — date format, appearance, colour vision — says nothing
+ * about the person. The time zone is the one preference that does, since it is what the card needs to
+ * say what time it is where they are.
+ */
+export interface PublicUserProfile {
+  id: string
+  name: string
+  hasAvatar: boolean
+  handle: string
+  location: string
+  jobTitle: string
+  pronouns: string
+  timezone: string
+  lastLoginAt: Date | null
+}
+
+/** The fields a user may change on its own profile. Notably not the email, nor any admin flag. */
+export interface UserProfilePatch {
+  name?: string
+  handle?: string
+  location?: string
+  jobTitle?: string
+  pronouns?: string
+  locale?: string
+  timezone?: string
+  dateFormat?: string
+  timeFormat?: string
+  appearance?: string
+  cvd?: string
+  reduceMotion?: boolean
+  underlineLinks?: boolean
+  contentTextSize?: string
+}
+
+/** The longest a `meta` profile field may be, as `UserProfileUpdate` enforces. */
+const MAX_PROFILE_META_LENGTH = 255
+
+/** The `meta` keys the profile owns, and the `prefs` keys it owns. */
+const profileMetaKeys = ['location', 'jobTitle', 'pronouns'] as const
+const profilePrefsKeys = [
+  'locale',
+  'timezone',
+  'dateFormat',
+  'timeFormat',
+  'appearance',
+  'cvd',
+  'reduceMotion',
+  'underlineLinks',
+  'contentTextSize'
+] as const
+
+/**
+ * The address domain of the accounts the sample content's discussion is written by, and the only
+ * thing that identifies them. `.invalid` is reserved (RFC 6761), so nothing is ever delivered to one.
+ */
+export const SAMPLE_ACCOUNT_DOMAIN = 'sample.invalid'
+
+/**
+ * The square, in pixels, an avatar is resized to. The profile page and the account menu both display
+ * one at 180px; nothing displays one larger.
+ */
+const avatarSize = 180
+
+/**
+ * How much of a picture an identity provider points at is worth downloading before giving up on it.
+ *
+ * The bytes are on their way to becoming a 180px square, so this is not a quality ceiling — it is the
+ * point past which a claim is pointing at something that was never an avatar, and the wiki should not
+ * be holding it in memory to find out.
+ */
+const remoteAvatarLimit = 5 * 1024 * 1024
+
+/**
+ * Escape the LIKE wildcards `%` and `_` (and the escape character itself) so that a user-supplied
+ * filter is matched literally. Values are still parameterized by the driver — this is about a `%`
+ * in the filter silently matching everything, not about injection.
+ */
+function escapeLikePattern(value: string): string {
+  return value.replaceAll('\\', '\\\\').replaceAll('%', '\\%').replaceAll('_', '\\_')
+}
+
+/**
+ * The groups a strategy puts everybody it lets in into: the Users group, plus its own auto-enroll
+ * groups. The Users group is not left to the strategy's list because it is where an ordinary
+ * account's access comes from — an account outside every group is refused everything, which is not
+ * what letting somebody register means.
+ */
+function strategyEnrollGroups(strategy: AuthStrategy): string[] {
+  return uniq([WIKI.data.systemIds.usersGroupId, ...(strategy.autoEnrollGroups ?? [])])
+}
+
+/**
+ * Count a wrong 2FA code against a continuation token, destroying the token once `maxTfaAttempts`
+ * have been used up — the client then has nothing left to continue with and has to start over.
+ *
+ * A token that has already been destroyed, or never existed, is not an error here: the caller is
+ * about to reject the attempt either way.
+ */
+async function countTfaFailure(token: string): Promise<void> {
+  const rows = await WIKI.db
+    .select({ id: userKeys.id, meta: userKeys.meta, userId: userKeys.userId })
+    .from(userKeys)
+    .where(eq(userKeys.token, token))
+    .limit(1)
+  const row = rows[0]
+  if (!row) {
+    return
+  }
+
+  const meta = (row.meta ?? {}) as Record<string, any>
+  const attempts = (meta.attempts ?? 0) + 1
+  if (attempts >= maxTfaAttempts) {
+    await WIKI.db.delete(userKeys).where(eq(userKeys.id, row.id))
+    WIKI.models.flags.authDebug(
+      `Discarded the 2FA continuation token of user ${row.userId} after ${attempts} incorrect codes`
+    )
+    return
+  }
+  await WIKI.db
+    .update(userKeys)
+    .set({ meta: { ...meta, attempts } })
+    .where(eq(userKeys.id, row.id))
+}
+
+/**
+ * How many wrong 2FA codes a continuation token survives before it is destroyed and the user has to
+ * start the login over. Retries have to be allowed — six digits get mistyped, and a code that rotates
+ * every 30 seconds is regularly entered a moment too late — but an unlimited number of them against a
+ * token that lives for 24 hours is a code space small enough to walk through.
+ */
+const maxTfaAttempts = 5
+
+/**
+ * How many ways into the account remain if the given provider stops working: the other providers
+ * linked to it, plus every registered passkey.
+ *
+ * A provider that is itself restricted does not count — it is no way in either. Neither is a passkey
+ * on an instance where passkeys are turned off, however many the account has registered. The ones
+ * that do count are counted whichever host they were registered against: on a multi-site instance one
+ * bound to another site still leaves the account reachable, which is what this guards against.
+ */
+function countAlternativeLogins(user: any, strategyId: string): number {
+  const auth = (user.auth ?? {}) as Record<string, any>
+  const otherProviders = Object.entries(auth).filter(
+    ([id, config]) => id !== strategyId && !config?.restrictLogin
+  ).length
+  const passkeys = WIKI.models.authentication.arePasskeysAllowed()
+    ? ((user.passkeys ?? {}).authenticators ?? []).length
+    : 0
+  return otherProviders + passkeys
+}
+
+/** Selection shared by the list / detail queries. Never includes `auth` or `passkeys`. */
+const userSelection = {
+  id: usersTable.id,
+  name: usersTable.name,
+  email: usersTable.email,
+  hasAvatar: usersTable.hasAvatar,
+  isSystem: usersTable.isSystem,
+  isActive: usersTable.isActive,
+  isVerified: usersTable.isVerified,
+  isProvisioned: usersTable.isProvisioned,
+  createdAt: usersTable.createdAt,
+  updatedAt: usersTable.updatedAt,
+  lastLoginAt: usersTable.lastLoginAt
+}
+
+/**
+ * A user as `list:users` may see one: what any page byline or comment already shows about them, and
+ * nothing about the account behind it.
+ */
+export interface UserLookup {
+  id: string
+  name: string
+  /** Empty for somebody who has not picked one. */
+  handle: string
+  hasAvatar: boolean
+}
+
+export interface LoginOptions {
+  siteId: string
+  strategyId: string
+  username?: string
+  password?: string
+  ip?: string
+}
+
+export interface AfterLoginResult {
+  authenticated?: boolean
+  nextAction: string
+  continuationToken?: string
+  tfaQRImage?: string
+  tfaSecret?: string
+  redirect: string
+}
+
+/**
+ * Users model
+ */
+class Users {
+  async getByEmail(email: string) {
+    const res = await WIKI.db.select().from(usersTable).where(eq(usersTable.email, email)).limit(1)
+    return res?.[0] ?? null
+  }
+
+  /**
+   * Who unattended work is recorded as having done it.
+   *
+   * Content arriving without a person behind it still has to name an author — a page pulled in by a
+   * scheduled storage sync lands in the wiki as an ordinary page, and an ordinary page has an author.
+   * The wiki's own longest-standing administrator is the least surprising answer: it is an account
+   * that exists on every instance, and one whose owner is entitled to have created the content.
+   *
+   * @returns The user id, or null on an instance with no active administrator at all
+   */
+  async getSystemActorId(): Promise<string | null> {
+    const rows = await WIKI.db
+      .select({ id: usersTable.id })
+      .from(usersTable)
+      .innerJoin(userGroups, eq(userGroups.userId, usersTable.id))
+      .innerJoin(groupsTable, eq(groupsTable.id, userGroups.groupId))
+      .where(
+        and(
+          eq(usersTable.isActive, true),
+          eq(usersTable.isSystem, false),
+          sql`${groupsTable.permissions} @> '["manage:system"]'::jsonb`
+        )
+      )
+      .orderBy(usersTable.createdAt)
+      .limit(1)
+    return rows[0]?.id ?? null
+  }
+
+  async getById(id: string) {
+    const res = await WIKI.db.select().from(usersTable).where(eq(usersTable.id, id)).limit(1)
+    return res?.[0] ?? null
+  }
+
+  /**
+   * Fetch the users who logged in most recently, most recent first.
+   *
+   * Identity and the moment only — this answers a dashboard panel readable by anyone in the admin area,
+   * which is a tier below the `read:users` that the user list itself needs, so it deliberately carries
+   * none of the account state `getUsers()` selects.
+   *
+   * An account that has never logged in has no place in the answer rather than trailing the end of it,
+   * hence the `isNotNull`. System accounts are excluded because the guest is one: nothing signs in as
+   * it, and a `lastLoginAt` on it would be an artefact rather than a visit.
+   *
+   * @param limit How many to return
+   * @returns The most recent logins, newest first
+   */
+  async getRecentLogins({ limit = 10 }: { limit?: number } = {}): Promise<RecentLogin[]> {
+    return WIKI.db
+      .select({
+        id: usersTable.id,
+        name: usersTable.name,
+        email: usersTable.email,
+        lastLoginAt: usersTable.lastLoginAt
+      })
+      .from(usersTable)
+      .where(and(isNotNull(usersTable.lastLoginAt), eq(usersTable.isSystem, false)))
+      .orderBy(desc(usersTable.lastLoginAt))
+      .limit(limit)
+  }
+
+  /**
+   * Fetch the most recently created accounts, newest first.
+   *
+   * The same bargain as `getRecentLogins()`: a dashboard panel below `read:users`, so identity and the
+   * moment only. System accounts are left out — they are made when the wiki is installed, not by
+   * anybody joining it.
+   *
+   * @param limit How many to return
+   * @returns The newest accounts, newest first
+   */
+  async getNewestUsers({ limit = 10 }: { limit?: number } = {}): Promise<NewestUser[]> {
+    return WIKI.db
+      .select({
+        id: usersTable.id,
+        name: usersTable.name,
+        email: usersTable.email,
+        createdAt: usersTable.createdAt
+      })
+      .from(usersTable)
+      .where(eq(usersTable.isSystem, false))
+      .orderBy(desc(usersTable.createdAt))
+      .limit(limit)
+  }
+
+  /**
+   * Fetch a page of users, optionally filtered by name or email
+   *
+   * @param filter Matched literally against name and email, case-insensitively
+   * @param assignableToGroupId Keep only the users that may be assigned to this group
+   * @returns The page of users plus the total number matching the filter
+   */
+  /**
+   * Users whose name or handle matches what was typed, for a picker.
+   *
+   * Only what `UserLookup` carries, because `list:users` is what answers this and it sees nothing
+   * else. Never matched on the email either, since a match would confirm an address the caller was
+   * never shown. Disabled accounts and the guest account are never offered: neither is somebody
+   * anything could be handed to.
+   *
+   * @param ids Narrow to these, for resolving ids already held rather than searching
+   */
+  async lookup({
+    query = '',
+    ids,
+    limit = 10
+  }: {
+    query?: string
+    ids?: string[]
+    limit?: number
+  }): Promise<UserLookup[]> {
+    const conditions = [eq(usersTable.isActive, true), eq(usersTable.isSystem, false)]
+    const term = query.trim()
+    if (term) {
+      const pattern = escapeLikePattern(term)
+      conditions.push(
+        or(ilike(usersTable.name, `%${pattern}%`), ilike(usersTable.handle, `${pattern}%`))!
+      )
+    }
+    if (ids) {
+      if (ids.length < 1) {
+        return []
+      }
+      conditions.push(inArray(usersTable.id, ids))
+    }
+    const rows = await WIKI.db
+      .select({
+        id: usersTable.id,
+        name: usersTable.name,
+        handle: usersTable.handle,
+        hasAvatar: usersTable.hasAvatar
+      })
+      .from(usersTable)
+      .where(and(...conditions))
+      .orderBy(usersTable.name)
+      .limit(limit)
+    return rows.map((row) => ({ ...row, handle: row.handle ?? '' }))
+  }
+
+  async getUsers({
+    filter = '',
+    assignableToGroupId = '',
+    page = 1,
+    limit = 20
+  }: {
+    filter?: string
+    assignableToGroupId?: string
+    page?: number
+    limit?: number
+  } = {}): Promise<UserPage> {
+    const conditions = []
+    if (filter) {
+      const pattern = `%${escapeLikePattern(filter)}%`
+      conditions.push(or(ilike(usersTable.name, pattern), ilike(usersTable.email, pattern))!)
+    }
+    if (assignableToGroupId) {
+      // -> Members of the group have nothing left to assign, and system users (the guest account)
+      //    have a fixed membership that `POST /groups/:id/users/:id` refuses to change
+      conditions.push(eq(usersTable.isSystem, false))
+      conditions.push(
+        notExists(
+          WIKI.db
+            .select({ exists: sql`1` })
+            .from(userGroups)
+            .where(
+              and(eq(userGroups.userId, usersTable.id), eq(userGroups.groupId, assignableToGroupId))
+            )
+        )
+      )
+    }
+    const where = conditions.length > 0 ? and(...conditions) : undefined
+
+    const totals = await WIKI.db.select({ total: count() }).from(usersTable).where(where)
+    const users = await WIKI.db
+      .select(userSelection)
+      .from(usersTable)
+      .where(where)
+      .orderBy(usersTable.name)
+      .limit(limit)
+      .offset((page - 1) * limit)
+
+    return {
+      total: totals[0]?.total ?? 0,
+      users
+    }
+  }
+
+  /**
+   * Fetch a single user with the groups it belongs to and the authentication providers linked to it.
+   *
+   * The stored `auth` blob is keyed by strategy ID and holds secrets, so it is reshaped into a list
+   * of providers carrying only state (`isPasswordSet`, `isTfaSetup`) — never the password hash or
+   * the TFA secret.
+   *
+   * @param id User ID
+   * @returns The user, or null if no such user exists
+   */
+  async getUserDetail(id: string) {
+    const results = await WIKI.db.select().from(usersTable).where(eq(usersTable.id, id)).limit(1)
+    const user = results[0]
+    if (!user) {
+      return null
+    }
+
+    const groups = await this.getUserGroups(id)
+
+    const strategies = await WIKI.db.select().from(authenticationTable)
+    const auth: UserAuthProvider[] = []
+    for (const [strategyId, rawConfig] of Object.entries(
+      (user.auth ?? {}) as Record<string, any>
+    )) {
+      const strategy = strategies.find((s: any) => s.id === strategyId)
+      const definition = WIKI.data.authentication?.find((d: any) => d.key === strategy?.module)
+      const { password, tfaSecret, tfaIsActive, tfaRequired, ...config } = rawConfig ?? {}
+      auth.push({
+        authId: strategyId,
+        authName: strategy?.displayName || definition?.title || strategy?.module || 'Unknown',
+        strategyKey: strategy?.module ?? 'unknown',
+        strategyIcon: definition?.icon ?? '',
+        config: {
+          ...config,
+          isPasswordSet: Boolean(password),
+          // -> Named as the profile page's own view names them, so one piece of state is not called two
+          //    things across the API. Whether 2FA is set up is `tfaIsActive` and a stored secret both:
+          //    a secret that was generated but never confirmed is not 2FA being on.
+          isTfaSetup: Boolean(tfaIsActive && tfaSecret),
+          isTfaRequired: Boolean(tfaRequired)
+        }
+      })
+    }
+
+    return {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      hasAvatar: user.hasAvatar,
+      isSystem: user.isSystem,
+      isActive: user.isActive,
+      isVerified: user.isVerified,
+      isProvisioned: user.isProvisioned,
+      externalId: user.externalId,
+      handle: user.handle ?? '',
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt,
+      lastLoginAt: user.lastLoginAt,
+      meta: user.meta,
+      prefs: user.prefs,
+      auth,
+      groups
+    }
+  }
+
+  /**
+   * Create a new user.
+   *
+   * @returns The new user's ID
+   */
+  async createUser({
+    name,
+    email,
+    password,
+    groups = [],
+    mustChangePassword = false,
+    isVerified = true,
+    isProvisioned = false,
+    externalId,
+    strategyId,
+    locale = ''
+  }: {
+    name: string
+    email: string
+    /**
+     * The local-strategy password, for an account that has one.
+     *
+     * Omitted for an account that authenticates somewhere else — one created by a provider login or
+     * by SCIM. Such a user gets no entry in `auth` at all, rather than an entry holding a random
+     * string nothing can sign in with: an empty blob is what `getProfileAuthMethods` reads as "this
+     * account has no password", and a hash of a value nobody holds reads as though it had one.
+     */
+    password?: string
+    groups?: string[]
+    mustChangePassword?: boolean
+    /**
+     * Defaults to true: an administrator creating the account vouches for the address. Login rejects
+     * an unverified user with `ERR_USER_NOT_VERIFIED`, which is cleared either by the link in the
+     * registration email or by an administrator marking the account verified.
+     */
+    isVerified?: boolean
+    /** Whether a SCIM client owns this account from the moment it exists. See `models/scim.ts`. */
+    isProvisioned?: boolean
+    /** What the directory provisioning it calls it, for an account SCIM created. */
+    externalId?: string | null
+    /**
+     * Which local strategy the password is filed under. Defaults to the built-in one, which is where
+     * every account seeded or created by an administrator keeps it.
+     *
+     * It matters because the local module reads `user.auth[its own strategy ID]` — a password stored
+     * under one local strategy authenticates nobody through another. A registration therefore files
+     * it under the strategy that was registered through, rather than assuming the built-in one.
+     */
+    strategyId?: string
+    /**
+     * The language to write to this person in, where the account was created somewhere that knows
+     * — a registration knows which language the wiki was being read in when the form was filled.
+     *
+     * Empty for an account created for somebody who is not there to say, which leaves the mails in
+     * the site's own language until they pick one on their profile.
+     */
+    locale?: string
+  }): Promise<string> {
+    const localStrategyId = strategyId ?? WIKI.data.systemIds.localAuthId
+    const result = await WIKI.db
+      .insert(usersTable)
+      .values({
+        email: email.toLowerCase(),
+        name,
+        auth: password
+          ? {
+              [localStrategyId]: {
+                password: await bcrypt.hash(password, 12),
+                mustChangePwd: mustChangePassword,
+                restrictLogin: false,
+                tfaIsActive: false,
+                tfaRequired: false,
+                tfaSecret: ''
+              }
+            }
+          : {},
+        isSystem: false,
+        isActive: true,
+        isVerified,
+        isProvisioned,
+        externalId: externalId ?? null,
+        meta: {
+          location: '',
+          jobTitle: '',
+          pronouns: ''
+        },
+        prefs: {
+          locale,
+          // -> Seeded from the instance-wide user defaults, which an administrator can change
+          timezone: WIKI.config.userDefaults?.timezone ?? 'America/New_York',
+          dateFormat: WIKI.config.userDefaults?.dateFormat ?? 'YYYY-MM-DD',
+          timeFormat: WIKI.config.userDefaults?.timeFormat ?? '12h',
+          appearance: 'site',
+          cvd: 'none',
+          reduceMotion: false,
+          underlineLinks: false,
+          contentTextSize: 'default'
+        }
+      })
+      .returning({ id: usersTable.id })
+
+    const userId = result[0].id
+    if (groups.length > 0) {
+      await this.setUserGroups(userId, groups)
+    }
+
+    WIKI.models.flags.authDebug(
+      `Created user ${userId} <${email.toLowerCase()}> in ${groups.length} group(s), password: ${password ? 'yes' : 'no'}, mustChangePwd: ${mustChangePassword}, verified: ${isVerified}`
+    )
+
+    await WIKI.models.hooks.emit('user:join', {
+      userId,
+      metadata: {
+        name,
+        email: email.toLowerCase()
+      }
+    })
+
+    return userId
+  }
+
+  /**
+   * Update a user's own fields. Group membership is handled by `setUserGroups()`.
+   *
+   * @param patch Fields to change — must not be empty
+   * @returns Whether a user was updated
+   */
+  async updateUser(id: string, patch: UserPatch): Promise<boolean> {
+    const values: Record<string, any> = { ...patch, updatedAt: sql`now()` }
+    if (typeof values.email === 'string') {
+      values.email = values.email.toLowerCase()
+    }
+    try {
+      const result = await WIKI.db.update(usersTable).set(values).where(eq(usersTable.id, id))
+      return (result.rowCount ?? 0) > 0
+    } catch (err: any) {
+      // -> A handle somebody else already holds is the one clash here a person can fix, and the
+      //    only one worth turning into a sentence rather than a 500
+      const cause = err.cause ?? err
+      if (cause.code === '23505' && cause.constraint === 'users_handle_idx') {
+        throw new CustomError('userHandleTaken', 'That handle is already taken.', 409)
+      }
+      throw err
+    }
+  }
+
+  /**
+   * A handle as typed, as it is stored: trimmed, checked against `HANDLE_PATTERN`, and null for an
+   * empty one — which is how a handle is taken off. Null rather than '' is what the unique index
+   * needs: postgres counts nulls as distinct, so any number of users may have none.
+   */
+  handleToStore(handle: string): string | null {
+    const trimmed = handle.trim()
+    if (trimmed.length > 0 && !HANDLE_PATTERN.test(trimmed)) {
+      throw new CustomError(
+        'userHandleInvalid',
+        'A handle is 3 to 32 characters of letters, digits, hyphens and underscores.'
+      )
+    }
+    return trimmed.length > 0 ? trimmed : null
+  }
+
+  /**
+   * The profile of a single user, as shown on its own profile page.
+   *
+   * `meta` and `prefs` are free-form blobs, so every field is defaulted here rather than trusted to
+   * be present — a user created before a given key existed simply has none.
+   *
+   * @returns The profile, or null if no such user exists
+   */
+  async getProfile(id: string): Promise<UserProfile | null> {
+    const user = await this.getById(id)
+    if (!user) {
+      return null
+    }
+    const meta = (user.meta ?? {}) as Record<string, any>
+    const prefs = (user.prefs ?? {}) as Record<string, any>
+    return {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      hasAvatar: user.hasAvatar,
+      // -> A column of its own rather than a `meta` key, because it has to be unique across the
+      //    wiki: `@ana` means one person or it means nothing
+      handle: user.handle ?? '',
+      location: meta.location ?? '',
+      jobTitle: meta.jobTitle ?? '',
+      pronouns: meta.pronouns ?? '',
+      // -> An empty locale means "whatever the site is written in", which is what the mails fall
+      //    back to and what the profile page offers as the first choice
+      locale: prefs.locale ?? '',
+      // -> An empty time zone / date format means "whatever the client resolves", which is what the
+      //    profile page falls back to
+      timezone: prefs.timezone ?? '',
+      dateFormat: prefs.dateFormat ?? '',
+      timeFormat: prefs.timeFormat ?? '12h',
+      appearance: prefs.appearance ?? 'site',
+      cvd: prefs.cvd ?? 'none',
+      reduceMotion: prefs.reduceMotion ?? false,
+      underlineLinks: prefs.underlineLinks ?? false,
+      contentTextSize: prefs.contentTextSize ?? 'default'
+    }
+  }
+
+  /**
+   * A user as their public profile page presents them, which is anybody who can read the wiki.
+   *
+   * `meta` and `prefs` are defaulted here for the same reason `getProfile` defaults them: they are
+   * free-form blobs, and a user created before a key existed simply has none.
+   *
+   * @returns The profile, or null when there is no person behind the ID — no such user, or a system
+   *          account, which is what the guest every anonymous reader is and what content nobody
+   *          authored is attributed to. Neither has a profile to show.
+   */
+  async getPublicProfile(id: string): Promise<PublicUserProfile | null> {
+    const user = await this.getById(id)
+    if (!user || user.isSystem) {
+      return null
+    }
+    const meta = (user.meta ?? {}) as Record<string, any>
+    const prefs = (user.prefs ?? {}) as Record<string, any>
+    return {
+      id: user.id,
+      name: user.name,
+      hasAvatar: user.hasAvatar,
+      // -> Public on purpose: it is written into every comment that mentions them
+      handle: user.handle ?? '',
+      location: meta.location ?? '',
+      jobTitle: meta.jobTitle ?? '',
+      pronouns: meta.pronouns ?? '',
+      // -> Empty for a user who never picked one, which leaves the card with no local time to show
+      //    rather than one from a zone nobody chose
+      timezone: prefs.timezone ?? '',
+      lastLoginAt: user.lastLoginAt
+    }
+  }
+
+  /**
+   * A user's own settings for one editor.
+   *
+   * Kept under `prefs.editors[editor]` so each editor owns its own blob and adding a second one
+   * needs no migration. The shape is whatever that editor saves; this only guarantees an object.
+   *
+   * @returns The saved settings, or `{}` for a user who has never saved any
+   */
+  async getEditorSettings(id: string, editor: string): Promise<Record<string, any>> {
+    const user = await this.getById(id)
+    if (!user) {
+      return {}
+    }
+    const prefs = (user.prefs ?? {}) as Record<string, any>
+    return (prefs.editors?.[editor] ?? {}) as Record<string, any>
+  }
+
+  /**
+   * Replace a user's settings for one editor.
+   *
+   * Merges at both levels for the same reason `updateProfile` does: another editor's settings, and
+   * every other preference, have to survive one editor saving its own.
+   *
+   * @returns The saved settings, or null if no such user exists
+   */
+  async setEditorSettings(
+    id: string,
+    editor: string,
+    config: Record<string, any>
+  ): Promise<Record<string, any> | null> {
+    const user = await this.getById(id)
+    if (!user) {
+      return null
+    }
+    const prefs = { ...((user.prefs ?? {}) as Record<string, any>) }
+    prefs.editors = { ...((prefs.editors ?? {}) as Record<string, any>), [editor]: config }
+    await this.updateUser(id, { prefs })
+    return config
+  }
+
+  /**
+   * Update a user's own profile fields, merging into the `meta` and `prefs` blobs rather than
+   * replacing them — an administrator's notes and any key this endpoint does not expose must survive
+   * a user saving its profile.
+   *
+   * @param patch Fields to change; omitted ones are left as they are
+   * @returns The updated profile, or null if no such user exists
+   */
+  async updateProfile(id: string, patch: UserProfilePatch): Promise<UserProfile | null> {
+    const user = await this.getById(id)
+    if (!user) {
+      return null
+    }
+
+    const meta = { ...((user.meta ?? {}) as Record<string, any>) }
+    const prefs = { ...((user.prefs ?? {}) as Record<string, any>) }
+    for (const key of profileMetaKeys) {
+      if (patch[key] !== undefined) {
+        meta[key] = patch[key]
+      }
+    }
+    for (const key of profilePrefsKeys) {
+      if (patch[key] !== undefined) {
+        prefs[key] = patch[key]
+      }
+    }
+
+    const values: UserPatch = { meta, prefs }
+    if (patch.name !== undefined) {
+      values.name = patch.name
+    }
+    if (patch.handle !== undefined) {
+      values.handle = this.handleToStore(patch.handle)
+    }
+
+    await this.updateUser(id, values)
+
+    return this.getProfile(id)
+  }
+
+  /**
+   * A user's avatar, with the type its bytes say it is.
+   *
+   * The type is sniffed rather than stored: an avatar written while Sharp was installed is a JPEG,
+   * one written without it is whatever was uploaded, and nothing records which. Unrecognizable bytes
+   * are reported as JPEG, which is what every avatar stored by 2.x is.
+   *
+   * @returns The avatar, or null if this user has none
+   */
+  async getAvatar(userId: string): Promise<{ data: Buffer; mime: string } | null> {
+    const rows = await WIKI.db
+      .select({ data: userAvatars.data })
+      .from(userAvatars)
+      .where(eq(userAvatars.id, userId))
+      .limit(1)
+    const data = rows[0]?.data
+    if (!data) {
+      return null
+    }
+    return { data, mime: detectImageMime(data) ?? 'image/jpeg' }
+  }
+
+  /**
+   * Replace a user's avatar.
+   *
+   * Normalized to a square JPEG when the Sharp extension is installed — an avatar is displayed at one
+   * small size, so there is no reason to keep a multi-megabyte original around. Without Sharp the
+   * uploaded bytes are stored as they came in, which is why reading one sniffs the type.
+   *
+   * @param data The uploaded image, already known to be one of the supported formats
+   */
+  async setAvatar(userId: string, data: Buffer): Promise<void> {
+    const normalized = (await resizeImageToSquareJpeg(data, avatarSize)) ?? data
+    await WIKI.db
+      .insert(userAvatars)
+      .values({ id: userId, data: normalized })
+      .onConflictDoUpdate({ target: userAvatars.id, set: { data: normalized } })
+    await WIKI.db
+      .update(usersTable)
+      .set({ hasAvatar: true, updatedAt: sql`now()` })
+      .where(eq(usersTable.id, userId))
+  }
+
+  /**
+   * Fetch the picture an identity provider pointed at, and store it as the account's avatar.
+   *
+   * Nothing about the URL is taken on trust beyond its being one. It arrived in a claim, so only
+   * http(s) is followed — a `data:` or `file:` URL is not something to go and read on a login — the
+   * download is capped and given a deadline, and the bytes have to sniff as an image exactly as an
+   * uploaded avatar's do. A provider that answers with a login page instead of a picture is a
+   * provider whose HTML must not end up served back as somebody's avatar.
+   *
+   * Failure is never the login's problem: an avatar that could not be fetched is logged and the
+   * person is signed in without it.
+   *
+   * @returns Whether an avatar was stored
+   */
+  async setAvatarFromUrl(userId: string, url: string): Promise<boolean> {
+    try {
+      const target = new URL(url)
+      if (target.protocol !== 'https:' && target.protocol !== 'http:') {
+        throw new Error(`a ${target.protocol} URL is not one to fetch a picture from`)
+      }
+      const resp = await fetch(target, { redirect: 'follow', signal: AbortSignal.timeout(10_000) })
+      if (!resp.ok) {
+        throw new Error(`the server answered ${resp.status}`)
+      }
+      if (!resp.body) {
+        throw new Error('the server answered with nothing')
+      }
+      // -> Read with a running total rather than in one go: `content-length` is the sender's claim
+      //    about the size, and this is a body from somewhere an administrator merely named
+      const chunks: Buffer[] = []
+      let size = 0
+      for await (const chunk of resp.body as unknown as AsyncIterable<Uint8Array>) {
+        size += chunk.byteLength
+        if (size > remoteAvatarLimit) {
+          throw new Error(`it is larger than ${Math.round(remoteAvatarLimit / 1024 / 1024)} MB`)
+        }
+        chunks.push(Buffer.from(chunk))
+      }
+      const data = Buffer.concat(chunks)
+      if (!detectImageMime(data)) {
+        throw new Error('what came back is not a PNG, JPEG, WebP or GIF')
+      }
+      await this.setAvatar(userId, data)
+      return true
+    } catch (err: any) {
+      WIKI.logger.warn(`Could not store the avatar at ${url} for user ${userId}: ${err.message}`)
+      return false
+    }
+  }
+
+  /**
+   * Store bytes an identity provider handed over directly as the account's avatar.
+   *
+   * The same check as an upload and as a fetched picture: what a directory calls `jpegPhoto` is
+   * whatever was put in the attribute, and only an image may be stored and served back. Failure is
+   * logged rather than raised, so a login is never lost over an avatar.
+   *
+   * @returns Whether an avatar was stored
+   */
+  async setAvatarFromBytes(userId: string, data: Buffer): Promise<boolean> {
+    if (!detectImageMime(data)) {
+      WIKI.logger.warn(
+        `Could not store the avatar for user ${userId}: the provider's bytes are not a PNG, JPEG, WebP or GIF`
+      )
+      return false
+    }
+    await this.setAvatar(userId, data)
+    return true
+  }
+
+  /**
+   * Remove a user's avatar, leaving it to be rendered as initials again.
+   */
+  async clearAvatar(userId: string): Promise<void> {
+    await WIKI.db.delete(userAvatars).where(eq(userAvatars.id, userId))
+    await WIKI.db
+      .update(usersTable)
+      .set({ hasAvatar: false, updatedAt: sql`now()` })
+      .where(eq(usersTable.id, userId))
+  }
+
+  /**
+   * The groups a user belongs to, by name. Only the identity of each group — never its permissions or
+   * page rules, which a user has no business reading about itself.
+   */
+  async getUserGroups(userId: string): Promise<Array<{ id: string; name: string }>> {
+    return WIKI.db
+      .select({ id: groupsTable.id, name: groupsTable.name })
+      .from(userGroups)
+      .innerJoin(groupsTable, eq(groupsTable.id, userGroups.groupId))
+      .where(eq(userGroups.userId, userId))
+      .orderBy(groupsTable.name)
+  }
+
+  /**
+   * The IDs of the groups a user belongs to
+   */
+  async getUserGroupIds(userId: string): Promise<string[]> {
+    const rows = await WIKI.db
+      .select({ groupId: userGroups.groupId })
+      .from(userGroups)
+      .where(eq(userGroups.userId, userId))
+    return rows.map((r: any) => r.groupId)
+  }
+
+  /**
+   * Replace a user's group membership with exactly the given groups.
+   *
+   * Unknown group IDs are ignored rather than failing the whole update, so that a stale client does
+   * not block an otherwise valid save. So is a membership that may not exist — see
+   * `groups.guestMembershipViolation`: this is the one call that sets every group at once, and it is
+   * reached from creating a user, editing one, and enrolling one that an identity provider has just
+   * sent. Dropping what may not be granted keeps all three honest without any of them having to know
+   * about the guests group.
+   */
+  async setUserGroups(userId: string, groupIds: string[]): Promise<void> {
+    const user = await this.getById(userId)
+    const allowed = groupIds.filter(
+      (groupId) => !WIKI.models.groups.guestMembershipViolation(groupId, user)
+    )
+    if (allowed.length !== groupIds.length) {
+      WIKI.logger.warn(
+        `Dropped ${groupIds.length - allowed.length} group assignment(s) for user ${userId} that may not be granted.`
+      )
+    }
+    /*
+      The guest account keeps the membership it was seeded with whatever was asked for: it is the one
+      user whose groups are not an administrator's to set, and an empty list would otherwise leave
+      anonymous access resolving against no rules at all.
+    */
+    if (user?.isSystem) {
+      return
+    }
+
+    const wanted =
+      allowed.length > 0
+        ? await WIKI.db
+            .select({ id: groupsTable.id })
+            .from(groupsTable)
+            .where(inArray(groupsTable.id, allowed))
+        : []
+    const wantedIds = wanted.map((g: any) => g.id)
+
+    await WIKI.db.delete(userGroups).where(eq(userGroups.userId, userId))
+    if (wantedIds.length > 0) {
+      await WIKI.db
+        .insert(userGroups)
+        .values(wantedIds.map((groupId: string) => ({ userId, groupId })))
+    }
+  }
+
+  /**
+   * Put a user in the wiki groups an identity provider named for them.
+   *
+   * Groups are matched by name, ignoring case, and only ever matched: a claim naming a group this
+   * wiki does not have is not an instruction to create one. A group here is a set of permissions and
+   * page rules that somebody wrote deliberately, and an empty one created from a directory entry
+   * would grant nothing while looking like it grants something.
+   *
+   * What the claim does NOT name is the half worth being careful about. Without `groupsExclusive` the
+   * claim only ever adds, so a membership granted here survives a directory that has never heard of
+   * it. With it, the provider is the authority and a group it stops naming is taken back — except the
+   * Users group and the strategy's auto-enroll groups, which are granted to everybody this strategy
+   * lets in, so a claim not mentioning them is not an opinion about them.
+   *
+   * A provider whose claim is missing entirely leaves membership alone; one whose claim is an empty
+   * list has said this person is in none, which under `groupsExclusive` is a removal.
+   */
+  async applyProviderGroups(
+    userId: string,
+    profile: ProviderProfile,
+    strategy: AuthStrategy
+  ): Promise<void> {
+    if (!profile.groups) {
+      return
+    }
+    const claimed = profile.groups.map((name) => name.toLowerCase())
+    const all = await WIKI.db
+      .select({ id: groupsTable.id, name: groupsTable.name })
+      .from(groupsTable)
+    const matched = all.filter((grp) => claimed.includes(grp.name.toLowerCase()))
+    const unmatched = profile.groups.filter(
+      (name) => !all.some((grp) => grp.name.toLowerCase() === name.toLowerCase())
+    )
+    /*
+      Both halves of the answer, and logged even when the provider named nothing: an empty claim is
+      the commonest reason a group mapping appears not to work, and it is silent everywhere else — the
+      wanted set below then simply equals the current one. What the provider said about this person is
+      logged by the module; this is what the wiki could do with it.
+    */
+    WIKI.models.flags.authDebug(
+      `Strategy ${strategy.id} named ${profile.groups.length} group(s) for user ${userId}: ${matched.length} matched a wiki group (${matched.map((grp) => grp.name).join(', ') || 'none'})${unmatched.length > 0 ? `, ${unmatched.length} did not (${unmatched.join(', ')})` : ''}`
+    )
+
+    const current = await this.getUserGroupIds(userId)
+    const autoEnroll = strategyEnrollGroups(strategy)
+    const wanted = profile.groupsExclusive
+      ? uniq([...matched.map((grp) => grp.id), ...current.filter((id) => autoEnroll.includes(id))])
+      : uniq([...current, ...matched.map((grp) => grp.id)])
+
+    // -> Every login goes through here, and most of them change nothing: `setUserGroups` replaces the
+    //    whole membership, which is not worth doing to arrive back where it started
+    if (wanted.length === current.length && wanted.every((id) => current.includes(id))) {
+      return
+    }
+    await this.setUserGroups(userId, wanted)
+    WIKI.models.flags.authDebug(
+      `Set user ${userId} to ${wanted.length} group(s) from strategy ${strategy.id}'s group claim`
+    )
+  }
+
+  /**
+   * Update the local-strategy behaviour flags for a user, leaving secrets and any other linked
+   * provider untouched.
+   *
+   * @param flags Any of `mustChangePwd`, `restrictLogin`, `tfaRequired`
+   * @returns False if the user does not exist
+   */
+  async setUserAuthFlags(id: string, flags: Record<string, any>): Promise<boolean> {
+    const user = await this.getById(id)
+    if (!user) {
+      return false
+    }
+
+    const localStrategyId = WIKI.data.systemIds.localAuthId
+    const auth = (user.auth ?? {}) as Record<string, any>
+    const current = auth[localStrategyId]
+    if (!current) {
+      // -> The user does not use local authentication, so there are no local flags to set
+      return false
+    }
+
+    for (const key of ['mustChangePwd', 'restrictLogin', 'tfaRequired'] as const) {
+      if (flags[key] !== undefined) {
+        current[key] = Boolean(flags[key])
+      }
+    }
+    auth[localStrategyId] = current
+
+    await WIKI.db
+      .update(usersTable)
+      .set({ auth, updatedAt: sql`now()` })
+      .where(eq(usersTable.id, id))
+    return true
+  }
+
+  /**
+   * Set a user's local-strategy password, leaving any other linked provider untouched.
+   *
+   * @returns False if the user does not exist
+   */
+  async setUserPassword({
+    id,
+    newPassword,
+    mustChangePassword = false
+  }: {
+    id: string
+    newPassword: string
+    mustChangePassword?: boolean
+  }): Promise<boolean> {
+    const user = await this.getById(id)
+    if (!user) {
+      return false
+    }
+
+    const localStrategyId = WIKI.data.systemIds.localAuthId
+    const auth = (user.auth ?? {}) as Record<string, any>
+    auth[localStrategyId] = {
+      ...auth[localStrategyId],
+      password: await bcrypt.hash(newPassword, 12),
+      mustChangePwd: mustChangePassword
+    }
+
+    await WIKI.db
+      .update(usersTable)
+      .set({ auth, updatedAt: sql`now()` })
+      .where(eq(usersTable.id, id))
+    return true
+  }
+
+  /**
+   * The authentication providers linked to a user, as its own profile page shows them.
+   *
+   * Reshaped from the stored `auth` blob the same way `getUserDetail()` does it, but reporting only
+   * what the user may act on. `isTfaRequired` is what greys out the "turn off 2FA" button, so it
+   * accounts for the strategy enforcing 2FA for everyone as well as this user being flagged for it.
+   */
+  async getProfileAuthMethods(userId: string): Promise<UserProfileAuthMethod[]> {
+    const user = await this.getById(userId)
+    if (!user) {
+      return []
+    }
+
+    /*
+      The completed strategies rather than the raw rows: a prop declared by a module after a strategy
+      was configured is missing from what is stored, and `allowPasswordChange` — like `enforceTfa`
+      below — has to read as the module's default there rather than as absent.
+    */
+    const strategies = await WIKI.models.authentication.getActiveStrategies()
+    const methods: UserProfileAuthMethod[] = []
+    for (const [strategyId, rawConfig] of Object.entries(
+      (user.auth ?? {}) as Record<string, any>
+    )) {
+      const strategy = strategies.find((s: any) => s.id === strategyId)
+      const definition = WIKI.data.authentication?.find((d: any) => d.key === strategy?.module)
+      const config = rawConfig ?? {}
+      methods.push({
+        authId: strategyId,
+        authName: strategy?.displayName || definition?.title || strategy?.module || 'Unknown',
+        strategyKey: strategy?.module ?? 'unknown',
+        strategyIcon: definition?.icon ?? '',
+        config: {
+          isPasswordSet: Boolean(config.password),
+          isTfaSetup: Boolean(config.tfaIsActive && config.tfaSecret),
+          isTfaRequired: Boolean(
+            config.tfaRequired || (strategy?.config as Record<string, any>)?.enforceTfa
+          ),
+          isPasswordLoginEnabled: !config.restrictLogin,
+          canDisablePasswordLogin: countAlternativeLogins(user, strategyId) > 0,
+          // -> `!== false` rather than `=== true`, so a module that declares no such prop at all is
+          //    not read as forbidding something it has no opinion about
+          canChangePassword:
+            (strategy?.config as Record<string, any>)?.allowPasswordChange !== false
+        }
+      })
+    }
+    return methods
+  }
+
+  /**
+   * Change a user's own password, having checked the current one.
+   *
+   * Distinct from `setUserPassword()`, which is an administrator replacing a password it does not
+   * know. This also clears `mustChangePwd`: a user who has just chosen a password satisfies the
+   * requirement to choose one.
+   *
+   * @throws `ERR_INVALID_USER`, `ERR_INVALID_STRATEGY`, `ERR_PASSWORD_TOO_SHORT` or
+   *         `ERR_INCORRECT_CURRENT_PASSWORD`
+   */
+  async changeOwnPassword({
+    userId,
+    strategyId,
+    currentPassword,
+    newPassword
+  }: {
+    userId: string
+    strategyId: string
+    currentPassword: string
+    newPassword: string
+  }): Promise<void> {
+    const user = await this.getById(userId)
+    if (!user) {
+      throw new Error('ERR_INVALID_USER')
+    }
+    if (!newPassword || newPassword.length < 8) {
+      throw new Error('ERR_PASSWORD_TOO_SHORT')
+    }
+
+    const auth = (user.auth ?? {}) as Record<string, any>
+    // -> Only a provider that stores a password here has one to change; an external identity provider
+    //    holds it somewhere this instance cannot reach
+    if (!auth[strategyId]?.password) {
+      throw new Error('ERR_INVALID_STRATEGY')
+    }
+    if ((await bcrypt.compare(currentPassword, auth[strategyId].password)) !== true) {
+      WIKI.models.flags.authDebug(
+        `Password change for user ${userId} rejected: the current password did not match`
+      )
+      throw new Error('ERR_INCORRECT_CURRENT_PASSWORD')
+    }
+
+    auth[strategyId] = {
+      ...auth[strategyId],
+      password: await bcrypt.hash(newPassword, 12),
+      mustChangePwd: false
+    }
+    await WIKI.db
+      .update(usersTable)
+      .set({ auth, updatedAt: sql`now()` })
+      .where(eq(usersTable.id, userId))
+  }
+
+  /**
+   * Turn password login on or off for a user's own account, which is the same `restrictLogin` flag an
+   * administrator sets from the admin area.
+   *
+   * Turning it off is refused unless something else can still sign the account in — a passkey or
+   * another linked provider — because the alternative is a user locking themselves out of their own
+   * account with one click. Turning it back on needs no such check, and the password itself is neither
+   * cleared nor asked for: a session that got this far has already been authenticated.
+   *
+   * @throws `ERR_INVALID_USER`, `ERR_INVALID_STRATEGY`, `ERR_PASSWORD_LOGIN_NOT_APPLICABLE` or
+   *         `ERR_NO_OTHER_LOGIN_METHOD`
+   */
+  async setPasswordLoginEnabled({
+    userId,
+    strategyId,
+    isEnabled
+  }: {
+    userId: string
+    strategyId: string
+    isEnabled: boolean
+  }): Promise<void> {
+    const user = await this.getById(userId)
+    if (!user) {
+      throw new Error('ERR_INVALID_USER')
+    }
+    const auth = (user.auth ?? {}) as Record<string, any>
+    if (!auth[strategyId]) {
+      throw new Error('ERR_INVALID_STRATEGY')
+    }
+
+    // -> The flag is only ever read by the local module's `authenticate()`, so setting it on a provider
+    //    that authenticates elsewhere would be a switch connected to nothing
+    const strategy = await WIKI.models.authentication.getStrategyById(strategyId)
+    if (strategy?.module !== 'local' || !auth[strategyId].password) {
+      throw new Error('ERR_PASSWORD_LOGIN_NOT_APPLICABLE')
+    }
+
+    if (!isEnabled && countAlternativeLogins(user, strategyId) < 1) {
+      throw new Error('ERR_NO_OTHER_LOGIN_METHOD')
+    }
+
+    auth[strategyId] = { ...auth[strategyId], restrictLogin: !isEnabled }
+    await WIKI.db
+      .update(usersTable)
+      .set({ auth, updatedAt: sql`now()` })
+      .where(eq(usersTable.id, userId))
+
+    WIKI.models.flags.authDebug(
+      `User ${userId} <${user.email}> turned password login ${isEnabled ? 'on' : 'off'}`
+    )
+  }
+
+  /**
+   * Start 2FA setup for a user: store a fresh secret, inactive, and return the QR code to scan.
+   *
+   * The secret is stored before it is proven to work, because the user has to be able to scan it and
+   * come back with a code generated from it. It counts for nothing until `enableTfa()` marks it
+   * active, and starting the setup again simply replaces it.
+   *
+   * @param user The user row, whose `auth` blob is updated in place as well as saved
+   * @param siteId The site being logged into, which names the entry in the authenticator app
+   * @returns The QR code as an SVG document, and the secret it encodes — which is shown as text too,
+   *          for a user who would rather type it into an authenticator app than scan anything
+   */
+  async startTfaSetup(
+    user: any,
+    strategyId: string,
+    siteId?: string
+  ): Promise<{ secret: string; tfaQRImage: string }> {
+    WIKI.logger.debug(`Generating a new 2FA secret for user ${user.id}...`)
+
+    // -> The title is only a label in the user's authenticator app, so any site will do when the one
+    //    being logged into cannot be resolved
+    const site = (siteId ? WIKI.sites[siteId] : null) ?? Object.values(WIKI.sites ?? {})[0]
+    const issuer = (site as any)?.config?.title || 'Wiki'
+
+    const secret = generateTotpSecret()
+    user.auth = (user.auth ?? {}) as Record<string, any>
+    user.auth[strategyId] = {
+      ...user.auth[strategyId],
+      tfaSecret: secret,
+      tfaIsActive: false
+    }
+    await WIKI.db
+      .update(usersTable)
+      .set({ auth: user.auth, updatedAt: sql`now()` })
+      .where(eq(usersTable.id, user.id))
+
+    return {
+      secret,
+      tfaQRImage: await QRCode.toString(buildTotpUri({ secret, account: user.email, issuer }), {
+        type: 'svg',
+        margin: 1
+      })
+    }
+  }
+
+  /**
+   * Mark a user's stored 2FA secret as active, i.e. required from now on. Called once the user has
+   * proven it produces the codes this server expects.
+   */
+  async enableTfa(user: any, strategyId: string): Promise<void> {
+    user.auth[strategyId] = { ...user.auth[strategyId], tfaIsActive: true }
+    await WIKI.db
+      .update(usersTable)
+      .set({ auth: user.auth, updatedAt: sql`now()` })
+      .where(eq(usersTable.id, user.id))
+    WIKI.models.flags.authDebug(`User ${user.id} <${user.email}> enabled 2FA`)
+  }
+
+  /**
+   * Turn 2FA off for a user and forget the secret, so that setting it up again starts from a new one.
+   *
+   * @throws `ERR_INVALID_USER`, `ERR_INVALID_STRATEGY`, `ERR_TFA_NOT_ACTIVE` or `ERR_TFA_ENFORCED`
+   */
+  async disableTfa(userId: string, strategyId: string): Promise<void> {
+    const user = await this.getById(userId)
+    if (!user) {
+      throw new Error('ERR_INVALID_USER')
+    }
+    const auth = (user.auth ?? {}) as Record<string, any>
+    if (!auth[strategyId]) {
+      throw new Error('ERR_INVALID_STRATEGY')
+    }
+    if (!auth[strategyId].tfaIsActive) {
+      throw new Error('ERR_TFA_NOT_ACTIVE')
+    }
+
+    // -> Turning it off would be undone at the next login, which is worth an error rather than a
+    //    confusing round trip. The client greys the button out, but that is a client.
+    const strategy = await WIKI.models.authentication.getStrategyById(strategyId)
+    if (auth[strategyId].tfaRequired || (strategy?.config as Record<string, any>)?.enforceTfa) {
+      throw new Error('ERR_TFA_ENFORCED')
+    }
+
+    auth[strategyId] = { ...auth[strategyId], tfaIsActive: false, tfaSecret: '' }
+    await WIKI.db
+      .update(usersTable)
+      .set({ auth, updatedAt: sql`now()` })
+      .where(eq(usersTable.id, userId))
+    WIKI.models.flags.authDebug(`User ${userId} <${user.email}> disabled 2FA`)
+  }
+
+  /**
+   * Whether a security code matches the 2FA secret stored for a user under one strategy.
+   */
+  verifyTfaCode(user: any, strategyId: string, securityCode: string): boolean {
+    const secret = ((user.auth ?? {}) as Record<string, any>)[strategyId]?.tfaSecret
+    return Boolean(secret) && verifyTotpCode(secret, securityCode)
+  }
+
+  /**
+   * Delete a user.
+   *
+   * Group assignments cascade, but sessions and keys do not — they are login artifacts, so they are
+   * cleared here rather than blocking the delete. References from authored content (pages, assets)
+   * have no cascade either and will make this throw, which is deliberate: the delete is refused
+   * rather than silently orphaning content.
+   *
+   * @returns Whether a user was deleted
+   */
+  async deleteUser(id: string): Promise<boolean> {
+    await WIKI.db.delete(userKeys).where(eq(userKeys.userId, id))
+    await WIKI.db.delete(sessionsTable).where(eq(sessionsTable.userId, id))
+    const result = await WIKI.db.delete(usersTable).where(eq(usersTable.id, id))
+    return (result.rowCount ?? 0) > 0
+  }
+
+  /**
+   * The accounts the sample content's discussion is written by, created where they do not exist yet.
+   *
+   * Real accounts rather than guest names, because what the sample discussion is for is looking at a
+   * talk page, and most of what a talk page draws — a profile link, a handle, a mention that resolves
+   * — needs an account behind the comment.
+   *
+   * None of them can sign in: no password is stored, and the account is unverified, which login
+   * refuses and the notification mailer skips. Not inactive, though that would be the obvious lock —
+   * a mention only resolves to an active account, and mentions are half of what the discussion is
+   * for. An instance that generated sample content must not have gained a set of accounts anybody
+   * could use, and the reserved address domain means no link could ever reach one either. They are
+   * told apart from everybody else by their address alone, under {@link SAMPLE_ACCOUNT_DOMAIN}, which
+   * is what {@link deleteUnusedSampleAccounts} looks for. A handle somebody real already holds is left
+   * off rather than refused, so a mention of it reaches that person's profile instead.
+   *
+   * @returns The account id for each handle asked for
+   */
+  async ensureSampleAccounts(
+    authors: Array<{ handle: string; name: string }>
+  ): Promise<Map<string, string>> {
+    const ids = new Map<string, string>()
+    for (const author of authors) {
+      const email = `${author.handle.toLowerCase()}@${SAMPLE_ACCOUNT_DOMAIN}`
+      const existing = await this.getByEmail(email)
+      if (existing) {
+        ids.set(author.handle, existing.id)
+        continue
+      }
+      const userId = await this.createUser({ name: author.name, email, isVerified: false })
+      try {
+        await this.updateUser(userId, { handle: author.handle })
+      } catch (err: any) {
+        WIKI.logger.debug(`Sample account ${email} left without a handle: ${err.message}`)
+      }
+      ids.set(author.handle, userId)
+    }
+    return ids
+  }
+
+  /**
+   * Delete the sample accounts that no comment is written by any more.
+   *
+   * Called after the sample pages are purged, whose comments go with them by the foreign key's
+   * cascade. Accounts are instance-wide and pages belong to one site, so an account still credited
+   * with a comment — on another site's sample discussion — is kept until that one is purged too.
+   *
+   * @returns How many accounts were deleted
+   */
+  async deleteUnusedSampleAccounts(): Promise<number> {
+    const rows = await WIKI.db
+      .select({ id: usersTable.id })
+      .from(usersTable)
+      .where(
+        and(
+          ilike(usersTable.email, `%@${SAMPLE_ACCOUNT_DOMAIN}`),
+          notExists(
+            WIKI.db
+              .select({ id: commentsTable.id })
+              .from(commentsTable)
+              .where(eq(commentsTable.authorId, usersTable.id))
+          )
+        )
+      )
+    let deleted = 0
+    for (const row of rows) {
+      if (await this.deleteUser(row.id)) {
+        deleted++
+      }
+    }
+    return deleted
+  }
+
+  async init(ids: SystemIds): Promise<void> {
+    WIKI.logger.info('Inserting default users...')
+
+    await WIKI.db.insert(usersTable).values([
+      {
+        id: ids.userAdminId,
+        email: process.env.ADMIN_EMAIL ?? 'admin@example.com',
+        auth: {
+          [ids.authModuleId]: {
+            password: await bcrypt.hash(process.env.ADMIN_PASS || '12345678', 12),
+            mustChangePwd: !process.env.ADMIN_PASS,
+            restrictLogin: false,
+            tfaIsActive: false,
+            tfaRequired: false,
+            tfaSecret: ''
+          }
+        },
+        name: 'Administrator',
+        isSystem: false,
+        isActive: true,
+        isVerified: true,
+        meta: {
+          location: '',
+          jobTitle: '',
+          pronouns: ''
+        },
+        prefs: {
+          timezone: 'America/New_York',
+          dateFormat: 'YYYY-MM-DD',
+          timeFormat: '12h',
+          appearance: 'site',
+          cvd: 'none',
+          reduceMotion: false,
+          underlineLinks: false,
+          contentTextSize: 'default'
+        }
+      },
+      {
+        id: ids.userGuestId,
+        email: 'guest@example.com',
+        auth: {},
+        name: 'Guest',
+        isSystem: true,
+        isActive: true,
+        isVerified: true,
+        meta: {},
+        prefs: {
+          timezone: 'America/New_York',
+          dateFormat: 'YYYY-MM-DD',
+          timeFormat: '12h',
+          appearance: 'site',
+          cvd: 'none',
+          reduceMotion: false,
+          underlineLinks: false,
+          contentTextSize: 'default'
+        }
+      }
+    ])
+
+    await WIKI.db.insert(userGroups).values([
+      {
+        userId: ids.userAdminId,
+        groupId: ids.groupAdminId
+      },
+      {
+        userId: ids.userGuestId,
+        groupId: ids.groupGuestId
+      }
+    ])
+  }
+
+  async login(
+    { siteId, strategyId, username, password, ip }: LoginOptions,
+    req: any
+  ): Promise<AfterLoginResult> {
+    if (strategyId in WIKI.auth.strategies) {
+      const str = WIKI.auth.strategies[strategyId] as any
+      const strInfo = WIKI.data.authentication.find((a: any) => a.key === str.module)
+      const context = {
+        ip,
+        siteId,
+        ...(strInfo.useForm && {
+          username,
+          password
+        })
+      }
+
+      // -> Never the password, flag or no flag
+      WIKI.models.flags.authDebug(
+        `Login attempt on site ${siteId} using ${str.module} strategy ${strategyId}${username ? ` as "${username}"` : ''} from ${ip}`
+      )
+
+      /*
+        Two kinds of form module, told apart by which method they implement.
+
+        The local module holds the credential it checks, so it answers with a user of this wiki and
+        the post-login checks run on it directly. A directory module — LDAP — checks the credential
+        somewhere else and answers with a `ProviderProfile` instead, exactly as a redirect login
+        does, so the account behind it is matched or created by `loginWithProvider` along with its
+        groups and its avatar. `profile()` is what says which: sniffing the answer could not, since a
+        user row and a profile both carry an id, an email and a name.
+      */
+      const usesProfile = Boolean(strInfo.useForm) && typeof str.profile === 'function'
+      let authenticated
+      try {
+        authenticated = usesProfile ? await str.profile(context) : await str.authenticate(context)
+      } catch (err: any) {
+        WIKI.models.flags.authDebug(
+          `Strategy ${str.module} rejected the attempt${username ? ` for "${username}"` : ''}: ${err.message}`
+        )
+        throw err
+      }
+
+      if (usesProfile) {
+        // -> The stored row, not `str`: registration, the email allow-list and the auto-enroll
+        //    groups are the strategy's, and the live instance is only the module
+        const strategy = await WIKI.models.authentication.getStrategyById(strategyId)
+        if (!strategy) {
+          throw new Error('ERR_INVALID_STRATEGY')
+        }
+        return this.loginWithProvider(
+          { siteId, strategy, profile: authenticated as ProviderProfile, ip },
+          req
+        )
+      }
+
+      // Perform post-login checks
+      return this.afterLoginChecks(
+        authenticated,
+        strategyId,
+        context,
+        {
+          skipTFA: !strInfo.useForm,
+          skipChangePwd: !strInfo.useForm
+        },
+        req
+      )
+    } else {
+      WIKI.models.flags.authDebug(`Login attempt using unknown strategy ${strategyId} from ${ip}`)
+      throw new Error('Invalid Strategy ID')
+    }
+  }
+
+  /**
+   * Log somebody in from what an identity provider said about them, creating the account if the
+   * strategy is set to accept new users.
+   *
+   * The email address is the identity: a provider's own `id` is recorded so that an address changing
+   * upstream does not orphan the account, but matching starts with the address because that is what
+   * an administrator invited, what a group rule was written against, and what every other strategy
+   * keys on. A module must therefore only ever report an address it has established belongs to the
+   * person — see `ProviderProfile`.
+   *
+   * Registration is refused rather than silently allowed: a wiki that has not opened its doors to a
+   * provider gets `ERR_REGISTRATION_DISABLED` for an unknown account, and one that has can still
+   * limit who by, with the strategy's email allow-list pattern.
+   *
+   * @throws `ERR_REGISTRATION_DISABLED`, `ERR_EMAIL_NOT_ALLOWED`, `ERR_INACTIVE_USER`
+   */
+  async loginWithProvider(
+    {
+      siteId,
+      strategy,
+      profile,
+      ip
+    }: {
+      siteId: string
+      strategy: AuthStrategy
+      profile: ProviderProfile
+      ip?: string
+    },
+    req: any
+  ): Promise<AfterLoginResult> {
+    const email = profile.email.toLowerCase().trim()
+    let user = await this.getByEmail(email)
+
+    if (!user) {
+      if (!strategy.registration) {
+        WIKI.models.flags.authDebug(
+          `Provider login for unknown address <${email}> refused: strategy ${strategy.id} does not accept new users`
+        )
+        throw new Error('ERR_REGISTRATION_DISABLED')
+      }
+      if (strategy.allowedEmailRegex) {
+        let allowed = false
+        try {
+          allowed = new RegExp(strategy.allowedEmailRegex).test(email)
+        } catch (err: any) {
+          // -> A pattern that will not compile allows nobody, rather than everybody
+          WIKI.logger.warn(
+            `Strategy ${strategy.id} has an invalid email pattern, refusing: ${err.message}`
+          )
+        }
+        if (!allowed) {
+          throw new Error('ERR_EMAIL_NOT_ALLOWED')
+        }
+      }
+      const userId = await this.createUser({
+        name: profile.name || email,
+        email,
+        // -> No password at all: this account authenticates at the provider, and the local strategy's
+        //    own entry is what one would live under
+        groups: strategyEnrollGroups(strategy),
+        isVerified: true
+      })
+      user = await this.getById(userId)
+      WIKI.models.flags.authDebug(
+        `Created user ${userId} <${email}> from ${strategy.module} strategy ${strategy.id}`
+      )
+    }
+
+    if (!user) {
+      throw new Error('ERR_LOGIN_FAILED')
+    }
+    if (!user.isActive) {
+      throw new Error('ERR_INACTIVE_USER')
+    }
+
+    /*
+      The link between this account and the provider's, written on every login: it records which
+      account at the provider this is, and it is what tells the profile page that this user signs in
+      through this strategy.
+    */
+    const auth = (user.auth ?? {}) as Record<string, any>
+    const link = { ...auth[strategy.id], id: profile.id, email }
+
+    /*
+      The avatar is stored only when this link has not already been given the same one. An avatar is a
+      180px square that will not have changed since the last sign-in, and a login is not where to
+      spend a round trip — or an image decode — establishing that. What is remembered is the URL for a
+      provider that links to the picture and a digest for one that hands the bytes over, and either
+      way it is recorded only once the image is stored, so a provider that was unreachable is tried
+      again next time rather than written off.
+    */
+    const pictureRef = profile.pictureData
+      ? `sha256:${createHash('sha256').update(profile.pictureData).digest('hex')}`
+      : profile.picture
+    if (pictureRef && pictureRef !== link.picture) {
+      const stored = profile.pictureData
+        ? await this.setAvatarFromBytes(user.id, profile.pictureData)
+        : await this.setAvatarFromUrl(user.id, profile.picture!)
+      if (stored) {
+        link.picture = pictureRef
+        // -> The account menu reads this off the session, which is built from `user` below
+        user.hasAvatar = true
+      }
+    }
+
+    auth[strategy.id] = link
+    user.auth = auth
+
+    /*
+      Profile fields the provider was mapped to fill in replace the person's own, every login — once an
+      administrator has pointed a claim at one, the directory is where it is kept up to date. Fields
+      the module did not report are not touched, so an unmapped job title stays whatever was typed here.
+    */
+    const metaUpdates = Object.entries(profile.meta ?? {})
+      .filter((entry): entry is [string, string] => typeof entry[1] === 'string')
+      // -> Held to what the profile form would accept, since nothing upstream of a provider is
+      .map(([key, value]) => [key, value.trim().slice(0, MAX_PROFILE_META_LENGTH)] as const)
+    const meta = (user.meta ?? {}) as Record<string, any>
+    const metaChanged = metaUpdates.some(([key, value]) => (meta[key] ?? '') !== value)
+    if (metaChanged) {
+      user.meta = { ...meta, ...Object.fromEntries(metaUpdates) }
+      WIKI.models.flags.authDebug(
+        `Updated ${metaUpdates.map(([key]) => key).join(', ')} of user ${user.id} from strategy ${strategy.id}`
+      )
+    }
+
+    await WIKI.db
+      .update(usersTable)
+      .set({ auth, ...(metaChanged ? { meta: user.meta } : {}), updatedAt: sql`now()` })
+      .where(eq(usersTable.id, user.id))
+
+    // -> After the account exists and before `afterLoginChecks`, which reads the memberships back out
+    //    to resolve this session's permissions and its redirect
+    await this.applyProviderGroups(user.id, profile, strategy)
+
+    /*
+      Neither 2FA nor a password change is asked for: both are the local strategy's, and this user has
+      just proved who they are somewhere else — where whatever second factor that provider enforces has
+      already been satisfied.
+    */
+    return this.afterLoginChecks(
+      user,
+      strategy.id,
+      { ip, siteId },
+      { skipTFA: true, skipChangePwd: true },
+      req
+    )
+  }
+
+  async afterLoginChecks(
+    user: any,
+    strategyId: string,
+    context: any,
+    { skipTFA, skipChangePwd }: { skipTFA?: boolean; skipChangePwd?: boolean } = {
+      skipTFA: false,
+      skipChangePwd: false
+    },
+    req?: any
+  ): Promise<AfterLoginResult> {
+    const str = WIKI.auth.strategies[strategyId] as any
+    if (!str) {
+      throw new Error('ERR_INVALID_STRATEGY')
+    }
+
+    // Get user groups
+    const account = await WIKI.db.query.users.findFirst({
+      columns: {
+        lastLoginAt: true
+      },
+      where: {
+        id: user.id
+      },
+      with: {
+        groups: {
+          columns: {
+            id: true,
+            permissions: true,
+            redirectOnLogin: true,
+            redirectOnFirstLogin: true
+          }
+        }
+      }
+    })
+    user.groups = account?.groups ?? []
+
+    /*
+      Where the login lands when it was not on its way anywhere: a reader who was sent here from a
+      page they were refused goes back to that page instead, and the client decides between the two.
+
+      A first login is one with no stamp yet. Read fresh rather than off `user`, which each caller
+      fetched its own way, and before the stamp below; a login stopped for 2FA or a password change
+      stamps nothing, so its continuation still counts as the first.
+
+      Each setting is the first group's that sets one, then the site's. A group's `/` reads as unset,
+      not as the root: it is what a 2.x group carries by default and arrives with on import.
+    */
+    const isFirstLogin = !account?.lastLoginAt
+    const groupRedirect = (user.groups as any[])
+      .map((grp) => (isFirstLogin ? grp.redirectOnFirstLogin : grp.redirectOnLogin))
+      .find((target) => target && target !== '/')
+    const siteAuth = context.siteId
+      ? (await WIKI.models.sites.getSiteById({ id: context.siteId }))?.config?.auth
+      : null
+    const redirect =
+      groupRedirect || (isFirstLogin ? siteAuth?.welcomeRedirect : siteAuth?.loginRedirect) || '/'
+
+    // Get auth strategy flags
+    const authStr = user.auth[strategyId] || {}
+
+    // Is 2FA required?
+    if (!skipTFA) {
+      if (authStr.tfaIsActive && authStr.tfaSecret) {
+        try {
+          const tfaToken = await this.generateToken({
+            kind: 'tfa',
+            userId: user.id,
+            meta: {
+              strategyId
+            }
+          })
+          WIKI.models.flags.authDebug(
+            `User ${user.id} <${user.email}> authenticated, but a 2FA code is required first`
+          )
+          return {
+            nextAction: 'provideTfa',
+            continuationToken: tfaToken,
+            redirect
+          }
+        } catch (errc) {
+          WIKI.logger.warn(errc)
+          throw new Error('ERR_TFA_FAILED')
+        }
+        /*
+          `conf`, not `config`: what a module is constructed with is its stored settings, and every
+          one of them keeps them under that name. `config` is free for a module to use for something
+          else, and two of them do — on the OIDC and Google strategies it holds the provider's
+          openid-client `Configuration`, which has no `enforceTfa` and never will. Read the wrong one
+          and this arm is simply never taken, which is what made "Enforce Two-Factor Authentication"
+          do nothing at all.
+        */
+      } else if (str.conf?.enforceTfa || authStr.tfaRequired) {
+        try {
+          const { secret, tfaQRImage } = await this.startTfaSetup(user, strategyId, context.siteId)
+          const tfaToken = await this.generateToken({
+            kind: 'tfaSetup',
+            userId: user.id,
+            meta: {
+              strategyId
+            }
+          })
+          WIKI.models.flags.authDebug(
+            `User ${user.id} <${user.email}> authenticated, but must set up 2FA first`
+          )
+          return {
+            nextAction: 'setupTfa',
+            continuationToken: tfaToken,
+            tfaQRImage,
+            tfaSecret: secret,
+            redirect
+          }
+        } catch (errc) {
+          WIKI.logger.warn(errc)
+          throw new Error('ERR_TFA_FAILED')
+        }
+      }
+    }
+
+    // Must Change Password?
+    if (!skipChangePwd && authStr.mustChangePwd) {
+      try {
+        const pwdChangeToken = await this.generateToken({
+          kind: 'changePwd',
+          userId: user.id,
+          meta: {
+            strategyId
+          }
+        })
+
+        WIKI.models.flags.authDebug(
+          `User ${user.id} <${user.email}> authenticated, but must change their password first`
+        )
+        return {
+          nextAction: 'changePassword',
+          continuationToken: pwdChangeToken,
+          redirect
+        }
+      } catch (errc) {
+        WIKI.logger.warn(errc)
+        throw new Error('ERR_CHANGE_PASSWORD_FAILED')
+      }
+    }
+
+    // Set Session Data
+    this.updateSession(user, strategyId, req)
+
+    WIKI.models.flags.authDebug(
+      `User ${user.id} <${user.email}> logged in with ${user.groups.length} group(s) and ${req?.session?.permissions?.length ?? 0} permission(s), redirecting to ${redirect}`
+    )
+
+    // -> Only once the login has actually succeeded: an attempt stopped by 2FA or a forced password
+    //    change is not a login yet.
+    //    Every login path -- local, provider, passkey, and the 2FA / password-change continuations --
+    //    ends up here, so this is the one place the stamp belongs. `updatedAt` is deliberately left
+    //    alone: signing in is not an edit of the account.
+    await WIKI.db
+      .update(usersTable)
+      .set({ lastLoginAt: sql`now()` })
+      .where(eq(usersTable.id, user.id))
+
+    await WIKI.models.hooks.emit('user:login', {
+      userId: user.id,
+      strategyId,
+      ip: context.ip,
+      metadata: {
+        name: user.name,
+        email: user.email
+      }
+    })
+
+    /*
+      The one audit entry not written from a route handler, and for the same reason the stamp above
+      is not: every way of signing in — local, a provider, a passkey, and the 2FA and forced password
+      change continuations — converges here, and recording it at each of those routes instead would
+      be six copies of one event that would drift apart.
+
+      A login that FAILED is deliberately not recorded anywhere. This endpoint is open to whoever can
+      reach the wiki, so a credential-stuffing run would otherwise be able to fill the table from the
+      outside; `models/rateLimits.ts` is what answers that, and the wiki's own log is where a refused
+      attempt shows up.
+    */
+    await WIKI.models.auditLog.record({
+      kind: 'auth',
+      action: 'login',
+      actor: { id: user.id, name: user.name, email: user.email, ip: context.ip ?? '' },
+      meta: { strategyId, siteId: context.siteId ?? null }
+    })
+
+    return {
+      authenticated: true,
+      nextAction: 'redirect',
+      redirect
+    }
+  }
+
+  /**
+   * Finish a login that stopped for 2FA — either to ask for a code, or to have the user set 2FA up
+   * because the strategy or the account requires it.
+   *
+   * The continuation token identifies the half-finished login, and is kept rather than consumed while
+   * codes are being tried: a mistyped or just-expired code has to be retryable. It is destroyed here
+   * as soon as one is correct, and by `countTfaFailure()` once too many have not been.
+   *
+   * @param setup True when the token came from a required setup, in which case a correct code also
+   *              activates the secret that was generated for it
+   * @throws `ERR_TFA_INVALID_REQUEST`, `ERR_INVALID_USER`, `ERR_INVALID_STRATEGY` or
+   *         `ERR_TFA_INCORRECT_TOKEN`, plus whatever `validateToken()` raises for a token that is
+   *         unknown or expired
+   */
+  async loginTFA(
+    {
+      strategyId,
+      siteId,
+      securityCode,
+      continuationToken,
+      setup = false,
+      ip
+    }: {
+      strategyId: string
+      siteId: string
+      securityCode: string
+      continuationToken: string
+      setup?: boolean
+      ip?: string
+    },
+    req: any
+  ): Promise<AfterLoginResult> {
+    if (!continuationToken || !/^[0-9]{6}$/.test(securityCode)) {
+      throw new Error('ERR_TFA_INVALID_REQUEST')
+    }
+
+    const { user, strategyId: expectedStrategyId } = await this.validateToken({
+      kind: setup ? 'tfaSetup' : 'tfa',
+      token: continuationToken,
+      skipDelete: true
+    })
+    if (!user) {
+      throw new Error('ERR_INVALID_USER')
+    }
+    if (strategyId !== expectedStrategyId) {
+      throw new Error('ERR_INVALID_STRATEGY')
+    }
+    if (!this.verifyTfaCode(user, strategyId, securityCode)) {
+      await countTfaFailure(continuationToken)
+      WIKI.models.flags.authDebug(`User ${user.id} <${user.email}> submitted an incorrect 2FA code`)
+      throw new Error('ERR_TFA_INCORRECT_TOKEN')
+    }
+
+    await this.destroyToken({ token: continuationToken })
+    if (setup) {
+      await this.enableTfa(user, strategyId)
+    }
+
+    // -> The remaining checks still apply: a user who owed a password change before 2FA still owes it
+    return this.afterLoginChecks(user, strategyId, { ip, siteId }, { skipTFA: true }, req)
+  }
+
+  /**
+   * Start 2FA setup from the profile page, for a user who is already logged in.
+   *
+   * @returns The QR code to scan, the secret behind it for manual entry, and the token that
+   *          `confirmTfaSetup()` expects back
+   * @throws `ERR_INVALID_USER`, `ERR_INVALID_STRATEGY` or `ERR_TFA_ALREADY_ACTIVE`
+   */
+  async startProfileTfaSetup({
+    userId,
+    strategyId,
+    siteId
+  }: {
+    userId: string
+    strategyId: string
+    siteId?: string
+  }): Promise<{ continuationToken: string; tfaQRImage: string; tfaSecret: string }> {
+    const user = await this.getById(userId)
+    if (!user) {
+      throw new Error('ERR_INVALID_USER')
+    }
+    const auth = (user.auth ?? {}) as Record<string, any>
+    if (!auth[strategyId]) {
+      throw new Error('ERR_INVALID_STRATEGY')
+    }
+    // -> Replacing a working secret would silently invalidate the app entry the user already has;
+    //    turning 2FA off first is the way to start again
+    if (auth[strategyId].tfaIsActive) {
+      throw new Error('ERR_TFA_ALREADY_ACTIVE')
+    }
+
+    const { secret, tfaQRImage } = await this.startTfaSetup(user, strategyId, siteId)
+    const continuationToken = await this.generateToken({
+      kind: 'tfaSetup',
+      userId,
+      meta: { strategyId }
+    })
+    return { continuationToken, tfaQRImage, tfaSecret: secret }
+  }
+
+  /**
+   * Finish 2FA setup from the profile page: check a code from the user's authenticator, then activate
+   * the secret that was generated for it.
+   *
+   * Deliberately not `loginTFA()` with `setup`: the user is already logged in, and running the login
+   * checks again would rebuild the session and emit a second login event for one visit.
+   *
+   * @throws `ERR_TFA_INVALID_REQUEST`, `ERR_INVALID_USER`, `ERR_INVALID_STRATEGY` or
+   *         `ERR_TFA_INCORRECT_TOKEN`
+   */
+  async confirmTfaSetup({
+    userId,
+    strategyId,
+    continuationToken,
+    securityCode
+  }: {
+    userId: string
+    strategyId: string
+    continuationToken: string
+    securityCode: string
+  }): Promise<void> {
+    if (!continuationToken || !/^[0-9]{6}$/.test(securityCode)) {
+      throw new Error('ERR_TFA_INVALID_REQUEST')
+    }
+
+    const { user, strategyId: expectedStrategyId } = await this.validateToken({
+      kind: 'tfaSetup',
+      token: continuationToken,
+      skipDelete: true
+    })
+    // -> The token is a bearer credential, so it only counts for the session that asked for it
+    if (!user || user.id !== userId) {
+      throw new Error('ERR_INVALID_USER')
+    }
+    if (strategyId !== expectedStrategyId) {
+      throw new Error('ERR_INVALID_STRATEGY')
+    }
+    if (!this.verifyTfaCode(user, strategyId, securityCode)) {
+      await countTfaFailure(continuationToken)
+      throw new Error('ERR_TFA_INCORRECT_TOKEN')
+    }
+
+    await this.destroyToken({ token: continuationToken })
+    await this.enableTfa(user, strategyId)
+  }
+
+  /**
+   * Where to send a user after logging out.
+   *
+   * A group's own target wins over the site's, which is what the admin area promises: the site setting
+   * says it "can be overridden at the group level". With several groups the first one that names a
+   * target wins, the same arbitrary-but-stable rule the login redirect uses.
+   *
+   * @param userId The user logging out, or null for a request that was not logged in
+   * @param siteId The site being logged out of, if it is known
+   * @returns A path or URL, never empty — the site root when nothing is configured
+   */
+  async getLogoutRedirect(userId: string | null, siteId?: string): Promise<string> {
+    if (userId) {
+      const groups = await WIKI.db.query.users
+        .findFirst({
+          columns: {},
+          where: {
+            id: userId
+          },
+          with: {
+            groups: {
+              columns: {
+                redirectOnLogout: true
+              }
+            }
+          }
+        })
+        .then((r: any) => r?.groups ?? [])
+      for (const grp of groups as any[]) {
+        if (grp.redirectOnLogout && grp.redirectOnLogout !== '/') {
+          return grp.redirectOnLogout
+        }
+      }
+    }
+
+    const site = siteId ? await WIKI.models.sites.getSiteById({ id: siteId }) : null
+    return site?.config?.auth?.logoutRedirect || '/'
+  }
+
+  async loginChangePassword(
+    {
+      strategyId,
+      siteId,
+      continuationToken,
+      newPassword,
+      ip
+    }: {
+      strategyId: string
+      siteId: string
+      continuationToken: string
+      newPassword: string
+      ip?: string
+    },
+    req: any
+  ): Promise<AfterLoginResult> {
+    if (!newPassword || newPassword.length < 8) {
+      throw new Error('ERR_PASSWORD_TOO_SHORT')
+    }
+    const { user, strategyId: expectedStrategyId } = await this.validateToken({
+      kind: 'changePwd',
+      token: continuationToken
+    })
+
+    if (strategyId !== expectedStrategyId) {
+      throw new Error('ERR_INVALID_STRATEGY')
+    }
+
+    if (user) {
+      user.auth[strategyId].password = await bcrypt.hash(newPassword, 12)
+      user.auth[strategyId].mustChangePwd = false
+      await WIKI.db.update(usersTable).set({ auth: user.auth }).where(eq(usersTable.id, user.id))
+
+      // -> Recorded separately from the `login` the call below writes: two things happened, and a
+      //    password that a login insisted be changed is the one worth being able to find on its own
+      await WIKI.models.auditLog.record({
+        kind: 'auth',
+        action: 'forcedPasswordChange',
+        actor: { id: user.id, name: user.name, email: user.email, ip: ip ?? '' },
+        meta: { siteId, strategyId }
+      })
+
+      return this.afterLoginChecks(
+        user,
+        strategyId,
+        { ip, siteId },
+        { skipChangePwd: true, skipTFA: true },
+        req
+      )
+    } else {
+      throw new Error('ERR_INVALID_USER')
+    }
+  }
+
+  /**
+   * Create an account from the login screen's own registration form.
+   *
+   * Only the local module registers this way. The providers that sign users in elsewhere create
+   * accounts too, but they do it in `loginWithProvider()` on the way through a successful sign-in —
+   * there is no form to fill in, and no password to choose.
+   *
+   * The strategy has to be one the site actually offers (`getSiteStrategy`), not merely one that
+   * exists: a strategy an administrator has taken off a site must stop creating accounts on it, and
+   * the ID is in the hands of anybody who has ever loaded that login screen.
+   *
+   * What happens next depends on the strategy's `emailValidation` prop. With it off the account is
+   * usable at once and this returns whatever an ordinary login would have — including a 2FA setup,
+   * for a strategy that enforces one. With it on the account is created unverified, the address is
+   * sent a link, and `verifyEmail` is what comes back: there is nothing to log in to yet.
+   *
+   * @param baseUrl Where this wiki is reachable, for the link in the email. Null on a wildcard site
+   *                with no base URL (see `mail.baseUrl`), where no mail is sent
+   * @param locale What language the wiki was being read in while the form was filled. It is kept as
+   *               the account's own preference as well as used for the mail that follows: somebody
+   *               who signed up reading the wiki in French has said something about which language
+   *               to write to them in, and there is nowhere else for a brand new account to get one.
+   * @throws `ERR_INVALID_STRATEGY`, `ERR_REGISTRATION_DISABLED`, `ERR_EMAIL_NOT_ALLOWED`,
+   *         `ERR_ACCOUNT_ALREADY_EXISTS`, `ERR_PASSWORD_TOO_SHORT`, `ERR_MAIL_NOT_CONFIGURED`
+   */
+  async registerUser(
+    {
+      siteId,
+      strategyId,
+      name,
+      email,
+      password,
+      ip,
+      baseUrl,
+      locale
+    }: {
+      siteId: string
+      strategyId: string
+      name: string
+      email: string
+      password: string
+      ip?: string
+      baseUrl: string | null
+      locale?: string | null
+    },
+    req: any
+  ): Promise<AfterLoginResult> {
+    const strategy = await WIKI.models.authentication.getSiteStrategy(siteId, strategyId)
+    if (!strategy || strategy.module !== 'local') {
+      WIKI.models.flags.authDebug(
+        `Registration on site ${siteId} refused: ${strategyId} is not a local strategy offered there`
+      )
+      throw new Error('ERR_INVALID_STRATEGY')
+    }
+    if (!strategy.registration) {
+      throw new Error('ERR_REGISTRATION_DISABLED')
+    }
+    if (!password || password.length < 8) {
+      throw new Error('ERR_PASSWORD_TOO_SHORT')
+    }
+
+    const address = email.toLowerCase().trim()
+    if (strategy.allowedEmailRegex) {
+      let allowed = false
+      try {
+        allowed = new RegExp(strategy.allowedEmailRegex).test(address)
+      } catch (err: any) {
+        // -> A pattern that will not compile allows nobody, rather than everybody
+        WIKI.logger.warn(
+          `Strategy ${strategy.id} has an invalid email pattern, refusing: ${err.message}`
+        )
+      }
+      if (!allowed) {
+        WIKI.models.flags.authDebug(
+          `Registration refused for <${address}>: the address is outside strategy ${strategy.id}'s allow-list`
+        )
+        throw new Error('ERR_EMAIL_NOT_ALLOWED')
+      }
+    }
+    if (await this.getByEmail(address)) {
+      throw new Error('ERR_ACCOUNT_ALREADY_EXISTS')
+    }
+
+    /*
+      An address this wiki has undertaken to check has to actually be checkable. Refusing here rather
+      than quietly creating a verified account is the point: the setting says addresses are confirmed,
+      and an instance with nothing to send the confirmation through cannot honour it. The alternative
+      -- an unverified account nobody can ever send a link to -- is a dead end that needs an
+      administrator either way, and this at least says so while somebody is looking.
+    */
+    const mustVerify = strategy.config?.emailValidation === true
+    if (mustVerify && !WIKI.models.mail.isConfigured) {
+      WIKI.logger.warn(
+        `Registration refused: strategy ${strategy.id} validates email addresses, but no SMTP server is configured.`
+      )
+      throw new Error('ERR_MAIL_NOT_CONFIGURED')
+    }
+    // -> The same dead end by another road: a mail server, and no address the link can safely name
+    if (mustVerify && !baseUrl) {
+      WIKI.logger.warn(
+        `Registration refused: strategy ${strategy.id} validates email addresses, but no base URL is set under Admin → Mail and the site answers to any hostname, so there is no trusted address to link to.`
+      )
+      throw new Error('ERR_MAIL_NOT_CONFIGURED')
+    }
+
+    const userId = await this.createUser({
+      name: name.trim(),
+      email: address,
+      password,
+      groups: strategyEnrollGroups(strategy),
+      isVerified: !mustVerify,
+      strategyId: strategy.id,
+      locale: locale ?? ''
+    })
+
+    /*
+      Called from both of the paths below rather than here, because the account is undone again if
+      the verification email cannot be sent — and an audit entry for an account that no longer
+      exists, pointing at a deleted row, is worse than no entry.
+    */
+    const recordRegistration = () =>
+      WIKI.models.auditLog.record({
+        kind: 'auth',
+        action: 'register',
+        actor: { id: userId, name: name.trim(), email: address, ip: ip ?? '' },
+        meta: { siteId, strategyId: strategy.id, mustVerify }
+      })
+
+    if (mustVerify) {
+      const token = await this.generateToken({
+        kind: 'verifyEmail',
+        userId,
+        meta: { strategyId: strategy.id, siteId }
+      })
+      try {
+        await WIKI.models.mail.send({
+          site: WIKI.models.mail.siteFor(siteId),
+          to: address,
+          template: 'welcome',
+          locale,
+          data: {
+            name: name.trim(),
+            // -> Never null here: registration was refused above when there is no address to link to
+            baseUrl: baseUrl!,
+            // -> The login screen, which asks for a press before it confirms anything. Never an
+            //    endpoint that would confirm on being fetched: the scanners that follow every link
+            //    in a message before it is delivered would spend the token before the reader does.
+            verifyUrl: `${baseUrl}/login?verify=${token}`
+          }
+        })
+      } catch (err: any) {
+        /*
+          Undone rather than left behind. The account cannot be signed into and cannot be confirmed,
+          and leaving it would take the address with it -- a second attempt, after whatever was wrong
+          with the mail server is fixed, would be refused as already registered. Nothing else has
+          happened to it yet, so there is nothing else to unwind.
+        */
+        await this.deleteUser(userId)
+        WIKI.logger.warn(`Could not send the verification email to <${address}>: ${err.message}`)
+        throw new Error('ERR_MAIL_SEND_FAILED')
+      }
+      WIKI.models.flags.authDebug(
+        `Registered user ${userId} <${address}> on site ${siteId} from ${ip}, pending email verification`
+      )
+      await recordRegistration()
+      return {
+        nextAction: 'verifyEmail',
+        redirect: '/'
+      }
+    }
+
+    // -> Best effort, and deliberately not undone on failure: unlike the verification link this is a
+    //    courtesy, and the account it welcomes works whether or not it arrives
+    if (WIKI.models.mail.isConfigured) {
+      if (!baseUrl) {
+        WIKI.logger.warn(
+          `Welcome email to <${address}> not sent: no base URL is set under Admin → Mail and the site answers to any hostname, so there is no trusted address to link to.`
+        )
+      } else {
+        try {
+          await WIKI.models.mail.send({
+            site: WIKI.models.mail.siteFor(siteId),
+            to: address,
+            template: 'welcome',
+            locale,
+            data: { name: name.trim(), baseUrl }
+          })
+        } catch (err: any) {
+          WIKI.logger.warn(`Could not send the welcome email to <${address}>: ${err.message}`)
+        }
+      }
+    }
+
+    const user = await this.getById(userId)
+    WIKI.models.flags.authDebug(
+      `Registered user ${userId} <${address}> on site ${siteId} from ${ip}, signing them in`
+    )
+    await recordRegistration()
+    return this.afterLoginChecks(user, strategy.id, { ip, siteId }, {}, req)
+  }
+
+  /**
+   * Tell somebody an account has been made for them.
+   *
+   * The administrator's version of what registration sends itself: no confirmation link, because an
+   * account an administrator created is verified by definition, and no password, because the mail is
+   * not the place for one. What it carries is the wiki's name and where to sign in.
+   *
+   * @param siteId Which site to welcome them to. Defaults to whichever one the request was addressed
+   *               to, since an instance with one site has no choice to make.
+   * @throws `ERR_INVALID_USER`, `ERR_MAIL_NOT_CONFIGURED`, one saying there is no base URL to link to
+   *         (see `mail.baseUrl`), and whatever the mail server said
+   */
+  async sendWelcomeEmail({
+    userId,
+    siteId,
+    req
+  }: {
+    userId: string
+    siteId?: string
+    req?: any
+  }): Promise<void> {
+    const user = await this.getById(userId)
+    if (!user) {
+      throw new Error('ERR_INVALID_USER')
+    }
+    const targetSiteId =
+      (siteId && WIKI.sites[siteId] ? siteId : null) ??
+      (await WIKI.models.sites.getSiteByHostname({ hostname: req?.hostname ?? '*' }))?.id ??
+      ''
+    const baseUrl = WIKI.models.mail.baseUrl({ siteId: targetSiteId, protocol: req?.protocol })
+    // -> Worded for the administrator, who reads it as the reply's `welcomeEmailError`
+    if (!baseUrl) {
+      throw new Error(
+        'The site answers to any hostname and no base URL is set under Admin → Mail, so the email would have no address to link to.'
+      )
+    }
+    await WIKI.models.mail.send({
+      site: WIKI.models.mail.siteFor(targetSiteId),
+      to: user.email,
+      template: 'welcome',
+      // -> Theirs, never the administrator's: the request that triggers this is somebody else's
+      locale: (user.prefs as Record<string, any>)?.locale,
+      data: {
+        name: user.name,
+        baseUrl
+      }
+    })
+  }
+
+  /**
+   * Confirm an address from the link in a registration email.
+   *
+   * The token is consumed whether or not it was still needed, so the link works once. Nobody is
+   * signed in by it: the browser reading the mail is not necessarily the one that registered, and
+   * whoever it is still has to know the password.
+   *
+   * @throws `ERR_INVALID_VALIDATION_TOKEN`, `ERR_EXPIRED_VALIDATION_TOKEN`, `ERR_INVALID_USER`
+   */
+  async verifyUserEmail(token: string, ip?: string): Promise<void> {
+    const { user } = await this.validateToken({ kind: 'verifyEmail', token })
+    if (!user) {
+      throw new Error('ERR_INVALID_USER')
+    }
+    if (!user.isVerified) {
+      await WIKI.db
+        .update(usersTable)
+        .set({ isVerified: true, updatedAt: sql`now()` })
+        .where(eq(usersTable.id, user.id))
+    }
+    WIKI.models.flags.authDebug(`User ${user.id} <${user.email}> confirmed their email address`)
+    await WIKI.models.auditLog.record({
+      kind: 'auth',
+      action: 'verifyEmail',
+      actor: { id: user.id, name: user.name, email: user.email, ip: ip ?? '' },
+      meta: {}
+    })
+  }
+
+  /**
+   * Send somebody the link they choose a new password from, if there is anybody to send it to.
+   *
+   * **This never says whether the address is registered.** It returns the same way for an account
+   * that got a mail, an address nobody here has, an account that signs in through a provider and has
+   * no local password, and a deactivated one — because the form is public, and answering the question
+   * would make it a way to find out who has an account. What is not about the address is reported
+   * normally: a strategy that does not offer resets at all, and an instance with no mail server, are
+   * both misconfigurations rather than answers about a user.
+   *
+   * @param baseUrl Where this wiki is reachable, for the link in the email. Null on a wildcard site
+   *                with no base URL (see `mail.baseUrl`): nothing is sent, and the caller is answered
+   *                as for an address nobody holds
+   * @param locale What language the wiki was being read in when the form was filled, which is what
+   *               the mail is written in for an account whose owner has never picked one
+   * @throws `ERR_INVALID_STRATEGY`, `ERR_FORGOT_PASSWORD_DISABLED`, `ERR_MAIL_NOT_CONFIGURED`
+   */
+  async requestPasswordReset({
+    siteId,
+    strategyId,
+    email,
+    ip,
+    baseUrl,
+    locale
+  }: {
+    siteId: string
+    strategyId: string
+    email: string
+    ip?: string
+    baseUrl: string | null
+    locale?: string | null
+  }): Promise<void> {
+    const strategy = await WIKI.models.authentication.getSiteStrategy(siteId, strategyId)
+    if (!strategy || strategy.module !== 'local') {
+      throw new Error('ERR_INVALID_STRATEGY')
+    }
+    if (strategy.config?.allowForgotPassword !== true) {
+      throw new Error('ERR_FORGOT_PASSWORD_DISABLED')
+    }
+    if (!WIKI.models.mail.isConfigured) {
+      WIKI.logger.warn(
+        'A password reset was requested, but no SMTP server is configured to send it through.'
+      )
+      throw new Error('ERR_MAIL_NOT_CONFIGURED')
+    }
+    /*
+      Answered like any other request rather than as an error: the form is public, and this is a gap in
+      the administrator's setup, not something to report to whoever filled it in. Before the address is
+      looked up, so the log says the same thing whether or not anybody holds it.
+    */
+    if (!baseUrl) {
+      WIKI.logger.warn(
+        `A password reset was requested on site ${siteId}, but no base URL is set under Admin → Mail and the site answers to any hostname, so there is no trusted address to link to; nothing sent.`
+      )
+      return
+    }
+
+    const address = email.toLowerCase().trim()
+    const user = await this.getByEmail(address)
+    const auth = (user?.auth ?? {}) as Record<string, any>
+    if (!user || !user.isActive || !auth[strategy.id]?.password) {
+      WIKI.models.flags.authDebug(
+        `Password reset requested from ${ip} for <${address}>, which has no password on strategy ${strategy.id}; nothing sent`
+      )
+      return
+    }
+
+    const token = await this.generateToken({
+      kind: 'resetPwd',
+      userId: user.id,
+      meta: { strategyId: strategy.id, siteId }
+    })
+    await WIKI.models.mail.send({
+      site: WIKI.models.mail.siteFor(siteId),
+      to: user.email,
+      template: 'resetPwd',
+      // -> Their own preference where they have one, and otherwise the language the wiki was being
+      //    read in by whoever filled the form — which is the same person often enough to be the
+      //    better guess, and is only ever a guess either way
+      locale: (user.prefs as Record<string, any>)?.locale || locale,
+      data: {
+        name: user.name,
+        baseUrl,
+        resetUrl: `${baseUrl}/login?reset=${token}`
+      }
+    })
+    WIKI.models.flags.authDebug(
+      `Password reset requested from ${ip} for user ${user.id} <${user.email}>, link sent`
+    )
+    /*
+      Only when a link was actually sent. The early return above covers an address nobody holds, and
+      recording those would turn an endpoint open to the internet into a way of writing arbitrary
+      addresses into the audit log.
+    */
+    await WIKI.models.auditLog.record({
+      kind: 'auth',
+      action: 'requestPasswordReset',
+      actor: { id: user.id, name: user.name, email: user.email, ip: ip ?? '' },
+      meta: { siteId, strategyId: strategy.id }
+    })
+  }
+
+  /**
+   * Set the new password a reset link was followed to choose.
+   *
+   * The token is consumed on the first attempt, correct password or not — unlike the 2FA
+   * continuation token, there is nothing to get wrong here that would need a second try, and a link
+   * sitting in a mailbox should stop working as soon as it has been used.
+   *
+   * The account is also marked verified. Following the link proves control of the mailbox, which is
+   * the whole of what verification asks — and without this, somebody who registered, never got the
+   * confirmation and then reset their password would still not be able to sign in.
+   *
+   * Nobody is signed in by it: the new password is what does that, on the login screen.
+   *
+   * @throws `ERR_INVALID_VALIDATION_TOKEN`, `ERR_EXPIRED_VALIDATION_TOKEN`, `ERR_INVALID_USER`,
+   *         `ERR_INACTIVE_USER`, `ERR_INVALID_STRATEGY`, `ERR_PASSWORD_TOO_SHORT`
+   */
+  async resetPassword({
+    token,
+    newPassword,
+    ip
+  }: {
+    token: string
+    newPassword: string
+    ip?: string
+  }): Promise<void> {
+    if (!newPassword || newPassword.length < 8) {
+      throw new Error('ERR_PASSWORD_TOO_SHORT')
+    }
+    const { user, strategyId } = await this.validateToken({ kind: 'resetPwd', token })
+    if (!user) {
+      throw new Error('ERR_INVALID_USER')
+    }
+    // -> A link sent before the account was deactivated must not still be able to change it
+    if (!user.isActive) {
+      throw new Error('ERR_INACTIVE_USER')
+    }
+    const auth = (user.auth ?? {}) as Record<string, any>
+    // -> The strategy could have been deleted, or password login turned off, since the link was sent
+    if (!auth[strategyId]?.password) {
+      throw new Error('ERR_INVALID_STRATEGY')
+    }
+    auth[strategyId] = {
+      ...auth[strategyId],
+      password: await bcrypt.hash(newPassword, 12),
+      mustChangePwd: false
+    }
+    await WIKI.db
+      .update(usersTable)
+      .set({ auth, isVerified: true, updatedAt: sql`now()` })
+      .where(eq(usersTable.id, user.id))
+    WIKI.models.flags.authDebug(`User ${user.id} <${user.email}> reset their password`)
+    await WIKI.models.auditLog.record({
+      kind: 'auth',
+      action: 'resetPassword',
+      actor: { id: user.id, name: user.name, email: user.email, ip: ip ?? '' },
+      meta: { strategyId }
+    })
+  }
+
+  updateSession(user: any, strategyId: string, req: any): void {
+    req.session.authenticated = true
+    // -> Kept for the logout, which has to ask this strategy's module where to send the browser next
+    req.session.strategyId = strategyId
+    req.session.user = {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      hasAvatar: user.hasAvatar,
+      locale: user.prefs?.locale,
+      timezone: user.prefs?.timezone,
+      dateFormat: user.prefs?.dateFormat,
+      timeFormat: user.prefs?.timeFormat,
+      appearance: user.prefs?.appearance,
+      cvd: user.prefs?.cvd,
+      reduceMotion: user.prefs?.reduceMotion,
+      underlineLinks: user.prefs?.underlineLinks,
+      contentTextSize: user.prefs?.contentTextSize
+    }
+    req.session.permissions = uniq(flatten(user.groups?.map((g: any) => g.permissions)))
+    // -> Group ids as well as their permissions, since navigation items are limited per group
+    req.session.groups = (user.groups ?? []).map((g: any) => g.id)
+  }
+
+  async generateToken({
+    userId,
+    kind,
+    meta = {}
+  }: {
+    userId: string
+    kind: string
+    meta?: Record<string, any>
+  }): Promise<string> {
+    WIKI.logger.debug(`Generating ${kind} token for user ${userId}...`)
+    const token = await nanoid()
+    await WIKI.db.insert(userKeys).values({
+      kind,
+      token,
+      meta,
+      // NOTE: ISO string rather than a Date, for the same UTC-vs-local reason as models/jobs.ts.
+      //       24 hours rather than 1 day: Temporal.Instant takes exact time units only, and in UTC
+      //       a calendar day is exactly 24 hours.
+      validUntil: Temporal.Now.instant()
+        .add({ hours: 24 })
+        .toString({ smallestUnit: 'millisecond' }) as any,
+      userId
+    })
+    return token
+  }
+
+  async validateToken({
+    kind,
+    token,
+    skipDelete
+  }: {
+    kind: string
+    token: string
+    skipDelete?: boolean
+  }): Promise<any> {
+    const res = await WIKI.db.query.userKeys.findFirst({
+      where: {
+        kind,
+        token
+      },
+      with: {
+        user: true
+      }
+    })
+    if (res) {
+      if (skipDelete !== true) {
+        await WIKI.db.delete(userKeys).where(eq(userKeys.id, res.id))
+      }
+      // -> BEHAVIOR CHANGE (Temporal migration): this previously read
+      //    `DateTime.utc() > DateTime.fromISO(res.validUntil)`. `validUntil` is a `timestamp`
+      //    column, so drizzle hands back a Date, and `fromISO` given a Date produced an *Invalid*
+      //    DateTime whose comparison was always false — tokens never expired. Temporal has no
+      //    Invalid sentinel to reproduce that with, so the check now works as intended.
+      if (
+        Temporal.Instant.compare(Temporal.Now.instant(), res.validUntil.toTemporalInstant()) > 0
+      ) {
+        throw new Error('ERR_EXPIRED_VALIDATION_TOKEN')
+      }
+      return {
+        ...(res.meta as Record<string, any>),
+        user: res.user
+      }
+    } else {
+      throw new Error('ERR_INVALID_VALIDATION_TOKEN')
+    }
+  }
+
+  async destroyToken({ token }: { token: string }) {
+    return WIKI.db.delete(userKeys).where(eq(userKeys.token, token))
+  }
+}
+
+export const users = new Users()

@@ -1,0 +1,1006 @@
+import { v4 as uuid } from 'uuid'
+import { and, count, eq, ilike, inArray, ne, or, sql } from 'drizzle-orm'
+import { groups as groupsTable, userGroups, users as usersTable } from '../db/schema.ts'
+import { invalidateAppShellCache } from '../helpers/appShell.ts'
+import { CustomError, isNoteImagesPath } from '../helpers/common.ts'
+import { resolveLocaleRule, resolvePageRule, type RulePageRef } from '../helpers/pageRules.ts'
+import type { SystemIds } from './types.ts'
+import type { FastifyRequest } from 'fastify'
+
+/** The permission that bypasses every check, and the one the guards below exist to protect. */
+export const SYSTEM_PERMISSION = 'manage:system'
+
+/**
+ * The permissions that amount to running the instance rather than to running part of it.
+ *
+ * Each one is a route to every other permission on the wiki, so a group holding any of them is a
+ * group whose membership is itself a privilege: somebody who may create users and put them in such a
+ * group, or add themselves to one, has granted themselves whatever that group can reach. That is why
+ * the guards below are written against this list and not against `manage:system` alone — stopping
+ * short at the root permission would leave `manage:users` handing out `manage:groups`, and
+ * `manage:groups` handing back `manage:users`, with neither step looking like an escalation on its
+ * own.
+ *
+ * `manage:system` is the one that also bypasses every route check; the others get here by being able
+ * to rewrite who holds what.
+ *
+ * `manage:scim` is on the list for exactly that reason and not because of what it is called: a SCIM
+ * client creates accounts and sets their group membership, which is the same power `write:groups`
+ * has when it staffs an ordinary group — and that one is here too. What keeps it from being a route
+ * to the elevated permissions themselves is the membership guard in `helpers/userGuards.ts`, which a
+ * SCIM request passes through like any other caller.
+ */
+export const ELEVATED_PERMISSIONS = [
+  'write:users',
+  'manage:users',
+  'write:groups',
+  'manage:groups',
+  'manage:scim',
+  SYSTEM_PERMISSION
+] as const
+
+/**
+ * Every GLOBAL permission a group may hold — the site-wide list, bound to no path.
+ *
+ * Here rather than in the admin screen that offers them or the route hook that checks them, because
+ * it is a vocabulary rather than a UI concern: nothing validates a permission string on the way in,
+ * so a name that is not on this list simply never matches anything, and whoever needs to ask "is
+ * this a real permission" needs one list to ask. `helpers/pageRules.ts` documents the other kind.
+ *
+ * Adding a name is the maintainer's call — see CLAUDE.md.
+ */
+export const GLOBAL_PERMISSIONS = [
+  'access:admin',
+  'list:users',
+  'read:users',
+  'write:users',
+  'manage:users',
+  'list:groups',
+  'read:groups',
+  'write:groups',
+  'manage:groups',
+  'read:audit',
+  'read:metrics',
+  'manage:theme',
+  'manage:storage',
+  'manage:sites',
+  'read:webhooks',
+  'manage:webhooks',
+  'manage:scim',
+  'use:mcp',
+  SYSTEM_PERMISSION
+] as const
+
+/**
+ * What lets a caller find users by name, as a picker does: `list:users`, or any rung above it.
+ *
+ * `list:users` is the bottom rung and buys nothing but the lookup — a name, a handle and an avatar
+ * for an id, never an email or anything else about the account (`users.lookup`). It is what lets an
+ * ordinary author name a page's owners without being able to read the user list.
+ */
+export const LIST_USERS_PERMISSIONS = ['list:users', 'read:users', 'write:users', 'manage:users']
+
+/** The same for groups: a name for an id (`groups.lookup`), and nothing about what a group may do. */
+export const LIST_GROUPS_PERMISSIONS = [
+  'list:groups',
+  'read:groups',
+  'write:groups',
+  'manage:groups'
+]
+
+/** The id and the name of a group, which is all `list:groups` may see of one. */
+export interface GroupLookup {
+  id: string
+  name: string
+}
+
+/**
+ * Every PAGE permission a rule may grant — bound to a path, a locale and a site.
+ *
+ * The other half of the vocabulary above, and deliberately disjoint from it: `config.permissions` on
+ * a route reads the global list only, so naming one of these there refuses everybody.
+ */
+export const PAGE_PERMISSIONS = [
+  'read:pages',
+  'write:pages',
+  'review:pages',
+  'manage:pages',
+  'delete:pages',
+  'write:tags',
+  'write:styles',
+  'write:scripts',
+  'read:source',
+  'read:history',
+  'read:assets',
+  'write:assets',
+  'manage:assets',
+  'read:comments',
+  'write:comments',
+  'manage:comments',
+  'manage:navigation',
+  'read:glossary',
+  'manage:glossary',
+  'read:notes',
+  'write:notes',
+  'write:feedback'
+]
+
+/**
+ * The page permissions that are about a site and a locale rather than a page.
+ *
+ * Granted through rules like every other page permission, but a rule's `match`, `path` and `tags` say
+ * nothing about them: a glossary has no path, and neither does a live note. Every rule naming one that is scoped to the site and the
+ * locale applies, and the modes rank as they always do — see `resolveLocaleRule` in
+ * `helpers/pageRules.ts`. `checkAccess` routes them there, so a caller asking about one at a page gets
+ * the locale's answer rather than one that changes from page to page.
+ */
+export const LOCALE_PERMISSIONS = ['read:glossary', 'manage:glossary', 'read:notes', 'write:notes']
+
+/**
+ * The locale permissions that come with another in the same locale: managing a glossary one may not
+ * read, or writing in a note one may not read, is not a state worth supporting.
+ */
+const IMPLIED_LOCALE_PERMISSIONS: Record<string, string> = {
+  'read:glossary': 'manage:glossary',
+  'read:notes': 'write:notes'
+}
+
+/** Whether a permission list carries any of `ELEVATED_PERMISSIONS`. */
+export function isElevated(permissions: readonly string[]): boolean {
+  return permissions.some((permission) =>
+    (ELEVATED_PERMISSIONS as readonly string[]).includes(permission)
+  )
+}
+
+/** How a rule addresses pages: `TAG` and `TAGALL` read `tags`, everything else reads `path`. */
+export type GroupRuleMatch = 'START' | 'END' | 'SUBTREE' | 'REGEX' | 'TAG' | 'TAGALL' | 'EXACT'
+
+/** Whether a matching rule grants, denies, or unconditionally grants its roles. */
+export type GroupRuleMode = 'ALLOW' | 'DENY' | 'FORCEALLOW'
+
+/** A single page-rule entry within a group. */
+export interface GroupRule {
+  id: string
+  name: string
+  roles: string[]
+  match: GroupRuleMatch
+  mode: GroupRuleMode
+  path: string
+  /**
+   * The tags a `TAG` / `TAGALL` rule addresses. Ignored by every other kind, and kept rather than
+   * cleared when one is chosen, so that a rule switched to a path kind and back still says what it
+   * said. A tag named here need not be on any page: a rule may be written ahead of the content.
+   */
+  tags: string[]
+  locales: string[]
+  sites: string[]
+}
+
+/** A group row, joined with the number of users assigned to it. */
+export interface GroupWithUserCount {
+  id: string
+  name: string
+  permissions: string[]
+  rules: GroupRule[]
+  redirectOnLogin: string
+  redirectOnFirstLogin: string
+  redirectOnLogout: string
+  isSystem: boolean
+  /** Whether a SCIM client owns this group, which is what the admin list badges. */
+  isProvisioned: boolean
+  userCount: number
+  createdAt: Date
+  updatedAt: Date
+}
+
+/** The subset of group fields that may be modified. `isSystem` is deliberately absent. */
+export interface GroupPatch {
+  name?: string
+  redirectOnLogin?: string
+  redirectOnFirstLogin?: string
+  redirectOnLogout?: string
+  permissions?: string[]
+  rules?: GroupRule[]
+  /** SCIM's bookkeeping; see the same two fields on `UserPatch`. */
+  isProvisioned?: boolean
+  externalId?: string | null
+}
+
+/**
+ * Selection shared by getAllGroups() / getGroupById().
+ *
+ * `userCount` comes from a left join on `userGroups` aggregated per group, so groups with no members
+ * count 0 rather than dropping out of the result.
+ */
+/** A member of a group, mirroring the `UserCore` API schema. */
+export interface GroupUser {
+  id: string
+  name: string
+  email: string
+  hasAvatar: boolean
+  isSystem: boolean
+  isActive: boolean
+  isVerified: boolean
+  createdAt: Date
+  updatedAt: Date
+  lastLoginAt: Date | null
+}
+
+export interface GroupUserPage {
+  total: number
+  users: GroupUser[]
+}
+
+/**
+ * Escape the LIKE wildcards `%` and `_` (and the escape character itself) so that a user-supplied
+ * filter is matched literally. Values are still parameterized by the driver — this is about a `%`
+ * in the filter silently matching everything, not about injection.
+ */
+function escapeLikePattern(value: string): string {
+  return value.replaceAll('\\', '\\\\').replaceAll('%', '\\%').replaceAll('_', '\\_')
+}
+
+const groupSelection = {
+  id: groupsTable.id,
+  name: groupsTable.name,
+  permissions: groupsTable.permissions,
+  rules: groupsTable.rules,
+  redirectOnLogin: groupsTable.redirectOnLogin,
+  redirectOnFirstLogin: groupsTable.redirectOnFirstLogin,
+  redirectOnLogout: groupsTable.redirectOnLogout,
+  isSystem: groupsTable.isSystem,
+  isProvisioned: groupsTable.isProvisioned,
+  createdAt: groupsTable.createdAt,
+  updatedAt: groupsTable.updatedAt,
+  userCount: count(userGroups.userId)
+}
+
+/**
+ * Who is asking, and what they hold outside the page rules.
+ *
+ * `permissions` is the group-wide list — `manage:system`, `access:admin` and the rest — which is a
+ * different thing from the page permissions the rules decide.
+ */
+export interface AccessActor {
+  groupIds: string[]
+  permissions: string[]
+}
+
+/**
+ * The page permissions a rule on the GUESTS group may grant.
+ *
+ * Reading, and saying something in a comment. Reading a live note includes following it as it is
+ * written; writing in one never is, whoever holds the link. Everything else — writing or deleting a page, managing
+ * assets or comments, reviewing suggestions — is an action attributable to somebody, and the guests
+ * group is precisely the absence of a somebody.
+ *
+ * Mirrored in `GroupEditOverlay.vue`, which offers exactly these when the guests group is open. This
+ * copy is the one that decides.
+ */
+export const GUEST_ROLES = [
+  'read:pages',
+  'read:source',
+  'read:history',
+  'read:assets',
+  'read:comments',
+  'write:comments',
+  'read:glossary',
+  'read:notes'
+]
+
+/**
+ * Every group's rules, by group id.
+ *
+ * Cached because a page permission is checked on every page read, and reading three rows out of the
+ * database to answer it would put a query in front of every request. Reloaded whenever a group
+ * changes, the same way the site configurations are.
+ */
+let rulesCache: Record<string, GroupRule[]> = {}
+
+/**
+ * Groups model
+ */
+class Groups {
+  /**
+   * Reload the page rules of every group into memory.
+   *
+   * Called at boot and after any change to a group. A group edit therefore takes effect on the next
+   * request rather than on the next login, which matters: rules are the whole of page access, and a
+   * revoked permission that waits for a logout is not revoked.
+   */
+  async reloadCache(): Promise<void> {
+    const rows = await WIKI.db
+      .select({ id: groupsTable.id, rules: groupsTable.rules })
+      .from(groupsTable)
+    rulesCache = {}
+    for (const row of rows) {
+      rulesCache[row.id] = (row.rules ?? []) as GroupRule[]
+    }
+    // -> Both of these are what the GUESTS group may read, held for minutes at a time: an index of
+    //    paths, and the page descriptions served to a client that will not run the app. Every other
+    //    consumer of these rules asks per request and is correct the moment this returns; those two
+    //    would go on publishing what a rule had just taken away, which is a permission waiting for a
+    //    timer rather than a document being a little out of date
+    WIKI.models.pages.invalidateSitemaps()
+    invalidateAppShellCache()
+    WIKI.logger.info(`Loaded page rules for ${rows.length} groups [ OK ]`)
+  }
+
+  /** The pooled rules of a set of groups, which is what a permission is decided against. */
+  rulesForGroups(groupIds: string[]): GroupRule[] {
+    return groupIds.flatMap((id) => rulesCache[id] ?? [])
+  }
+
+  /**
+   * Which groups a request speaks for.
+   *
+   * An anonymous request is not group-less: it is the guests group, whose rules are how a wiki says
+   * what the public may see. Treating it as no groups at all would deny everything, which is a
+   * different answer from the one the administrator configured.
+   *
+   * An API key speaks for the groups it was issued for, ahead of any session riding along with it —
+   * the same precedence `actorForRequest` gives its permissions, so that one request is never the
+   * key's permissions judged against the session's rules.
+   */
+  groupIdsForRequest(req: FastifyRequest): string[] {
+    if (req.apiKey) {
+      return req.apiKey.groupIds
+    }
+    if (req.session?.authenticated && req.session.user?.id) {
+      return req.session.groups ?? []
+    }
+    return [WIKI.data.systemIds.guestsGroupId]
+  }
+
+  /** The actor a request speaks for: its groups, and the group-wide permissions it holds. */
+  actorForRequest(req: FastifyRequest): AccessActor {
+    return {
+      groupIds: this.groupIdsForRequest(req),
+      // -> An API key stands in for a session and carries its own permissions, as it does in the
+      //    route-level check
+      permissions: req.apiKey?.permissions ?? req.session?.permissions ?? []
+    }
+  }
+
+  /**
+   * The actor the PUBLIC speaks for, which is not the same as a request that happens to be anonymous.
+   *
+   * The guests group and nothing else, asked without a request in hand — which is what "whatever
+   * anybody may read" means, and what makes an answer built from it identical for whoever fetched it.
+   * That is the whole reason it exists separately: the sitemap and the app shell's public document are
+   * both cached and handed to the next requester, so neither may be built from anything a particular
+   * requester holds.
+   *
+   * No group-wide permissions rather than the guests group's own: `checkAccess` reads that list only
+   * for `manage:system`, and a wiki that had somehow handed the public an administrator's permission
+   * should not also publish every page it has as a consequence.
+   */
+  actorForPublic(): AccessActor {
+    return { groupIds: [WIKI.data.systemIds.guestsGroupId], permissions: [] }
+  }
+
+  /**
+   * Whether this caller may do this to this page.
+   *
+   * The one place page permissions are decided. Everything page-scoped asks this rather than reading
+   * the session's permission list, because that list says what a group was granted GLOBALLY and page
+   * permissions are not granted that way — see `helpers/pageRules.ts` for how a rule is chosen.
+   *
+   * Never for anything in the live notes' image folder (`NOTE_IMAGES_FOLDER`), whoever asks — not even
+   * `manage:system`. That folder is not content anybody browses, reorganises or writes into by path,
+   * and answering no here is what keeps it out of every listing and every route at once rather than
+   * one filter at a time. `/_files/` serves those images by a rule of its own.
+   *
+   * @param permission A single page permission, e.g. `read:pages` or `read:history`
+   */
+  checkAccess(actor: AccessActor, permission: string, page: RulePageRef): boolean {
+    if (!LOCALE_PERMISSIONS.includes(permission) && isNoteImagesPath(page.path)) {
+      return false
+    }
+    // -> Above the rules entirely: an administrator is not something a rule can lock out, and a
+    //    wiki whose only administrator had denied themselves would have nobody left to fix it
+    if (actor.permissions.includes('manage:system')) {
+      return true
+    }
+    if (LOCALE_PERMISSIONS.includes(permission)) {
+      return this.checkLocaleAccess(actor, permission, page.siteId, page.locale)
+    }
+    /*
+      Anything at or under a feedback board is ruled as the board: its path and its tags, all or
+      nothing, regardless of what a rule written further down says. Here rather than in each caller
+      so that the page view, search, the tree, the sitemap, MCP and comments cannot disagree about an
+      idea.
+    */
+    const ref = WIKI.models.feedback.ruleRefFor(page)
+    const rule = resolvePageRule(this.rulesForGroups(actor.groupIds), permission, ref)
+    return rule ? rule.mode !== 'DENY' : false
+  }
+
+  /**
+   * Whether this caller holds a locale permission (`LOCALE_PERMISSIONS`) on a site, in a locale.
+   *
+   * The question `checkAccess` cannot ask without a page. Every rule naming the permission that is
+   * scoped to the site and the locale counts, whatever it addresses, and mode alone decides between
+   * them: a DENY anywhere closes the locale, a FORCE ALLOW anywhere reopens it.
+   *
+   * `manage:glossary` implies `read:glossary` in the same locale, and `write:notes` implies
+   * `read:notes` (`IMPLIED_LOCALE_PERMISSIONS`): editing a glossary one may not read is not a state
+   * worth supporting, and the editor needs the list to pick related terms from; a note is written in an
+   * editor showing it. Each is decided on its own rules first, so a DENY on reading does not take the
+   * other with it.
+   *
+   * @param locale Absent, rules limited to particular locales are not excluded — as for a page
+   *   reference that leaves the locale out
+   */
+  checkLocaleAccess(
+    actor: AccessActor,
+    permission: string,
+    siteId: string,
+    locale?: string
+  ): boolean {
+    if (actor.permissions.includes('manage:system')) {
+      return true
+    }
+    const rules = this.rulesForGroups(actor.groupIds)
+    const grants = (name: string) => {
+      const rule = resolveLocaleRule(rules, name, { siteId, locale })
+      return rule ? rule.mode !== 'DENY' : false
+    }
+    const implied = IMPLIED_LOCALE_PERMISSIONS[permission]
+    return grants(permission) || (implied !== undefined && grants(implied))
+  }
+
+  /**
+   * Whether any rule this actor holds grants a page permission ANYWHERE.
+   *
+   * Deliberately not a substitute for `checkAccess`, which is the question every endpoint acting on a
+   * page has to ask. This answers the narrower "is this person a `manage:navigation` holder at all",
+   * which is what a route serving the OPTIONS such an editor needs -- the group names its visibility
+   * field offers -- has to know, since that request names no page of its own.
+   *
+   * A `DENY` rule is not a grant, so a set of rules that only ever denies answers false.
+   */
+  grantsAnywhere(actor: AccessActor, permission: string): boolean {
+    if (actor.permissions.includes('manage:system')) {
+      return true
+    }
+    return this.rulesForGroups(actor.groupIds).some(
+      (rule) => rule.mode !== 'DENY' && (rule.roles ?? []).includes(permission)
+    )
+  }
+  async init(ids: SystemIds): Promise<void> {
+    WIKI.logger.info('Inserting default groups...')
+
+    await WIKI.db.insert(groupsTable).values([
+      {
+        id: ids.groupAdminId,
+        name: 'Administrators',
+        permissions: ['manage:system'],
+        rules: [],
+        isSystem: true
+      },
+      {
+        id: ids.groupUserId,
+        name: 'Users',
+        /*
+          No global permissions: everything an ordinary account may do is about pages, and page
+          permissions are granted by the rule below -- the list is checked by the route hook, which
+          only understands global ones (see `PAGE_PERMISSIONS`), so a page permission named in it
+          grants nothing.
+        */
+        permissions: [],
+        rules: [
+          {
+            // -> `write:comments` so that a wiki which turns comments on has a discussion its
+            //    accounts can join, rather than one nobody but an administrator can. `read:notes`
+            //    and not `write:notes`: a shared note opens for any account, but who may start one
+            //    is an administrator's decision. `write:feedback` matches every path but only means
+            //    anything under a feedback board that accepts ideas, so the board's own switch is
+            //    what opens it to every account -- see `models/feedback.ts`
+
+            id: uuid(),
+            name: 'Default Rule',
+            roles: [
+              'read:pages',
+              'read:assets',
+              'read:comments',
+              'write:comments',
+              'read:glossary',
+              'read:notes',
+              'write:feedback'
+            ],
+            match: 'START',
+            mode: 'ALLOW',
+            path: '',
+            tags: [],
+            locales: [],
+            sites: []
+          }
+        ],
+        isSystem: true
+      },
+      {
+        id: ids.groupGuestId,
+        name: 'Guests',
+        // -> None, for the reason the Users group has none: what guests may do is the rule below
+        permissions: [],
+        rules: [
+          {
+            id: uuid(),
+            name: 'Default Rule',
+            /*
+              Named in a rule that DENIES them, which is a fresh install being private rather than a
+              statement about comments: an operator opening the wiki up flips this one rule to ALLOW,
+              and what they get is the set the guests group is allowed to hold (`GUEST_ROLES`) rather
+              than a public wiki whose readers still cannot say anything.
+
+              `read:glossary` and `read:notes` are deliberately NOT named here. They ignore the path, so
+              a DENY for one anywhere outranks every ALLOW for it everywhere: named in this rule, an
+              operator's later ALLOW for guests would do nothing. Guests are denied them anyway with no
+              rule at all.
+            */
+            roles: ['read:pages', 'read:assets', 'read:comments', 'write:comments'],
+            match: 'START',
+            mode: 'DENY',
+            path: '',
+            tags: [],
+            locales: [],
+            sites: []
+          }
+        ],
+        isSystem: true
+      }
+    ])
+  }
+
+  /**
+   * Create a new (non-system) group, seeded with the same starting permissions and default rule as
+   * the `Users` group.
+   *
+   * @param name Group name
+   * @returns The new group's ID
+   */
+  /**
+   * Check a group name, on its way in or on its way to replacing one.
+   *
+   * A name has to be unique because it is an identity, not a label: a group is picked by name in the
+   * group editor, in a strategy's auto-enrollment list and — since the identity-provider modules map
+   * groups — by whatever a directory or a claim calls it. Two groups answering to one name make every
+   * one of those ambiguous, and the group mapping resolves the ambiguity by putting the user in both.
+   *
+   * Compared case-insensitively and with the ends trimmed, because "editors" and "Editors " are the
+   * same name to everybody reading the screen, and a check that let them coexist would be a check
+   * anybody could step around by holding down the space bar.
+   *
+   * @param name The name being asked for
+   * @param exceptId The group being renamed, which does not clash with itself
+   * @returns The reason it cannot be used, or null when it is fine
+   */
+  async validateName(name: string, exceptId?: string): Promise<string | null> {
+    const trimmed = name.trim()
+    if (trimmed.length < 1) {
+      return 'The group name cannot be empty.'
+    }
+    if (!/^[^<>"]+$/.test(trimmed)) {
+      return 'The group name cannot contain <, > or ".'
+    }
+    const sameName = sql`lower(${groupsTable.name}) = lower(${trimmed})`
+    const clash = await WIKI.db
+      .select({ name: groupsTable.name })
+      .from(groupsTable)
+      .where(exceptId ? and(sameName, ne(groupsTable.id, exceptId)) : sameName)
+      .limit(1)
+    return clash.length > 0 ? `There is already a group named "${clash[0].name}".` : null
+  }
+
+  async createGroup(name: string): Promise<string> {
+    // -> What the Users group starts with, for the same reasons: see `init()`
+    const startingRoles = [
+      'read:pages',
+      'read:assets',
+      'read:comments',
+      'write:comments',
+      'read:glossary',
+      'read:notes',
+      'write:feedback'
+    ]
+    const result = await WIKI.db
+      .insert(groupsTable)
+      .values({
+        // -> Trimmed here rather than at the boundary, so that what is stored is what `validateName`
+        //    compared and no route can store a name that would not have passed
+        name: name.trim(),
+        permissions: [],
+        rules: [
+          {
+            id: uuid(),
+            name: 'Default Rule',
+            roles: startingRoles,
+            match: 'START',
+            mode: 'ALLOW',
+            path: '',
+            tags: [],
+            locales: [],
+            sites: []
+          }
+        ],
+        isSystem: false
+      })
+      .returning({ id: groupsTable.id })
+    await this.reloadCache()
+    return result[0].id
+  }
+
+  /**
+   * Fetch all groups, ordered by name
+   */
+  async getAllGroups(): Promise<GroupWithUserCount[]> {
+    const results = await WIKI.db
+      .select(groupSelection)
+      .from(groupsTable)
+      .leftJoin(userGroups, eq(userGroups.groupId, groupsTable.id))
+      .groupBy(groupsTable.id)
+      .orderBy(groupsTable.name)
+    return results as GroupWithUserCount[]
+  }
+
+  /**
+   * A user as an access actor, with no request in hand: their groups and those groups' permissions,
+   * as they stand now.
+   *
+   * For work done on somebody's behalf when they are not there — a lifecycle rule acting as whoever
+   * wrote it — which is why it reads the membership afresh rather than from any session.
+   */
+  async actorForUser(userId: string): Promise<AccessActor> {
+    const rows = await WIKI.db
+      .select({ id: groupsTable.id, permissions: groupsTable.permissions })
+      .from(userGroups)
+      .innerJoin(groupsTable, eq(groupsTable.id, userGroups.groupId))
+      .where(eq(userGroups.userId, userId))
+    return {
+      groupIds: rows.map((row) => row.id),
+      permissions: [...new Set(rows.flatMap((row) => (row.permissions ?? []) as string[]))]
+    }
+  }
+
+  /**
+   * Groups whose name contains what was typed, for a picker.
+   *
+   * Only the id and the name: this is what `list:groups` answers, and that permission sees nothing
+   * about what a group may do or who is in it. The guests group is never offered — it is everybody
+   * who has not signed in, which is not a group of people anything could be handed to.
+   *
+   * @param ids Narrow to these, for resolving ids already held rather than searching
+   */
+  async lookup({
+    query = '',
+    ids,
+    limit = 10
+  }: {
+    query?: string
+    ids?: string[]
+    limit?: number
+  }): Promise<GroupLookup[]> {
+    const conditions = [ne(groupsTable.id, WIKI.data.systemIds.guestsGroupId)]
+    if (query.trim()) {
+      conditions.push(ilike(groupsTable.name, `%${escapeLikePattern(query.trim())}%`))
+    }
+    if (ids) {
+      if (ids.length < 1) {
+        return []
+      }
+      conditions.push(inArray(groupsTable.id, ids))
+    }
+    return WIKI.db
+      .select({ id: groupsTable.id, name: groupsTable.name })
+      .from(groupsTable)
+      .where(and(...conditions))
+      .orderBy(groupsTable.name)
+      .limit(limit)
+  }
+
+  /**
+   * Fetch a single group by ID
+   *
+   * @param id Group ID
+   * @returns The group, or null if no such group exists
+   */
+  async getGroupById(id: string): Promise<GroupWithUserCount | null> {
+    const results = await WIKI.db
+      .select(groupSelection)
+      .from(groupsTable)
+      .leftJoin(userGroups, eq(userGroups.groupId, groupsTable.id))
+      .where(eq(groupsTable.id, id))
+      .groupBy(groupsTable.id)
+      .limit(1)
+    return (results[0] as GroupWithUserCount) ?? null
+  }
+
+  /**
+   * Update a group
+   *
+   * @param id Group ID
+   * @param patch Fields to change — must not be empty
+   * @returns Whether a group was updated
+   */
+  async updateGroup(id: string, patch: GroupPatch): Promise<boolean> {
+    const result = await WIKI.db
+      .update(groupsTable)
+      .set({
+        ...this.clampGuestPatch(id, this.normalizeRulePatch(patch)),
+        ...(patch.name !== undefined ? { name: patch.name.trim() } : {}),
+        updatedAt: sql`now()`
+      })
+      .where(eq(groupsTable.id, id))
+    await this.reloadCache()
+    return (result.rowCount ?? 0) > 0
+  }
+
+  /**
+   * Tidy the tags on the rules being saved: trimmed, lowercased, de-duplicated, blanks dropped.
+   *
+   * Done on the way in rather than at match time so that the stored rule says exactly what it
+   * matches. `ruleTags` lowercases anyway — a rule written through the API keeps working either
+   * way — but a rule listing `Meeting` and `meeting` as two tags is a `TAGALL` rule that reads as
+   * though it wanted two things and a rule the admin screen would show twice.
+   *
+   * Every rule is tidied, not only the tag kinds: what a path rule carries in `tags` is what it
+   * would match on if it were switched back, and there is no moment at which holding a stray blank
+   * is worth anything.
+   */
+  private normalizeRulePatch(patch: GroupPatch): GroupPatch {
+    if (!patch.rules) {
+      return patch
+    }
+    return {
+      ...patch,
+      rules: patch.rules.map((rule) => ({
+        ...rule,
+        tags: [...new Set((rule.tags ?? []).map((tag) => tag.trim().toLowerCase()).filter(Boolean))]
+      }))
+    }
+  }
+
+  /**
+   * Hold the guests group to what the public may be given.
+   *
+   * The guests group is every anonymous reader at once, so a rule on it is a rule about the open
+   * internet: writing a page, deleting one, reading its source history — none of those are things to
+   * hand out to nobody in particular, and several of them cannot be undone. So the set is fixed here,
+   * beside the rules themselves, rather than only in the admin screen that edits them: what a group
+   * may hold is not something a browser should be the only one deciding.
+   *
+   * Roles outside the set are dropped rather than refused. An administrator saving a group edited
+   * before this existed — or through the API — gets the group they asked for minus what may not be
+   * granted, instead of a form that cannot be saved and does not say which rule is at fault.
+   */
+  private clampGuestPatch(id: string, patch: GroupPatch): GroupPatch {
+    if (id !== WIKI.data.systemIds.guestsGroupId || !patch.rules) {
+      return patch
+    }
+    let dropped = 0
+    const rules = patch.rules.map((rule) => {
+      const roles = (rule.roles ?? []).filter((role) => GUEST_ROLES.includes(role))
+      dropped += (rule.roles ?? []).length - roles.length
+      return { ...rule, roles }
+    })
+    if (dropped > 0) {
+      WIKI.logger.warn(
+        `Dropped ${dropped} permission(s) from the guests group that may not be granted to it.`
+      )
+    }
+    return { ...patch, rules }
+  }
+
+  /**
+   * Delete a group. Assignments in `userGroups` are removed by the FK cascade.
+   *
+   * @param id Group ID
+   * @returns Whether a group was deleted
+   */
+  async deleteGroup(id: string): Promise<boolean> {
+    const result = await WIKI.db.delete(groupsTable).where(eq(groupsTable.id, id))
+    await this.reloadCache()
+    return (result.rowCount ?? 0) > 0
+  }
+
+  /**
+   * Assign a user to a group. Idempotent.
+   *
+   * @returns False if the user was already a member
+   */
+  /**
+   * Why this user may not be a member of this group, if they may not.
+   *
+   * The guests group and the guest account belong to each other and to nothing else:
+   *
+   *   - the group IS anonymous access, so a real user in it would be granted whatever the public is
+   *     granted regardless of their own groups, and would keep it after every other group was taken
+   *     away from them;
+   *   - the account IS the anonymous visitor, so putting it in another group hands that group's
+   *     permissions to everybody who never logged in.
+   *
+   * The pair is also why neither half can be taken apart: removing the account from the group would
+   * leave anonymous access resolving against nothing, with no way back through the interface.
+   *
+   * One definition, used by the routes that assign a single membership and by `setUserGroups`, which
+   * sets them all at once.
+   *
+   * @returns The reason, or null when the membership is fine
+   */
+  guestMembershipViolation(groupId: string, user: { isSystem?: boolean } | null): string | null {
+    const isGuestsGroup = groupId === WIKI.data.systemIds.guestsGroupId
+    // -> The guest account is the only system user; see the seeding in `models/users.ts`
+    if (user?.isSystem) {
+      return isGuestsGroup
+        ? null
+        : 'The guest account cannot be a member of any group other than the guests group.'
+    }
+    return isGuestsGroup
+      ? 'The guests group holds the guest account and nothing else — it is what anonymous visitors are.'
+      : null
+  }
+
+  async assignUserToGroup(groupId: string, userId: string): Promise<boolean> {
+    const user = await WIKI.models.users.getById(userId)
+    const violation = this.guestMembershipViolation(groupId, user)
+    if (violation) {
+      throw new CustomError('groupMembershipForbidden', violation)
+    }
+    const result = await WIKI.db
+      .insert(userGroups)
+      .values({ userId, groupId })
+      .onConflictDoNothing()
+    return (result.rowCount ?? 0) > 0
+  }
+
+  /**
+   * Remove a user from a group
+   *
+   * @returns False if the user was not a member
+   */
+  async unassignUserFromGroup(groupId: string, userId: string): Promise<boolean> {
+    /*
+      The one membership that cannot be taken apart: anonymous access resolves against the guests
+      group's rules, and the guest account is what resolves it. Removed, every anonymous visitor would
+      hold nothing at all — and nothing in the interface puts a system user back into a group.
+    */
+    if (groupId === WIKI.data.systemIds.guestsGroupId) {
+      const user = await WIKI.models.users.getById(userId)
+      if (user?.isSystem) {
+        throw new CustomError(
+          'groupMembershipForbidden',
+          'The guest account cannot be removed from the guests group.'
+        )
+      }
+    }
+    const result = await WIKI.db
+      .delete(userGroups)
+      .where(and(eq(userGroups.groupId, groupId), eq(userGroups.userId, userId)))
+    return (result.rowCount ?? 0) > 0
+  }
+
+  /**
+   * Fetch a page of the users assigned to a group, ordered by name.
+   *
+   * @param groupId Group ID
+   * @param filter Optional case-insensitive substring matched against name and email
+   * @param page 1-based page number
+   * @param limit Page size
+   */
+  async getGroupUsers(
+    groupId: string,
+    { filter = '', page = 1, limit = 20 }: { filter?: string; page?: number; limit?: number } = {}
+  ): Promise<GroupUserPage> {
+    const conditions = [eq(userGroups.groupId, groupId)]
+    if (filter) {
+      const pattern = `%${escapeLikePattern(filter)}%`
+      conditions.push(or(ilike(usersTable.name, pattern), ilike(usersTable.email, pattern))!)
+    }
+    const where = and(...conditions)
+
+    const totals = await WIKI.db
+      .select({ total: count() })
+      .from(userGroups)
+      .innerJoin(usersTable, eq(usersTable.id, userGroups.userId))
+      .where(where)
+
+    const users = await WIKI.db
+      .select({
+        id: usersTable.id,
+        name: usersTable.name,
+        email: usersTable.email,
+        hasAvatar: usersTable.hasAvatar,
+        isSystem: usersTable.isSystem,
+        isActive: usersTable.isActive,
+        isVerified: usersTable.isVerified,
+        createdAt: usersTable.createdAt,
+        updatedAt: usersTable.updatedAt,
+        lastLoginAt: usersTable.lastLoginAt
+      })
+      .from(userGroups)
+      .innerJoin(usersTable, eq(usersTable.id, userGroups.userId))
+      .where(where)
+      .orderBy(usersTable.name)
+      .limit(limit)
+      .offset((page - 1) * limit)
+
+    return {
+      total: totals[0]?.total ?? 0,
+      users
+    }
+  }
+
+  /**
+   * Count the users assigned to a group
+   */
+  async countUsersInGroup(groupId: string): Promise<number> {
+    return WIKI.db.$count(userGroups, eq(userGroups.groupId, groupId))
+  }
+
+  /**
+   * Whether a user is currently assigned to a group
+   */
+  async isUserInGroup(groupId: string, userId: string): Promise<boolean> {
+    const total = await WIKI.db.$count(
+      userGroups,
+      and(eq(userGroups.groupId, groupId), eq(userGroups.userId, userId))
+    )
+    return total > 0
+  }
+
+  /**
+   * Whether the caller itself holds `manage:system`.
+   *
+   * `manage:system` is the permission that bypasses every route check, so a `manage:users` /
+   * `manage:groups` holder who could hand it out — or take it away, or edit the account of somebody
+   * who has it — would hold it in all but name. The guards built on this answer say so in their own
+   * words rather than as a bare 403, because "you may manage users, but not THIS user" is not
+   * something the caller can work out from a generic refusal.
+   */
+  holdsSystemPermission(req: FastifyRequest): boolean {
+    return this.actorForRequest(req).permissions.includes(SYSTEM_PERMISSION)
+  }
+
+  /** The ids of every group carrying `manage:system`. */
+  async systemGroupIds(): Promise<string[]> {
+    const rows = await WIKI.db
+      .select({ id: groupsTable.id, permissions: groupsTable.permissions })
+      .from(groupsTable)
+    return rows
+      .filter((row) => ((row.permissions ?? []) as string[]).includes(SYSTEM_PERMISSION))
+      .map((row) => row.id)
+  }
+
+  /**
+   * The ids of every group carrying any of `ELEVATED_PERMISSIONS`.
+   *
+   * What the membership guards ask about: putting somebody into one of these, or taking them out,
+   * changes who administers the instance rather than what one account may read.
+   */
+  async elevatedGroupIds(): Promise<string[]> {
+    const rows = await WIKI.db
+      .select({ id: groupsTable.id, permissions: groupsTable.permissions })
+      .from(groupsTable)
+    return rows
+      .filter((row) => isElevated((row.permissions ?? []) as string[]))
+      .map((row) => row.id)
+  }
+
+  /**
+   * Whether a user is protected by `manage:system` — i.e. belongs to any group carrying it.
+   *
+   * Membership rather than the session's own list, because the question is asked ABOUT somebody who
+   * is not the caller and may not be logged in at all.
+   */
+  async userHoldsSystemPermission(userId: string): Promise<boolean> {
+    const rows = await WIKI.db
+      .select({ permissions: groupsTable.permissions })
+      .from(userGroups)
+      .innerJoin(groupsTable, eq(groupsTable.id, userGroups.groupId))
+      .where(eq(userGroups.userId, userId))
+    return rows.some((row) => ((row.permissions ?? []) as string[]).includes(SYSTEM_PERMISSION))
+  }
+}
+
+export const groups = new Groups()

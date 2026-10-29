@@ -1,33 +1,85 @@
-// How to get remote container development working with VSCode:
-// 1. Install "Remote Development" extension pack (ms-vscode-remote.vscode-remote-extensionpack)
-// 2. Select "Remote Containers - Reopen in container"
-
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the README at:
+// https://github.com/microsoft/vscode-dev-containers/tree/v0.231.6/containers/javascript-node-postgres
+// Update the VARIANT arg in docker-compose.yml to pick a Node.js version
 {
-  "name": "Wiki.js",
-  "dockerComposeFile": [
-    "../dev/containers/docker-compose.yml"
-  ],
-  "forwardPorts": [3000, 3001],
-  "service": "wiki",
-  "workspaceFolder": "/wiki",
-  "settings": {
-    "terminal.integrated.shell.linux": "/bin/bash"
+	"name": "Wiki.js Dev",
+	"dockerComposeFile": "docker-compose.yml",
+	"service": "app",
+	"workspaceFolder": "/workspace",
+  "shutdownAction": "stopCompose",
+
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "zsh"
+      },
+      "extensions": [
+        "arcanis.vscode-zipfs",
+        "eamodio.gitlens",
+        "Vue.volar",
+        "oxc.oxc-vscode",
+        "oderwat.indent-rainbow",
+        "redhat.vscode-yaml",
+        "editorconfig.editorconfig",
+        "lokalise.i18n-ally",
+        "mrmlnc.vscode-duplicate",
+        "mutantdino.resourcemonitor",
+        "wayou.vscode-todo-highlight"
+      ]
+    }
   },
-  "extensions": [
-	"EditorConfig.editorconfig",
-	"dbaeumer.vscode-eslint",
-	"christian-kohler.path-intellisense",
-	"mrmlnc.vscode-puglint",
-	"octref.vetur",
-	"dzannotti.vscode-babel-coloring",
-	"wayou.vscode-todo-highlight",
-	"visualstudioexptteam.vscodeintellicode",
-	"lukas-tr.materialdesignicons-intellisense",
-	"codezombiech.gitignore",
-	"kumar-harsh.graphql-for-vscode",
-	"mrmlnc.vscode-duplicate",
-	"oderwat.indent-rainbow",
-	"christian-kohler.npm-intellisense"
-],
-  "postCreateCommand": ["yarn", "install"]
+
+	// Use 'forwardPorts' to make a list of ports inside the container available locally.
+	// This can be used to network with other containers or with the host.
+	"forwardPorts": [1025, 3000, 3001, 5432, 8000, 8025],
+
+  "portsAttributes": {
+    "1025": {
+      "label": "Mailpit SMTP",
+      "onAutoForward": "silent"
+    },
+    "3000": {
+      "label": "Application Backend",
+      "onAutoForward": "silent"
+    },
+    "3001": {
+      "label": "Application Frontend",
+      "onAutoForward": "silent"
+    },
+    "5432": {
+      "label": "PostgreSQL",
+      "onAutoForward": "silent"
+    },
+    "8000": {
+      "label": "PGAdmin",
+      "onAutoForward": "silent"
+    },
+    "8025": {
+      "label": "Mailpit",
+      "onAutoForward": "silent"
+    }
+  },
+
+	// Use 'postCreateCommand' to run commands after the container is created.
+	"postCreateCommand": "/docker-init.sh",
+
+	// Comment out to connect as root instead. More info: https://aka.ms/vscode-remote/containers/non-root.
+	"remoteUser": "node",
+	"features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+			"installZsh": "true",
+      "installOhMyZsh": "true",
+			"username": "node",
+			"upgradePackages": "true"
+		},
+    "ghcr.io/devcontainers/features/node:1": {
+      "nodeGypDependencies": true,
+      "version": "26",
+      "npmVersion": "none",
+      "pnpmVersion": "none",
+      "nvmVersion": "latest"
+    },
+    "ghcr.io/devcontainers/features/git:1": {},
+    "ghcr.io/joedmck/devcontainer-features/cloudflared:1": {}
+	}
 }

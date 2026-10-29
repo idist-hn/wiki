@@ -1,0 +1,73 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Update 'VARIANT' to pick an LTS version of Node.js: 18, 16, 14, 12.
+        # Append -bullseye or -buster to pin to an OS version.
+        # Use -bullseye variants on local arm64/Apple Silicon.
+        VARIANT: 26
+
+    volumes:
+      - ..:/workspace
+      - wiki-vscode-ext:/root/.vscode-server/extensions
+
+    # Overrides default command so things don't shut down after the process ends.
+    command: sleep infinity
+
+    # Runs app on the same network as the database container, allows "forwardPorts" in devcontainer.json function.
+    network_mode: service:db
+
+    # Uncomment the next line to use a non-root user for all processes.
+    # user: node
+
+    # Use "forwardPorts" in **devcontainer.json** to forward an app port locally.
+    # (Adding the "ports" property to this file will not forward from a Codespace.)
+
+  db:
+    image: postgres:18
+    restart: unless-stopped
+    volumes:
+      # Postgres 18+ stores data in a major-version subdirectory and expects the
+      # volume mounted at /var/lib/postgresql (not /var/lib/postgresql/data).
+      - postgres-data:/var/lib/postgresql
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+
+  # A mail server that delivers nothing, which is what makes it useful: everything the wiki sends —
+  # a registration's confirmation link, a password reset, the admin area's test button — lands in a
+  # web inbox at http://localhost:8025 instead of somebody's mailbox.
+  #
+  # Configure it under Admin -> Mail: host `localhost`, port 1025, TLS off, no username or password.
+  # Sharing the database container's network namespace is what makes `localhost` reach it.
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: unless-stopped
+    environment:
+      # -> Nothing here is reachable from outside the container, and a dev instance should not fail a
+      #    send because of a credential nobody has set: any AUTH is accepted, over a plain connection.
+      - MP_SMTP_AUTH_ACCEPT_ANY=true
+      - MP_SMTP_AUTH_ALLOW_INSECURE=true
+    # -> Deliberately no volume: these are test messages, and a mailbox that survives a rebuild is a
+    #    mailbox full of last month's password resets.
+    network_mode: service:db
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=dev@js.wiki
+      - PGADMIN_DEFAULT_PASSWORD=123123
+      - PGADMIN_DISABLE_POSTFIX=True
+      - PGADMIN_LISTEN_PORT=8000
+      - PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED=False
+      - PGADMIN_CONFIG_LOGIN_BANNER="Login with dev@js.wiki / 123123"
+    network_mode: service:db
+    # volumes:
+      # - ./pgadmin-servers.json:/pgadmin4/servers.json
+
+volumes:
+  postgres-data:
+  wiki-vscode-ext:

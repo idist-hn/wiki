@@ -1,0 +1,309 @@
+<template>
+  <w-page class="admin-flags">
+    <div class="flex flex-wrap p-4 items-center">
+      <div class="flex-none">
+        <img class="admin-icon animated fadeInLeft" src="/_assets/icons/fluent-plugin.svg" />
+      </div>
+      <div class="min-w-0 flex-1 pl-4">
+        <div class="text-h5 admin-page-title animated fadeInLeft">
+          {{ t('admin.blocks.title') }}
+        </div>
+        <div class="text-subtitle1 text-grey animated fadeInLeft wait-p2s">
+          {{ t('admin.blocks.subtitle') }}
+        </div>
+      </div>
+      <div class="flex-none flex">
+        <w-btn
+          class="mr-2 acrylic-btn"
+          flat
+          icon="la:file-upload"
+          :color="dark.isActive ? `indigo-4` : `indigo`"
+          :label="t(`admin.blocks.import`)"
+          :loading="state.importing"
+          :disabled="state.loading > 0 || state.importing"
+          @click="pickPackage">
+          <w-tooltip>{{ t(`admin.blocks.importHint`) }}</w-tooltip>
+        </w-btn>
+        <w-separator class="mr-2" vertical />
+        <w-btn
+          class="mr-2 acrylic-btn"
+          icon="la:question-circle"
+          flat
+          color="grey"
+          :aria-label="t(`common.actions.viewDocs`)"
+          :href="siteStore.docsBase + `/admin/editors`"
+          target="_blank">
+          <w-tooltip>{{ t(`common.actions.viewDocs`) }}</w-tooltip>
+        </w-btn>
+        <w-btn
+          class="mr-2 acrylic-btn"
+          icon="la:redo-alt"
+          flat
+          color="secondary"
+          :loading="state.loading > 0"
+          :aria-label="t(`common.actions.refresh`)"
+          @click="refresh">
+          <w-tooltip>{{ t(`common.actions.refresh`) }}</w-tooltip>
+        </w-btn>
+        <w-btn
+          unelevated
+          icon="mdi:check"
+          :label="t(`common.actions.apply`)"
+          color="secondary"
+          @click="save"
+          :disabled="state.loading > 0" />
+      </div>
+    </div>
+    <w-separator inset />
+    <div class="p-4 gap-4">
+      <w-card>
+        <w-list separator>
+          <w-item v-for="block of state.blocks" :key="block.id">
+            <blueprint-icon :icon="block.isCustom ? `plugin` : block.icon" />
+            <w-item-section>
+              <w-item-label
+                ><strong>{{ block.name }}</strong></w-item-label
+              >
+              <w-item-label caption>{{ block.description }}</w-item-label>
+              <w-item-label class="flex items-center" caption>
+                <w-chip
+                  class="m-0"
+                  square
+                  dense
+                  :color="dark.isActive ? `pink-8` : `pink-1`"
+                  :text-color="dark.isActive ? `white` : `pink-9`">
+                  <span class="text-caption">&lt;block-{{ block.block }}&gt;</span>
+                </w-chip>
+                <w-separator class="mx-2 my-1" vertical />
+                <em class="text-purple" v-if="block.isCustom">{{ t('admin.blocks.custom') }}</em>
+                <em class="text-teal-7" v-else>{{ t('admin.blocks.builtin') }}</em>
+              </w-item-label>
+            </w-item-section>
+            <template v-if="block.isCustom">
+              <w-item-section side>
+                <w-btn
+                  icon="la:trash"
+                  :aria-label="t(`common.actions.delete`)"
+                  color="negative"
+                  outline
+                  no-caps
+                  padding="xs sm"
+                  @click="deleteBlock(block.id)" />
+              </w-item-section>
+              <w-separator class="ml-6" vertical />
+            </template>
+            <w-item-section side>
+              <w-toggle
+                class="pr-2"
+                v-model="block.isEnabled"
+                :label="t(`admin.blocks.isEnabled`)"
+                :aria-label="t(`admin.blocks.isEnabled`)" />
+            </w-item-section>
+          </w-item>
+        </w-list>
+      </w-card>
+    </div>
+    <input
+      type="file"
+      ref="packageFileIpt"
+      accept=".wkblock"
+      style="display: none"
+      @change="importPackage" />
+  </w-page>
+</template>
+
+<script setup>
+import { useI18n } from 'vue-i18n'
+import { onMounted, reactive, ref, watch } from 'vue'
+
+import { useDark } from '@/composables/dark'
+import { useMeta } from '@/composables/meta'
+import { notify } from '@/composables/notify'
+import { loading } from '@/composables/loading'
+import { confirm } from '@/composables/dialog'
+
+import { useAdminStore } from '@/stores/admin'
+import { useSiteStore } from '@/stores/site'
+
+import { pick } from 'es-toolkit/object'
+import { apiErrorMessage } from '@/helpers/apiError'
+
+// COMPOSABLES
+
+const dark = useDark()
+
+// STORES
+
+const adminStore = useAdminStore()
+const siteStore = useSiteStore()
+
+// I18N
+
+const { t } = useI18n()
+
+// META
+
+useMeta(() => ({
+  title: t('admin.editors.title')
+}))
+
+const state = reactive({
+  loading: 0,
+  importing: false,
+  blocks: []
+})
+
+const packageFileIpt = ref(null)
+
+// WATCHERS
+
+watch(
+  () => adminStore.currentSiteId,
+  (newValue) => {
+    loading.show()
+    load()
+  }
+)
+
+// METHODS
+
+async function load() {
+  state.loading++
+  try {
+    /*
+      Child blocks are dropped: the API lists them so an editor can build a form from the props they
+      declare, but there is nothing here to do with one. `block-tab` has no row, cannot be switched off
+      independently of the tabset it sits in, and cannot be deleted.
+    */
+    const all = (await API_CLIENT.get(`sites/${adminStore.currentSiteId}/blocks`).json()) ?? []
+    state.blocks = all.filter((block) => !block.isChild)
+  } catch (err) {
+    notify({
+      type: 'negative',
+      message: t('admin.blocks.loadFailed'),
+      caption: err.message
+    })
+  }
+  loading.hide()
+  state.loading--
+}
+
+async function save() {
+  state.loading++
+  try {
+    const resp = await API_CLIENT.put(`sites/${adminStore.currentSiteId}/blocks`, {
+      json: {
+        states: state.blocks.map((bl) => pick(bl, ['id', 'isEnabled']))
+      }
+    }).json()
+    if (!resp?.ok) {
+      throw new Error(
+        t(`admin.blocks.${resp?.error}`, resp?.message || 'An unexpected error occured.')
+      )
+    }
+    notify({
+      type: 'positive',
+      message: t('admin.blocks.saveSuccess')
+    })
+  } catch (err) {
+    notify({
+      type: 'negative',
+      message: t('admin.blocks.saveFailed'),
+      caption: err.message
+    })
+  }
+  state.loading--
+}
+
+async function refresh() {
+  await load()
+}
+
+function pickPackage() {
+  packageFileIpt.value?.click()
+}
+
+/**
+ * Install a `.wkblock` — a block somebody built outside this instance and packaged into one file.
+ *
+ * The body is the file itself rather than a multipart form, as every other upload here is. A package
+ * whose block this site already has replaces it, which is how a custom block is upgraded, so the
+ * reply says which of the two happened.
+ */
+async function importPackage() {
+  const file = packageFileIpt.value?.files?.[0]
+  if (!file || state.importing) {
+    return
+  }
+  state.importing = true
+  try {
+    const resp = await API_CLIENT.post(`sites/${adminStore.currentSiteId}/blocks/import`, {
+      headers: { 'content-type': 'application/octet-stream' },
+      body: file
+    }).json()
+    // -> The API client does not throw on 400, which is what a package that is not one comes back as,
+    //    so a refusal arrives here as a parsed error. A key a built-in block already has is a 409 and
+    //    does throw — both paths have to be reported
+    if (resp?.ok === false) {
+      throw new Error(resp.message || 'An unexpected error occured.')
+    }
+    notify({
+      type: 'positive',
+      message: t(resp.isNew ? 'admin.blocks.importSuccess' : 'admin.blocks.importUpdated', {
+        blockName: resp.name
+      })
+    })
+    await load()
+  } catch (err) {
+    notify({
+      type: 'negative',
+      message: t('admin.blocks.importFailed'),
+      caption: apiErrorMessage(err)
+    })
+  }
+  packageFileIpt.value.value = null
+  state.importing = false
+}
+
+function deleteBlock(id) {
+  const block = state.blocks.find((bl) => bl.id === id)
+  confirm({
+    title: t('admin.blocks.delete'),
+    icon: 'img:/_assets/icons/fluent-delete-bin.svg',
+    message: t('admin.blocks.deleteConfirm', { blockName: block?.name ?? '' }),
+    cancel: true,
+    persistent: true
+  }).onOk(async () => {
+    state.loading++
+    try {
+      const resp = await API_CLIENT.delete(`sites/${adminStore.currentSiteId}/blocks/${id}`)
+      if (!resp?.ok) {
+        throw new Error((await resp.json())?.message || 'An unexpected error occured.')
+      }
+      notify({
+        type: 'positive',
+        message: t('admin.blocks.deleteSuccess')
+      })
+      await load()
+    } catch (err) {
+      // -> ky throws above 400 (e.g. 409 for a built-in block), with the reason in the body
+      notify({
+        type: 'negative',
+        message: apiErrorMessage(err)
+      })
+    }
+    state.loading--
+  })
+}
+
+// MOUNTED
+
+onMounted(async () => {
+  loading.show()
+  if (adminStore.currentSiteId) {
+    await load()
+  }
+})
+</script>
+
+<style lang="scss"></style>

@@ -1,0 +1,99 @@
+<template>
+  <div
+    ref="listEl"
+    class="w-tabs flex flex-nowrap items-stretch gap-1 overflow-x-auto rounded-lg"
+    :class="[dense ? `p-0.5` : `p-1`, dark ? `bg-dark-5` : `bg-grey-2 dark:bg-dark-5`]"
+    role="tablist"
+    @keydown="onKeydown">
+    <slot />
+  </div>
+</template>
+
+<script setup>
+import { computed, provide, ref } from 'vue'
+
+/**
+ * A strip of tabs, drawn as a segmented control: a tinted track holding the tabs, with the active
+ * one raised out of it as a light pill (see `WTab`). `WTab` children register through it; the panels
+ * are either `WTabPanels` or, where a caller prefers, plain `v-if` on the same model.
+ *
+ * The track fill is a utility rather than a rule in this file's stylesheet, so a caller that puts
+ * the strip on a surface of its own -- `PageDataDialog` bands it with `alt-card` -- still overrides
+ * it. An SFC stylesheet is emitted unlayered and would outrank any such class.
+ *
+ * Simplification: no scroll arrows, no overflow menu. The two tab strips in this app have two tabs
+ * each; the strip simply scrolls if it ever cannot fit.
+ */
+const props = defineProps({
+  modelValue: {
+    type: [String, Number],
+    default: null
+  },
+  /** Leave labels as written instead of upper-casing them. */
+  noCaps: {
+    type: Boolean,
+    default: false
+  },
+  /** Icon and label side by side rather than stacked. */
+  inlineLabel: {
+    type: Boolean,
+    default: false
+  },
+  /**
+   * Smaller tabs on a thinner track, for a strip that sits in a bar rather than heading a dialog --
+   * the live note's Editor / Reader switch.
+   */
+  dense: {
+    type: Boolean,
+    default: false
+  },
+  /**
+   * Drawn as in the dark theme whichever theme is on, for a strip sitting on a dark surface of its
+   * own -- the live note's switch, in a notch of the site header. The `dark:` variant answers to the
+   * body's theme class and so cannot be scoped to one component; this picks the dark classes outright.
+   */
+  dark: {
+    type: Boolean,
+    default: false
+  }
+})
+
+const emit = defineEmits(['update:modelValue'])
+
+const listEl = ref(null)
+
+provide('wTabs', {
+  current: computed(() => props.modelValue),
+  noCaps: computed(() => props.noCaps),
+  inlineLabel: computed(() => props.inlineLabel),
+  dense: computed(() => props.dense),
+  dark: computed(() => props.dark),
+  select: (name) => emit('update:modelValue', name)
+})
+
+/**
+ * Arrow keys move between tabs, which is what a tablist is expected to do -- and the reason the
+ * handler lives here rather than on each tab: only the strip knows what the neighbours are.
+ */
+function onKeydown(ev) {
+  const keys = { ArrowRight: 1, ArrowLeft: -1, Home: 'first', End: 'last' }
+  const move = keys[ev.key]
+  if (move === undefined) {
+    return
+  }
+  const tabs = [...listEl.value.querySelectorAll('[role="tab"]:not(:disabled)')]
+  if (tabs.length === 0) {
+    return
+  }
+  ev.preventDefault()
+  const at = tabs.indexOf(document.activeElement)
+  const next =
+    move === 'first'
+      ? 0
+      : move === 'last'
+        ? tabs.length - 1
+        : (Math.max(at, 0) + move + tabs.length) % tabs.length
+  tabs[next].focus()
+  tabs[next].click()
+}
+</script>

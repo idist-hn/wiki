@@ -1,0 +1,16 @@
+key: db
+title: 'Database'
+icon: '/_assets/icons/ultraviolet-database.svg'
+banner: '/_assets/storage/database.jpg'
+description: 'The local PostgreSQL database can store any assets. It is however not recommended to store large files directly in the database as this can cause performance issues.'
+assetDelivery:
+  isDirectAccessSupported: false
+contentTypes:
+  defaultTypesEnabled: ['pages', 'images', 'documents', 'others', 'large']
+props: {}
+actions:
+  offloadUnchecked:
+    label: Offload Unchecked Content Types
+    hint: For every content type unticked above, move the bytes still held in the database onto the storage targets that are configured to hold it, then clear them from the database. Each file is read back from every destination before its database copy is released, and anything with no other target to go to is left alone. Only the bytes are removed - names, sizes, thumbnails and folders stay in the database, and the files go on being served from wherever they now live.
+    warn: This releases the database's copy of those files, which for content uploaded before another target was enabled is the only copy there is. Make sure the targets you want them on are enabled and configured for those content types first, and take a database backup before running this.
+    icon: database-export

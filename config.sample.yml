@@ -2,7 +2,7 @@
 # Wiki.js - CONFIGURATION                                             #
 #######################################################################
 # Full documentation + examples:
-# https://docs.requarks.io/install
+# https://next.js.wiki/docs/install
 
 # ---------------------------------------------------------------------
 # Port the server should listen to
@@ -13,25 +13,18 @@ port: 3000
 # ---------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------
-# Supported Database Engines:
-# - postgres = PostgreSQL 9.5 or later
-# - mysql = MySQL 8.0 or later (5.7.8 partially supported, refer to docs)
-# - mariadb = MariaDB 10.2.7 or later
-# - mssql = MS SQL Server 2012 or later
-# - sqlite = SQLite 3.9 or later
+# PostgreSQL 17 or later required
 
 db:
-  type: postgres
-
-  # PostgreSQL / MySQL / MariaDB / MS SQL Server only:
   host: localhost
   port: 5432
-  user: wikijs
-  pass: wikijsrocks
-  db: wiki
+  user: postgres
+  pass: postgres
+  db: postgres
+  schema: wiki
   ssl: false
 
-  # Optional - PostgreSQL / MySQL / MariaDB only:
+  # Optional
   # -> Uncomment lines you need below and set `auto` to false
   # -> Full list of accepted options: https://nodejs.org/api/tls.html#tls_tls_createsecurecontext_options
   sslOptions:
@@ -43,56 +36,10 @@ db:
     # pfx: path/to/cert.pfx
     # passphrase: xyz123
 
-  # Optional - PostgreSQL only:
-  schema: public
-
-  # SQLite only:
-  storage: path/to/database.sqlite
-
 #######################################################################
 # ADVANCED OPTIONS                                                    #
 #######################################################################
 # Do not change unless you know what you are doing!
-
-# ---------------------------------------------------------------------
-# SSL/TLS Settings
-# ---------------------------------------------------------------------
-# Consider using a reverse proxy (e.g. nginx) if you require more
-# advanced options than those provided below.
-
-ssl:
-  enabled: false
-  port: 3443
-
-  # Provider to use, possible values: custom, letsencrypt
-  provider: custom
-
-  # ++++++ For custom only ++++++
-  # Certificate format, either 'pem' or 'pfx':
-  format: pem
-  # Using PEM format:
-  key: path/to/key.pem
-  cert: path/to/cert.pem
-  # Using PFX format:
-  pfx: path/to/cert.pfx
-  # Passphrase when using encrypted PEM / PFX keys (default: null):
-  passphrase: null
-  # Diffie Hellman parameters, with key length being greater or equal
-  # to 1024 bits (default: null):
-  dhparam: null
-
-  # ++++++ For letsencrypt only ++++++
-  domain: wiki.yourdomain.com
-  subscriberEmail: admin@example.com
-
-# ---------------------------------------------------------------------
-# Database Pool Options
-# ---------------------------------------------------------------------
-# Refer to https://github.com/vincit/tarn.js for all possible options
-
-pool:
-  # min: 2
-  # max: 10
 
 # ---------------------------------------------------------------------
 # IP address the server should listen to
@@ -102,15 +49,12 @@ pool:
 bindIP: 0.0.0.0
 
 # ---------------------------------------------------------------------
-# Log Level
+# Logging
 # ---------------------------------------------------------------------
-# Possible values: error, warn, info (default), verbose, debug, silly
+# Possible values: error, warn, info (default), debug
 
 logLevel: info
 
-# ---------------------------------------------------------------------
-# Log Format
-# ---------------------------------------------------------------------
 # Output format for logging, possible values: default, json
 
 logFormat: default
@@ -118,19 +62,18 @@ logFormat: default
 # ---------------------------------------------------------------------
 # Offline Mode
 # ---------------------------------------------------------------------
-# If your server cannot access the internet. Set to true and manually
-# download the offline files for sideloading.
+# Set to true if your server cannot access the internet. Wiki.js then
+# makes no request of its own to upstream services:
+#  - Icons: icon sets cannot be added, and only icons the wiki has
+#    already stored can be used. The interface's own icons are built in
+#    and unaffected.
+#  - Locales: nothing is downloaded. Install a locale by uploading its
+#    file instead (Admin > Locale).
+#  - Update checks: skipped.
+# Services you configure yourself (authentication providers, storage
+# targets, mail, Akismet) are still contacted, since you chose them.
 
 offline: false
-
-# ---------------------------------------------------------------------
-# High-Availability
-# ---------------------------------------------------------------------
-# Set to true if you have multiple concurrent instances running off the
-# same DB (e.g. Kubernetes pods / load balanced instances). Leave false
-# otherwise. You MUST be using PostgreSQL to use this feature.
-
-ha: false
 
 # ---------------------------------------------------------------------
 # Data Path
@@ -139,9 +82,58 @@ ha: false
 dataPath: ./data
 
 # ---------------------------------------------------------------------
+# Icons
+# ---------------------------------------------------------------------
+# Icons are fetched from the Iconify API the first time they are used, then
+# stored in the database and served by this instance. Point this at a
+# self-hosted Iconify API to keep icon lookups inside your network.
+
+icons:
+  apiUrl: 'https://api.iconify.design'
+
+# ---------------------------------------------------------------------
 # Body Parser Limit
 # ---------------------------------------------------------------------
-# Maximum size of API requests body that can be parsed. Does not affect
-# file uploads.
+# Maximum size of API requests body that can be parsed, in bytes.
+# Does not affect file uploads. (default: 5242880 (5mb))
 
-bodyParserLimit: 5mb
+bodyParserLimit: 5242880
+
+# ---------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------
+
+scheduler:
+  # Maximum number of workers to run background cpu-intensive jobs.
+  # Leave 'auto' for one fewer than the CPUs available to the process (at
+  # least 1), which respects a container's CPU limit.
+  workers: auto
+
+# ---------------------------------------------------------------------
+# Database Connection Pool
+# ---------------------------------------------------------------------
+# Passed as-is to the PostgreSQL connection pool (node-postgres) of
+# each instance, so any of its options is accepted:
+# https://node-postgres.com/apis/pool
+#
+# `max` (default 10) is the one worth knowing: with several instances
+# behind a load balancer, each opens up to `max` connections, and the
+# total must stay under the server's `max_connections`. Three of each
+# instance's connections are held open for good (event, scheduler and
+# collaboration listeners), so `max` must be well above 3 or queries
+# will wait for a connection that never comes free.
+# Worker threads ignore this and use one connection each.
+
+# pool:
+#   max: 10
+
+# ---------------------------------------------------------------------
+# Dev Mode
+# ---------------------------------------------------------------------
+# Settings when running in dev mode only
+
+dev:
+  dropSchema: false
+  logQueries: false
+  port: 3001
+  hmrClientPort: 3001

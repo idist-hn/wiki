@@ -1,0 +1,283 @@
+<template>
+  <!--
+    Two classes doing two different jobs. `page-contents` is what draws the markdown INSIDE the notice
+    -- its paragraphs, lists, links and code -- exactly as the same markdown would read on a page, and
+    is also what zeroes the notice's own outer margins (`> :first-child`, `> :last-child`).
+
+    The notice itself is drawn by `site-banner-alert` in the style block below, which is a COPY of the
+    caution admonition rather than a use of it: a banner is chrome an administrator raises over a
+    whole site, an admonition is something an author wrote in one page, and the two only happen to
+    look alike today. Restyle either without touching the other.
+  -->
+  <div class="page-contents site-banner" v-if="html" v-html="html" />
+</template>
+
+<script setup>
+import { computed, ref, watch } from 'vue'
+
+import { escape } from 'es-toolkit/string'
+
+import { useSiteStore } from '@/stores/site'
+
+/**
+ * The site-wide banner, above the contents of every page.
+ *
+ * Site configuration rather than content: it is set in the admin area's General section, is the same
+ * on every page, and so never goes through the page renderer -- which renders ONE page, on the server,
+ * and stores the result. This renders here instead, on every view, which is also what lets a banner
+ * raised during an incident appear without every page being re-rendered.
+ *
+ * Only the inline parts of markdown are worth anything in a notice a few lines long, but the full
+ * block grammar comes free with the parser, so the whole of markdown-it is what runs -- with `html`
+ * OFF, unlike the page renderer. An administrator writing a banner is not writing a page, and
+ * markdown-it's own link validation (`javascript:` and friends) is then the only escape left to
+ * worry about, which it handles itself.
+ */
+
+// STORES
+
+const siteStore = useSiteStore()
+
+// DATA
+
+/**
+ * The parser, built on first use and kept.
+ *
+ * Imported dynamically so that markdown-it stays out of the bundle a reader downloads for a site with
+ * no banner, which is nearly all of them -- and so that it is fetched alongside the banner rather than
+ * ahead of the page.
+ */
+let md = null
+
+/** Which render is the current one, so that a slower earlier import cannot land on top of a later. */
+let generation = 0
+
+const html = ref('')
+
+// COMPUTED
+
+const banner = computed(() => siteStore.banner)
+
+// WATCHERS
+
+watch(banner, render, { deep: true, immediate: true })
+
+// METHODS
+
+async function render() {
+  const gen = ++generation
+  const { isEnabled, title, content } = banner.value
+  if (!isEnabled) {
+    html.value = ''
+    return
+  }
+
+  // -> Text, not markdown: a title is one line, and a heading inside a heading is not what an
+  //    administrator typing a sentence there means
+  const parts = title ? [`<p class="site-banner-title">${escape(title)}</p>`] : []
+
+  if (content) {
+    md ??= new (await import('markdown-it')).default({
+      html: false,
+      linkify: true,
+      breaks: true
+    })
+    parts.push(md.render(content))
+  }
+
+  /*
+    Built as a string rather than written in the template around a `v-html` element, because the
+    title has to be a DIRECT child of the notice: an element in the template could only hold the
+    render in a wrapper of its own, and every `>` selector below would then miss.
+  */
+  if (gen === generation) {
+    html.value = parts.length > 0 ? `<div class="site-banner-alert">${parts.join('')}</div>` : ''
+  }
+}
+</script>
+
+<!--
+  Not scoped: the notice and its title are written by `v-html`, and scoped styles reach only the
+  elements Vue itself renders. Every selector is under `.site-banner`, which is what keeps it to this
+  component -- and what carries the specificity, since these rules sit inside `.page-contents` and
+  have to out-weigh its own (`.page-contents p` and friends are two components, so one class is not
+  enough).
+-->
+<style lang="scss">
+.site-banner {
+  /*
+    Flush to the top of the column, a hairline of it left showing either side, and the article's own
+    distance below.
+
+    All three are measured off the padding `page-container-body` puts around the article -- 1rem, or
+    0.5rem on a phone, which is why the breakpoint here is the 600px `Index.vue` switches that padding
+    at. The band takes the whole of it back at the top and all but a pixel of it at the sides, so the
+    property below is that padding and the margins are what is left of it.
+  */
+  --site-banner-pad: 1rem;
+
+  margin: calc(-1 * var(--site-banner-pad)) calc(1px - var(--site-banner-pad)) 1.5rem;
+
+  @media (max-width: $breakpoint-xs-max) {
+    --site-banner-pad: 0.5rem;
+  }
+
+  /*
+    Descended from the caution admonition in `css/_page-contents.scss` and now drawn on its own terms:
+    a wash, a heavier rule and an icon -- colour alone would leave a reader who cannot separate the
+    hues with nothing to go on, and the icon is a masked SVG rather than a glyph because the app ships
+    no icon webfont.
+
+    The rule runs along the BOTTOM and the corners are square, which is where it parts company with an
+    admonition: this is a band across the top of the page rather than a block within it, so it reads
+    as a strip the article begins under -- squared off to the column's own edges, and closed by a line
+    that says where the page's own content starts.
+
+    Its colours are declared here as the banner's OWN two properties rather than read from the content
+    palette, so that re-tinting the banner is these two lines (plus the two in the dark block) and
+    reaches nothing else.
+  */
+  .site-banner-alert {
+    /*
+      One colour at three alphas: the hue itself for the rule, the icon and the heading, the wash the
+      band is filled with, and the same hue at nothing, which both gradients below fade out to.
+
+      The third is spelled out rather than written as `transparent` or mixed down from the hue. Both
+      of those are transparent BLACK -- `color-mix(in srgb, <hue> 0%, transparent)` computes to
+      `color(srgb 0 0 0 / 0)`, which is the thing it looks like it avoids -- and a gradient running to
+      it drags its middle through grey. Stating the hue with a zero alpha is what keeps every step of
+      the fade the banner's own colour.
+
+      The fourth is where the rule ends, and it is the odd one out: opaque, and a step DARKER than the
+      band it is drawn under -- which is the band as composited, not the wash, so it is the only value
+      here that knows what the page behind it looks like. That coupling is why it is a literal per
+      theme rather than an expression: the wash over white is `#faeeef` and a step down from it is
+      this, while in the dark theme the hue is lighter than the page, so the same expression would
+      walk the wrong way and the value there is derived from `#25191c` instead. The rule has always
+      been opaque -- its other end is the hue itself -- so nothing is given up by stating it.
+    */
+    --site-banner-hue: #c02636;
+    --site-banner-wash: rgba(192, 38, 54, 0.08);
+    --site-banner-fade: rgba(192, 38, 54, 0);
+    --site-banner-rule-end: #f5dcdf;
+
+    position: relative;
+    padding: 0.9em 1.1em 0.9em 3.1em;
+    /*
+      The rule that closes the band, run left to right from the hue to the band's own colour taken a
+      step darker -- so it thins away to a line rather than to nothing, and the edge stays drawn all
+      the way across.
+
+      `border-image` rather than a background layer or a pseudo-element: it keeps the line in the
+      border box, so the height and the padding above it are the ones the border already set, and it
+      leaves `::before` to the icon. The `border-bottom` above it is not a fallback that gets
+      overridden -- it is what gives this edge a width, since `border-image` paints the border box
+      and nothing else says how thick the bottom of it is. The other three stay at zero, which is why
+      a slice that nominally covers all four edges only ever draws this one.
+    */
+    border-bottom: 4px solid var(--site-banner-hue);
+    border-image: linear-gradient(to right, var(--site-banner-hue), var(--site-banner-rule-end)) 1;
+    /*
+      The wash, thrown as an ellipse centred on the band's top-right corner: nothing at the corner,
+      where the page's own surface shows through, deepening to the full wash across the band.
+
+      A `background-image` and no `background-color`: a flat colour underneath would be painted
+      through the transparent end, which is the one part of this that has to show the page.
+    */
+    background-image: radial-gradient(
+      ellipse at top right,
+      var(--site-banner-fade),
+      var(--site-banner-wash)
+    );
+
+    /* -> Lighter, because the notice sits on a dark page rather than in the flow of one */
+    @at-root .body--dark & {
+      --site-banner-hue: #ff8b8b;
+      --site-banner-wash: rgba(255, 139, 139, 0.12);
+      --site-banner-fade: rgba(255, 139, 139, 0);
+      --site-banner-rule-end: #1e1416;
+    }
+
+    &::before {
+      content: '';
+      position: absolute;
+      /*
+        Centred on the CAP BAND of the first line rather than on the line box holding it: a line box
+        is ascent plus descent, and a title inks only what is between the cap line and the baseline,
+        so an icon centred on the box reads as sitting a pixel high. `0.9em` is the padding above the
+        first line, `0.79em` the middle of the cap band within it, and `0.625em` half the icon.
+      */
+      top: calc(0.9em + 0.79em - 0.625em);
+      left: 1.1em;
+      width: 1.25em;
+      height: 1.25em;
+      /*
+        The warning triangle, drawn here as a mask rather than referenced as an icon: a name would be
+        resolved at runtime through `/_icons`, and a banner raised because something is wrong is the
+        last thing that should depend on a fetch.
+      */
+      background-color: var(--site-banner-hue);
+      mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M13 14h-2V9h2m0 9h-2v-2h2M1 21h22L12 2z'/%3E%3C/svg%3E");
+      mask-repeat: no-repeat;
+      mask-size: contain;
+    }
+
+    /* -> The notice ends where its box does; the last block's own margin would show as a gap */
+    > :last-child {
+      margin-bottom: 0;
+    }
+
+    /*
+      The banner's heading, in the notice's colour since that is what it names, and close above the
+      text it introduces rather than a paragraph's distance from it.
+    */
+    > .site-banner-title {
+      margin-bottom: 0.3em;
+      color: var(--site-banner-hue);
+      font-weight: 600;
+    }
+  }
+
+  /*
+    ON PAPER
+    --------
+
+    The banner survives printing. It is site chrome rather than this page, and the same on every one of
+    them -- but an administrator raises a banner because it has to be seen, and a printout that quietly
+    drops "this documentation is superseded" is worse than one that spends the ink. What goes is the
+    wash, as every other tint does on paper (see `css/_print.scss`); the rule under the notice and its
+    hue are what carry it.
+
+    Here rather than with the rest of the print stylesheet because of the cascade: these styles ship in
+    the page view's lazily-imported chunk, which the browser adds after `main`'s, so a rule over there
+    would tie on specificity and lose on order.
+
+    The margins are the other half. They are measured off the article column's padding -- see the note
+    on `--site-banner-pad` above -- and print zeroes that padding, so left alone they would pull the
+    band a whole rem out past the text on three sides.
+  */
+  @media print {
+    margin: 0 0 1.5rem;
+
+    .site-banner-alert {
+      background-color: transparent;
+
+      /*
+        The warning triangle is a mask over a background COLOUR, and a print dialog leaves background
+        graphics off by default -- so the one mark that says this notice is a warning rather than an
+        aside was the one part of it that did not print. Same pair as a done task item in
+        `css/_page-contents.scss`, for the same reason.
+      */
+      &::before {
+        print-color-adjust: exact;
+        -webkit-print-color-adjust: exact;
+      }
+    }
+
+    /* -> The dark theme's hue is pitched to be seen against a dark page and prints as a pale smear */
+    @at-root .body--dark & .site-banner-alert {
+      --site-banner-hue: #c02636;
+    }
+  }
+}
+</style>

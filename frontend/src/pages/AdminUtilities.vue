@@ -1,0 +1,1259 @@
+<template>
+  <w-page class="admin-utilities">
+    <div class="flex flex-wrap p-4 items-center">
+      <div class="flex-none">
+        <img
+          class="admin-icon animated fadeInLeft"
+          src="/_assets/icons/fluent-swiss-army-knife-animated.svg" />
+      </div>
+      <div class="min-w-0 flex-1 pl-4">
+        <div class="text-h5 admin-page-title animated fadeInLeft">
+          {{ t('admin.utilities.title') }}
+        </div>
+        <div class="text-subtitle1 text-grey animated fadeInLeft wait-p2s">
+          {{ t('admin.utilities.subtitle') }}
+        </div>
+      </div>
+      <div class="flex-none">
+        <w-btn
+          class="mr-2 acrylic-btn"
+          icon="la:question-circle"
+          flat
+          color="grey"
+          :aria-label="t(`common.actions.viewDocs`)"
+          :href="siteStore.docsBase + `/admin/utilities`"
+          target="_blank">
+          <w-tooltip>{{ t(`common.actions.viewDocs`) }}</w-tooltip>
+        </w-btn>
+      </div>
+    </div>
+    <w-separator inset />
+    <div class="p-4 columns-1 xl:columns-2 gap-4">
+      <w-card class="mb-4 break-inside-avoid">
+        <w-card-header>{{ t(`admin.utilities.groupAuthentication`) }}</w-card-header>
+        <w-list separator>
+          <w-item>
+            <blueprint-icon icon="disconnected" :hue-rotate="45" />
+            <w-item-section>
+              <w-item-label>{{ t(`admin.utilities.disconnectWS`) }}</w-item-label>
+              <w-item-label caption>{{ t(`admin.utilities.disconnectWSHint`) }}</w-item-label>
+            </w-item-section>
+            <w-item-section side>
+              <w-btn
+                class="acrylic-btn"
+                flat
+                icon="la:arrow-circle-right"
+                color="primary"
+                @click="disconnectWS"
+                :label="t(`common.actions.proceed`)" />
+            </w-item-section>
+          </w-item>
+          <w-item>
+            <blueprint-icon icon="matches" :hue-rotate="45" />
+            <w-item-section>
+              <w-item-label>{{ t(`admin.utilities.invalidApiCertificates`) }}</w-item-label>
+              <w-item-label caption>{{
+                t(`admin.utilities.invalidApiCertificatesHint`)
+              }}</w-item-label>
+            </w-item-section>
+            <w-item-section side>
+              <w-btn
+                class="acrylic-btn"
+                flat
+                icon="la:arrow-circle-right"
+                color="primary"
+                @click="invalidateApiCertificates"
+                :label="t(`common.actions.proceed`)" />
+            </w-item-section>
+          </w-item>
+          <w-item>
+            <blueprint-icon icon="key" :hue-rotate="45" />
+            <w-item-section>
+              <w-item-label>{{ t(`admin.utilities.invalidSessionSecret`) }}</w-item-label>
+              <w-item-label caption>{{
+                t(`admin.utilities.invalidSessionSecretHint`)
+              }}</w-item-label>
+            </w-item-section>
+            <w-item-section side>
+              <w-btn
+                class="acrylic-btn"
+                flat
+                icon="la:arrow-circle-right"
+                color="primary"
+                @click="invalidateSessionSecret"
+                :label="t(`common.actions.proceed`)" />
+            </w-item-section>
+          </w-item>
+        </w-list>
+      </w-card>
+      <w-card class="mb-4 break-inside-avoid">
+        <w-card-header>{{ t(`admin.utilities.groupMaintenance`) }}</w-card-header>
+        <w-list separator>
+          <w-item>
+            <blueprint-icon icon="opened-folder" :hue-rotate="45" />
+            <w-item-section>
+              <w-item-label>{{ t(`admin.utilities.purgeEmptyFolders`) }}</w-item-label>
+              <w-item-label caption>{{ t(`admin.utilities.purgeEmptyFoldersHint`) }}</w-item-label>
+            </w-item-section>
+            <w-item-section side>
+              <w-btn
+                class="acrylic-btn"
+                flat
+                icon="la:arrow-circle-right"
+                color="primary"
+                @click="purgeEmptyFolders"
+                :label="t(`common.actions.proceed`)" />
+            </w-item-section>
+          </w-item>
+          <w-item>
+            <blueprint-icon icon="datalake" :hue-rotate="45" />
+            <w-item-section>
+              <w-item-label>{{ t(`admin.utilities.flushCache`) }}</w-item-label>
+              <w-item-label caption>{{ t(`admin.utilities.flushCacheHint`) }}</w-item-label>
+            </w-item-section>
+            <w-item-section side>
+              <w-btn
+                class="acrylic-btn"
+                flat
+                icon="la:arrow-circle-right"
+                color="primary"
+                @click="flushCache"
+                :label="t(`common.actions.proceed`)" />
+            </w-item-section>
+          </w-item>
+          <w-item>
+            <blueprint-icon icon="historical" :hue-rotate="45" />
+            <w-item-section>
+              <w-item-label>{{ t(`admin.utilities.purgeHistory`) }}</w-item-label>
+              <w-item-label caption>{{ t(`admin.utilities.purgeHistoryHint`) }}</w-item-label>
+            </w-item-section>
+            <w-item-section side>
+              <w-select
+                outlined
+                :label="t(`admin.utilities.purgeHistoryTimeframe`)"
+                v-model="state.purgeHistoryTimeframe"
+                style="min-width: 175px"
+                emit-value
+                map-options
+                dense
+                :options="purgeHistoryTimeframes" />
+            </w-item-section>
+            <w-separator class="ml-2" vertical />
+            <w-item-section side>
+              <w-btn
+                class="acrylic-btn"
+                flat
+                icon="la:arrow-circle-right"
+                color="primary"
+                @click="purgeHistory"
+                :label="t(`common.actions.proceed`)" />
+            </w-item-section>
+          </w-item>
+          <w-item>
+            <blueprint-icon icon="trash" :hue-rotate="45" />
+            <w-item-section>
+              <w-item-label>{{ t(`admin.utilities.purgeRevokedKeys`) }}</w-item-label>
+              <w-item-label caption>{{ t(`admin.utilities.purgeRevokedKeysHint`) }}</w-item-label>
+            </w-item-section>
+            <w-item-section side>
+              <w-btn
+                class="acrylic-btn"
+                flat
+                icon="la:arrow-circle-right"
+                color="primary"
+                @click="purgeRevokedKeys"
+                :label="t(`common.actions.proceed`)" />
+            </w-item-section>
+          </w-item>
+          <w-item>
+            <blueprint-icon icon="link" :hue-rotate="45" />
+            <w-item-section>
+              <w-item-label>{{ t(`admin.utilities.rebuildPageLinks`) }}</w-item-label>
+              <w-item-label caption>{{ t(`admin.utilities.rebuildPageLinksHint`) }}</w-item-label>
+            </w-item-section>
+            <w-item-section side>
+              <w-btn
+                class="acrylic-btn"
+                flat
+                icon="la:arrow-circle-right"
+                color="primary"
+                @click="rebuildPageLinks"
+                :label="t(`common.actions.proceed`)" />
+            </w-item-section>
+          </w-item>
+          <w-item>
+            <blueprint-icon icon="star-half-empty" :hue-rotate="45" />
+            <w-item-section>
+              <w-item-label>{{ t(`admin.utilities.rebuildPageRatings`) }}</w-item-label>
+              <w-item-label caption>{{ t(`admin.utilities.rebuildPageRatingsHint`) }}</w-item-label>
+            </w-item-section>
+            <w-item-section side>
+              <w-btn
+                class="acrylic-btn"
+                flat
+                icon="la:arrow-circle-right"
+                color="primary"
+                @click="rebuildPageRatings"
+                :label="t(`common.actions.proceed`)" />
+            </w-item-section>
+          </w-item>
+          <w-item>
+            <blueprint-icon icon="html" :hue-rotate="45" />
+            <w-item-section>
+              <w-item-label>{{ t(`admin.utilities.rerenderPages`) }}</w-item-label>
+              <w-item-label caption>{{ t(`admin.utilities.rerenderPagesHint`) }}</w-item-label>
+            </w-item-section>
+            <w-item-section side>
+              <w-btn
+                class="acrylic-btn"
+                flat
+                icon="la:arrow-circle-right"
+                color="primary"
+                @click="openRerenderPages"
+                :label="t(`common.actions.proceed`)" />
+            </w-item-section>
+          </w-item>
+          <w-item>
+            <blueprint-icon icon="rescan-document" :hue-rotate="45" />
+            <w-item-section>
+              <w-item-label>{{ t(`admin.utilities.scanPageProblems`) }}</w-item-label>
+              <w-item-label caption>{{ t(`admin.utilities.scanPageProblemsHint`) }}</w-item-label>
+            </w-item-section>
+            <w-item-section side>
+              <w-btn
+                class="acrylic-btn"
+                flat
+                icon="la:arrow-circle-right"
+                color="primary"
+                @click="openPageProblems"
+                :label="t(`common.actions.proceed`)" />
+            </w-item-section>
+          </w-item>
+        </w-list>
+      </w-card>
+      <w-card class="mb-4 break-inside-avoid">
+        <w-card-header>{{ t(`admin.utilities.groupMigration`) }}</w-card-header>
+        <w-list separator>
+          <w-item>
+            <blueprint-icon icon="database-export" :hue-rotate="45" />
+            <w-item-section>
+              <w-item-label>{{ t(`admin.utilities.export`) }}</w-item-label>
+              <w-item-label caption>{{ t(`admin.utilities.exportHint`) }}</w-item-label>
+            </w-item-section>
+            <w-item-section side>
+              <!--
+                The wrapper is what carries the tooltip: a disabled button is transparent to the
+                hit test, so a tooltip written inside it would never be shown. See WTooltip.
+              -->
+              <span data-tooltip-anchor class="inline-flex">
+                <w-btn
+                  class="acrylic-btn"
+                  flat
+                  icon="la:arrow-circle-right"
+                  color="primary"
+                  disabled
+                  :label="t(`common.actions.proceed`)" />
+                <w-tooltip>{{ t(`common.comingSoon`) }}</w-tooltip>
+              </span>
+            </w-item-section>
+          </w-item>
+          <w-item>
+            <blueprint-icon icon="database-restore" :hue-rotate="45" />
+            <w-item-section>
+              <w-item-label>{{ t(`admin.utilities.importBackup`) }}</w-item-label>
+              <w-item-label caption>{{ t(`admin.utilities.importBackupHint`) }}</w-item-label>
+            </w-item-section>
+            <w-item-section side>
+              <!--
+                The wrapper is what carries the tooltip: a disabled button is transparent to the
+                hit test, so a tooltip written inside it would never be shown. See WTooltip.
+              -->
+              <span data-tooltip-anchor class="inline-flex">
+                <w-btn
+                  class="acrylic-btn"
+                  flat
+                  icon="la:arrow-circle-right"
+                  color="primary"
+                  disabled
+                  :label="t(`common.actions.proceed`)" />
+                <w-tooltip>{{ t(`common.comingSoon`) }}</w-tooltip>
+              </span>
+            </w-item-section>
+          </w-item>
+          <w-item>
+            <blueprint-icon icon="database-restore" :hue-rotate="45" />
+            <w-item-section>
+              <w-item-label>{{ t(`admin.utilities.importWikijs2`) }}</w-item-label>
+              <w-item-label caption>{{ t(`admin.utilities.importWikijs2Hint`) }}</w-item-label>
+            </w-item-section>
+            <w-item-section side>
+              <w-btn
+                class="acrylic-btn"
+                flat
+                icon="la:arrow-circle-right"
+                color="primary"
+                @click="openWikijs2Import"
+                :label="t(`common.actions.proceed`)" />
+            </w-item-section>
+          </w-item>
+          <w-item>
+            <blueprint-icon icon="database-restore" :hue-rotate="45" />
+            <w-item-section>
+              <w-item-label>{{ t(`admin.utilities.importConfluence`) }}</w-item-label>
+              <w-item-label caption>{{ t(`admin.utilities.importConfluenceHint`) }}</w-item-label>
+            </w-item-section>
+            <w-item-section side>
+              <!--
+                The wrapper is what carries the tooltip: a disabled button is transparent to the
+                hit test, so a tooltip written inside it would never be shown. See WTooltip.
+              -->
+              <span data-tooltip-anchor class="inline-flex">
+                <w-btn
+                  class="acrylic-btn"
+                  flat
+                  icon="la:arrow-circle-right"
+                  color="primary"
+                  disabled
+                  :label="t(`common.actions.proceed`)" />
+                <w-tooltip>{{ t(`common.comingSoon`) }}</w-tooltip>
+              </span>
+            </w-item-section>
+          </w-item>
+          <w-item>
+            <blueprint-icon icon="database-restore" :hue-rotate="45" />
+            <w-item-section>
+              <w-item-label>{{ t(`admin.utilities.importDokuwiki`) }}</w-item-label>
+              <w-item-label caption>{{ t(`admin.utilities.importDokuwikiHint`) }}</w-item-label>
+            </w-item-section>
+            <w-item-section side>
+              <!--
+                The wrapper is what carries the tooltip: a disabled button is transparent to the
+                hit test, so a tooltip written inside it would never be shown. See WTooltip.
+              -->
+              <span data-tooltip-anchor class="inline-flex">
+                <w-btn
+                  class="acrylic-btn"
+                  flat
+                  icon="la:arrow-circle-right"
+                  color="primary"
+                  disabled
+                  :label="t(`common.actions.proceed`)" />
+                <w-tooltip>{{ t(`common.comingSoon`) }}</w-tooltip>
+              </span>
+            </w-item-section>
+          </w-item>
+          <w-item>
+            <blueprint-icon icon="database-restore" :hue-rotate="45" />
+            <w-item-section>
+              <w-item-label>{{ t(`admin.utilities.importNotion`) }}</w-item-label>
+              <w-item-label caption>{{ t(`admin.utilities.importNotionHint`) }}</w-item-label>
+            </w-item-section>
+            <w-item-section side>
+              <!--
+                The wrapper is what carries the tooltip: a disabled button is transparent to the
+                hit test, so a tooltip written inside it would never be shown. See WTooltip.
+              -->
+              <span data-tooltip-anchor class="inline-flex">
+                <w-btn
+                  class="acrylic-btn"
+                  flat
+                  icon="la:arrow-circle-right"
+                  color="primary"
+                  disabled
+                  :label="t(`common.actions.proceed`)" />
+                <w-tooltip>{{ t(`common.comingSoon`) }}</w-tooltip>
+              </span>
+            </w-item-section>
+          </w-item>
+          <w-item>
+            <blueprint-icon icon="database-restore" :hue-rotate="45" />
+            <w-item-section>
+              <w-item-label>{{ t(`admin.utilities.importXwiki`) }}</w-item-label>
+              <w-item-label caption>{{ t(`admin.utilities.importXwikiHint`) }}</w-item-label>
+            </w-item-section>
+            <w-item-section side>
+              <!--
+                The wrapper is what carries the tooltip: a disabled button is transparent to the
+                hit test, so a tooltip written inside it would never be shown. See WTooltip.
+              -->
+              <span data-tooltip-anchor class="inline-flex">
+                <w-btn
+                  class="acrylic-btn"
+                  flat
+                  icon="la:arrow-circle-right"
+                  color="primary"
+                  disabled
+                  :label="t(`common.actions.proceed`)" />
+                <w-tooltip>{{ t(`common.comingSoon`) }}</w-tooltip>
+              </span>
+            </w-item-section>
+          </w-item>
+        </w-list>
+      </w-card>
+      <w-card class="break-inside-avoid">
+        <w-card-header>{{ t(`admin.utilities.groupTesting`) }}</w-card-header>
+        <w-list separator>
+          <w-item>
+            <blueprint-icon icon="popcorn-maker" :hue-rotate="45" />
+            <w-item-section>
+              <w-item-label>{{ t(`admin.utilities.generateSample`) }}</w-item-label>
+              <w-item-label caption>{{ t(`admin.utilities.generateSampleHint`) }}</w-item-label>
+            </w-item-section>
+            <w-item-section side>
+              <w-btn
+                class="acrylic-btn"
+                flat
+                icon="la:arrow-circle-right"
+                color="primary"
+                :loading="state.sampleLoading"
+                @click="generateSampleContent"
+                :label="t(`common.actions.proceed`)" />
+            </w-item-section>
+          </w-item>
+          <w-item>
+            <blueprint-icon icon="eraser" :hue-rotate="45" />
+            <w-item-section>
+              <w-item-label>{{ t(`admin.utilities.purgeSample`) }}</w-item-label>
+              <w-item-label caption>{{ t(`admin.utilities.purgeSampleHint`) }}</w-item-label>
+            </w-item-section>
+            <w-item-section side>
+              <w-btn
+                class="acrylic-btn"
+                flat
+                icon="la:arrow-circle-right"
+                color="primary"
+                :loading="state.sampleLoading"
+                @click="purgeSampleContent"
+                :label="t(`common.actions.proceed`)" />
+            </w-item-section>
+          </w-item>
+        </w-list>
+      </w-card>
+    </div>
+  </w-page>
+</template>
+
+<script setup>
+import { computed, reactive } from 'vue'
+import { useI18n } from 'vue-i18n'
+
+import { useMeta } from '@/composables/meta'
+import { notify } from '@/composables/notify'
+import { loading } from '@/composables/loading'
+import { confirm } from '@/composables/dialog'
+import { apiErrorMessage } from '@/helpers/apiError'
+
+import { useAdminStore } from '@/stores/admin'
+import { pagePathHash } from '@/stores/page'
+import { useSiteStore } from '@/stores/site'
+
+import { MarkdownRenderer } from '@/renderers/markdown'
+
+// STORES
+
+const adminStore = useAdminStore()
+const siteStore = useSiteStore()
+
+// I18N
+
+const { t } = useI18n()
+
+// META
+
+useMeta(() => ({
+  title: t('admin.utilities.title')
+}))
+
+// DATA
+
+const state = reactive({
+  purgeHistoryTimeframe: '1y',
+  /** Shared by both sample-content buttons: neither should be pressable while the other is running. */
+  sampleLoading: false
+})
+
+// COMPUTED
+
+/** What to call the site the two sample-content actions write to and clear. */
+const siteName = computed(
+  () => adminStore.sites.find((site) => site.id === adminStore.currentSiteId)?.title ?? ''
+)
+
+const purgeHistoryTimeframes = computed(() => [
+  { value: '24h', label: t('admin.utitilies.purgeHistoryToday') },
+  { value: '1m', label: t('admin.utitilies.purgeHistoryMonth', 1, { count: 1 }) },
+  { value: '3m', label: t('admin.utitilies.purgeHistoryMonth', 3, { count: 3 }) },
+  { value: '6m', label: t('admin.utitilies.purgeHistoryMonth', 6, { count: 6 }) },
+  { value: '1y', label: t('admin.utitilies.purgeHistoryYear', 1, { count: 1 }) },
+  { value: '2y', label: t('admin.utitilies.purgeHistoryYear', 2, { count: 2 }) }
+])
+
+// METHODS
+
+/**
+ * Hand the 2.x import its own screen. It is a form with several parts and a progress log beside
+ * them, which is more than a row here can carry -- unlike the actions around it, which are a
+ * confirmation and a result.
+ */
+function openWikijs2Import() {
+  adminStore.$patch({ overlay: 'ImportWikijs2Overlay' })
+}
+
+/**
+ * The page problem scan gets a screen of its own for the same reason: it runs for a while and reports
+ * as it goes, which is a progress log rather than a confirmation and a result.
+ */
+function openPageProblems() {
+  adminStore.$patch({ overlay: 'PageProblemsOverlay' })
+}
+
+/**
+ * Rerendering every page as well: it renders in this browser, a page at a time, and its screen is the
+ * list of pages and how each one went.
+ */
+function openRerenderPages() {
+  adminStore.$patch({ overlay: 'RerenderPagesOverlay' })
+}
+
+/**
+ * Close every websocket the wiki holds — the editors of anyone collaborating on a page, and any open
+ * admin terminal. Confirmed first because it interrupts people who are working: their clients
+ * reconnect on their own, but an editor is briefly cut off from the others in its room.
+ *
+ * Both this and {@link flushCache} reach every instance: the one answering the request acts on itself
+ * and publishes the same instruction to the others. `count` in the response is therefore only what
+ * this one closed, which is why it is not reported.
+ */
+function disconnectWS() {
+  confirm({
+    title: t('admin.utilities.disconnectWS'),
+    message: t('admin.utilities.disconnectWSConfirm'),
+    cancel: true,
+    color: 'negative',
+    okLabel: t('common.actions.proceed')
+  }).onOk(async () => {
+    loading.show()
+    try {
+      const resp = await API_CLIENT.post('system/websockets/disconnect').json()
+      if (!resp?.ok) {
+        throw new Error(resp?.message || 'An unexpected error occured.')
+      }
+      notify({
+        type: 'positive',
+        message: t('admin.utilities.disconnectWSSuccess')
+      })
+    } catch (err) {
+      notify({
+        type: 'negative',
+        message: t('admin.utilities.disconnectWSFailed'),
+        caption: apiErrorMessage(err)
+      })
+    }
+    loading.hide()
+  })
+}
+
+/**
+ * Replace the keypair API keys are signed with, taking back every key ever issued.
+ *
+ * Nobody is logged out by this — session cookies are signed with a secret of their own, which is the
+ * point of the two being separate — but every integration holding a key stops working until it is
+ * given a new one, so the confirmation says how many are affected rather than asking blind.
+ */
+function invalidateApiCertificates() {
+  confirm({
+    title: t('admin.utilities.invalidApiCertificates'),
+    message: t('admin.utilities.invalidApiCertificatesConfirm'),
+    caption: t('admin.utilities.invalidApiCertificatesConfirmWarn'),
+    cancel: true,
+    persistent: true,
+    color: 'negative',
+    okLabel: t('common.actions.proceed')
+  }).onOk(async () => {
+    loading.show()
+    try {
+      const resp = await API_CLIENT.post('system/certificates').json()
+      if (!resp?.ok) {
+        throw new Error(resp?.message || 'An unexpected error occured.')
+      }
+      const count = resp.invalidatedKeys ?? 0
+      notify({
+        type: 'positive',
+        message: t('admin.utilities.invalidApiCertificatesSuccess', count, { count })
+      })
+    } catch (err) {
+      notify({
+        type: 'negative',
+        message: t('admin.utilities.invalidApiCertificatesFailed'),
+        caption: apiErrorMessage(err)
+      })
+    }
+    loading.hide()
+  })
+}
+
+/**
+ * Rotate the secret session cookies are signed with, and end every session.
+ *
+ * Including this one: the admin who clicks it is logged out with everybody else, which the
+ * confirmation says outright. Nothing is notified afterwards for that reason — the router lands on
+ * the login screen while the notification would still be on its way.
+ */
+function invalidateSessionSecret() {
+  confirm({
+    title: t('admin.utilities.invalidSessionSecret'),
+    message: t('admin.utilities.invalidSessionSecretConfirm'),
+    caption: t('admin.utilities.invalidSessionSecretConfirmWarn'),
+    cancel: true,
+    persistent: true,
+    color: 'negative',
+    okLabel: t('common.actions.proceed')
+  }).onOk(async () => {
+    loading.show()
+    try {
+      const resp = await API_CLIENT.post('system/sessions/invalidate').json()
+      if (!resp?.ok) {
+        throw new Error(resp?.message || 'An unexpected error occured.')
+      }
+      // -> This session is one of the ones just ended, so there is nowhere to go but back to the
+      //    login screen. A full load rather than a route push: every store is holding the state of
+      //    somebody who is no longer signed in.
+      window.location.assign('/login')
+    } catch (err) {
+      loading.hide()
+      notify({
+        type: 'negative',
+        message: t('admin.utilities.invalidSessionSecretFailed'),
+        caption: apiErrorMessage(err)
+      })
+    }
+  })
+}
+
+/**
+ * Delete every folder that holds no page and no asset, on every site.
+ *
+ * Confirmed, but not coloured as a destruction: what goes is a container with nothing in it, and the
+ * server will not delete anything that is not a folder. The confirmation says the part that is not
+ * obvious — that a folder holding only empty folders counts as empty too, so a whole branch can go at
+ * once.
+ */
+function purgeEmptyFolders() {
+  confirm({
+    title: t('admin.utilities.purgeEmptyFolders'),
+    message: t('admin.utilities.purgeEmptyFoldersConfirm'),
+    caption: t('admin.utilities.purgeEmptyFoldersConfirmWarn'),
+    cancel: true,
+    persistent: true,
+    okLabel: t('common.actions.proceed')
+  }).onOk(async () => {
+    loading.show()
+    try {
+      const resp = await API_CLIENT.post('system/empty-folders/purge').json()
+      if (!resp?.ok) {
+        throw new Error(resp?.message || 'An unexpected error occured.')
+      }
+      const count = resp.count ?? 0
+      notify({
+        type: 'positive',
+        message: t('admin.utilities.purgeEmptyFoldersSuccess', count, { count })
+      })
+    } catch (err) {
+      notify({
+        type: 'negative',
+        message: t('admin.utilities.purgeEmptyFoldersFailed'),
+        caption: apiErrorMessage(err)
+      })
+    }
+    loading.hide()
+  })
+}
+
+/**
+ * Delete every page version older than the selected timeframe, on every site.
+ *
+ * Confirmed, and named in the confirmation: pages keep what they say now, but a version thrown away
+ * here is gone for good — and the versions of a page somebody deleted are all that is left of it.
+ */
+function purgeHistory() {
+  const timeframe = purgeHistoryTimeframes.value.find(
+    (tf) => tf.value === state.purgeHistoryTimeframe
+  )
+  confirm({
+    title: t('admin.utilities.purgeHistory'),
+    message: t('admin.utilities.purgeHistoryConfirm', { timeframe: timeframe?.label ?? '' }),
+    caption: t('admin.utilities.purgeHistoryConfirmWarn'),
+    cancel: true,
+    persistent: true,
+    color: 'negative',
+    okLabel: t('common.actions.proceed')
+  }).onOk(async () => {
+    loading.show()
+    try {
+      const resp = await API_CLIENT.post('system/history/purge', {
+        json: { olderThan: state.purgeHistoryTimeframe }
+      }).json()
+      if (!resp?.ok) {
+        throw new Error(resp?.message || 'An unexpected error occured.')
+      }
+      const count = resp.count ?? 0
+      notify({
+        type: 'positive',
+        message: t('admin.utilities.purgeHistorySuccess', count, { count })
+      })
+    } catch (err) {
+      notify({
+        type: 'negative',
+        message: t('admin.utilities.purgeHistoryFailed'),
+        caption: apiErrorMessage(err)
+      })
+    }
+    loading.hide()
+  })
+}
+
+/**
+ * Delete the rows of keys somebody revoked.
+ *
+ * Confirmed, but not coloured as a destruction: nothing loses access here, since a revoked key
+ * already had none. What goes is the record that it existed.
+ */
+function purgeRevokedKeys() {
+  confirm({
+    title: t('admin.utilities.purgeRevokedKeys'),
+    message: t('admin.utilities.purgeRevokedKeysConfirm'),
+    caption: t('admin.utilities.purgeRevokedKeysConfirmWarn'),
+    cancel: true,
+    persistent: true,
+    color: 'negative',
+    okLabel: t('common.actions.proceed')
+  }).onOk(async () => {
+    loading.show()
+    try {
+      const resp = await API_CLIENT.post('system/api-keys/purge').json()
+      if (!resp?.ok) {
+        throw new Error(resp?.message || 'An unexpected error occured.')
+      }
+      const count = resp.count ?? 0
+      notify({
+        type: 'positive',
+        message: t('admin.utilities.purgeRevokedKeysSuccess', count, { count })
+      })
+    } catch (err) {
+      notify({
+        type: 'negative',
+        message: t('admin.utilities.purgeRevokedKeysFailed'),
+        caption: apiErrorMessage(err)
+      })
+    }
+    loading.hide()
+  })
+}
+
+/**
+ * Fill the current site with pages to look at.
+ *
+ * A development convenience: a fresh instance is empty, so checking a stylesheet, a renderer or the
+ * navigation against anything means writing dummy pages first. Every page is tagged so
+ * {@link purgeSampleContent} can take them all away again — the blog and its posts included, since
+ * the purge asks about the tag and nothing else.
+ *
+ * Five kinds of page come out of it: the markdown set under `/sample`, a blog at `/my-blog` and the
+ * posts filed under it, and a feedback board at `/feedback` and the ideas filed in it. See
+ * `SAMPLE_PAGES`, `SAMPLE_BLOG` and `SAMPLE_BOARD` in `helpers/sampleContent`.
+ * One of the markdown set, `SAMPLE_DISCUSSION`, then has a discussion written onto its Talk tab. And
+ * where the site has no home page yet, one is written linking to all of them (`buildSampleHome`).
+ *
+ * The pages are written one at a time through the ordinary create endpoint — the same one the editor
+ * saves through — rather than by a bulk call on the server. That is what makes the content
+ * representative: it goes through the same validation, the same render sanitising and the same tree
+ * placement as a page somebody typed.
+ *
+ * **The render is produced here**, by the same markdown renderer the editor uses, because that is
+ * where it lives. A page stores the HTML its editor produced, and the server can only produce one by
+ * driving a headless browser through the Puppeteer extension — which a plain checkout does not
+ * install, so a server-side generator would write pages that are blank until somebody re-renders
+ * them.
+ */
+async function generateSampleContent() {
+  const {
+    SAMPLE_CONTENT_TAG,
+    SAMPLE_FOLDERS,
+    SAMPLE_PAGES,
+    SAMPLE_DISCUSSION,
+    SAMPLE_BLOG,
+    SAMPLE_BLOG_POSTS,
+    SAMPLE_BOARD,
+    SAMPLE_IDEA_ICON,
+    SAMPLE_IDEAS,
+    SAMPLE_IDEA_DISCUSSION,
+    buildSampleHome
+  } = await import('@/helpers/sampleContent')
+  const { serializeBlog } = await import('@/helpers/pageBlog')
+  const { serializeBoard } = await import('@/helpers/pageFeedback')
+  /*
+    Asked before the confirmation rather than left to the create call to refuse, so that the count it
+    shows is what will be written, and so that a home page somebody wrote is not reported as a failure.
+  */
+  let hasHome
+  try {
+    hasHome = await pageExists(adminStore.currentSiteId, 'home')
+  } catch (err) {
+    notify({
+      type: 'negative',
+      message: t('admin.utilities.generateSampleFailed'),
+      caption: apiErrorMessage(err)
+    })
+    return
+  }
+  const markdownPages = [
+    ...(hasHome ? [] : [buildSampleHome()]),
+    ...SAMPLE_PAGES,
+    SAMPLE_DISCUSSION.page
+  ]
+  // -> The blog's and the board's own front pages as well as what is under them: each is a page that
+  //    gets written like any other
+  const total = markdownPages.length + 1 + SAMPLE_BLOG_POSTS.length + 1 + SAMPLE_IDEAS.length
+  confirm({
+    title: t('admin.utilities.generateSample'),
+    message: t('admin.utilities.generateSampleConfirm', {
+      count: total,
+      site: siteName.value
+    }),
+    caption: t('admin.utilities.generateSampleConfirmWarn', { tag: SAMPLE_CONTENT_TAG }),
+    cancel: true,
+    persistent: true,
+    okLabel: t('common.actions.proceed')
+  }).onOk(async () => {
+    const siteId = adminStore.currentSiteId
+    state.sampleLoading = true
+    try {
+      /*
+        The site's own markdown settings, so the render matches what its editor would have produced —
+        line breaks, typography and linkify all change the output. Read from the site rather than from
+        `editorStore`, which holds the config of the site being BROWSED, and the admin area may be
+        working on another one.
+      */
+      const site = await API_CLIENT.get(`sites/${siteId}`).json()
+      const md = new MarkdownRenderer(site?.editors?.markdown?.config ?? {})
+
+      /*
+        Store the icons before the pages that use them, so the wiki can serve them without the Iconify
+        API afterwards — which is what the icon picker does when an author chooses one.
+
+        The ones written INTO the content as well as the ones on the pages: a tab's `icon` prop is an
+        icon reference like any other, and materializing only the page icons left every tab in the
+        sample set with a blank space where its icon should be.
+
+        Best effort: this reaches upstream, which an offline instance does not, and an icon that could
+        not be fetched costs a missing picture rather than a page.
+      */
+      const icons = new Set(
+        [SAMPLE_BLOG, SAMPLE_BOARD, ...markdownPages, ...SAMPLE_BLOG_POSTS]
+          .map((page) => page.icon)
+          .concat(SAMPLE_IDEA_ICON)
+      )
+      for (const page of markdownPages) {
+        for (const [, name] of page.content.matchAll(/\bicon="([a-z0-9-]+:[a-z0-9-]+)"/g)) {
+          icons.add(name)
+        }
+      }
+      try {
+        await API_CLIENT.post('icons/materialize', { json: { icons: [...icons] } }).json()
+      } catch (err) {
+        console.warn(`Could not store the sample content icons: ${apiErrorMessage(err)}`)
+      }
+
+      /*
+        Everything to be written, in one list, because there is one way to write a page and three
+        kinds of page to write: the markdown set, a blog front page, and the posts filed under it.
+
+        The blog is the odd one. Its editor is `blog` and its content column holds a settings
+        document rather than a body, which is why it has no `render` — there is nothing to render.
+        `serializeBlog` is what puts those settings into the one spelling the column holds, and is
+        the same call the blog editor makes on save.
+
+        Its posts are ordinary markdown pages that happen to live underneath it: nothing records that
+        a page is a post, and being under the blog's path is the whole of what makes it one. Their
+        `publishStartDate` is what the listing orders and dates them by.
+      */
+      const documents = [
+        ...markdownPages.map((page) => ({
+          ...page,
+          editor: 'markdown',
+          render: md.render(page.content, { pagePath: page.path })
+        })),
+        {
+          ...SAMPLE_BLOG,
+          editor: 'blog',
+          content: serializeBlog(SAMPLE_BLOG.settings)
+        },
+        ...SAMPLE_BLOG_POSTS.map((post) => ({
+          ...post,
+          editor: 'markdown',
+          render: md.render(post.content, { pagePath: post.path }),
+          publishStartDate: post.publishedAt
+        })),
+        /*
+          A feedback board, the same way: a settings document for the front page, and ordinary
+          markdown pages in its folder for the ideas -- written after the board, since an idea is one
+          by having a board for a parent. Their statuses, votes and a discussion follow once they exist.
+        */
+        {
+          ...SAMPLE_BOARD,
+          editor: 'feedback',
+          content: serializeBoard(SAMPLE_BOARD.settings)
+        },
+        ...SAMPLE_IDEAS.map((idea) => ({
+          ...idea,
+          icon: SAMPLE_IDEA_ICON,
+          // -> As a submitted idea is created (`api/feedback.ts`)
+          showSidebar: false,
+          editor: 'markdown',
+          render: md.render(idea.content, { pagePath: idea.path })
+        }))
+      ]
+
+      // -> The folders first, so that they carry their titles rather than their path names. One that
+      //    exists answers 409 and is left as it is; anything else is reported with the pages
+      const failures = []
+      for (const folder of SAMPLE_FOLDERS) {
+        const segments = folder.path.split('/')
+        try {
+          await API_CLIENT.post(`sites/${siteId}/tree/folders`, {
+            json: {
+              parentPath: segments.slice(0, -1).join('/'),
+              pathName: segments.at(-1),
+              title: folder.title
+            }
+          }).json()
+        } catch (err) {
+          if (err?.response?.status !== 409) {
+            failures.push(`${folder.path} — ${apiErrorMessage(err)}`)
+          }
+        }
+      }
+
+      let created = 0
+      let discussionPageId = null
+      /** The ideas written, by path, for their statuses and votes below. */
+      const ideaIds = new Map()
+      for (const page of documents) {
+        try {
+          const resp = await API_CLIENT.post(`sites/${siteId}/pages`, {
+            json: {
+              path: page.path,
+              title: page.title,
+              description: page.description,
+              icon: page.icon,
+              editor: page.editor,
+              content: page.content,
+              ...(page.render ? { render: page.render } : {}),
+              ...(page.publishStartDate ? { publishStartDate: page.publishStartDate } : {}),
+              ...(page.showSidebar === false ? { showSidebar: false } : {}),
+              // -> The tag the purge looks for, first, then whatever this page is about
+              tags: [SAMPLE_CONTENT_TAG, ...page.tags],
+              publishState: 'published'
+            }
+          }).json()
+          if (!resp?.ok) {
+            throw new Error(resp?.message || 'An unexpected error occured.')
+          }
+          if (page.path === SAMPLE_DISCUSSION.page.path) {
+            discussionPageId = resp.page.id
+          }
+          if (SAMPLE_IDEAS.some((idea) => idea.path === page.path)) {
+            ideaIds.set(page.path, resp.page.id)
+          }
+          created++
+        } catch (err) {
+          // -> One page at a time, and one failure does not stop the rest: a path already taken is
+          //    the likely case, and the other forty-odd pages are still worth having
+          failures.push(`${page.path} — ${apiErrorMessage(err)}`)
+        }
+      }
+
+      /*
+        The discussion, onto the page just written for it — and only then: a discussion page left
+        over from an earlier run already has one, and a second copy beside it is not a busier talk
+        page, it is the same conversation twice.
+
+        Through its own endpoint rather than the comment one, which posts as whoever is signed in.
+        That one creates the authors as accounts and stores each comment at the date given, which
+        is sent as an instant rather than an offset so that every comment is dated from the same now.
+      */
+      if (discussionPageId) {
+        const now = Temporal.Now.instant()
+        const toComment = ({ author, guestName, content, hoursAgo, editedHoursAgo }) => ({
+          ...(author ? { author } : { guestName }),
+          content,
+          createdAt: hoursBefore(now, hoursAgo),
+          ...(editedHoursAgo !== undefined && { editedAt: hoursBefore(now, editedHoursAgo) })
+        })
+        try {
+          await API_CLIENT.post('system/sample-content/comments', {
+            json: {
+              siteId,
+              pageId: discussionPageId,
+              authors: SAMPLE_DISCUSSION.authors,
+              threads: SAMPLE_DISCUSSION.threads.map((thread) => ({
+                ...toComment(thread),
+                replies: (thread.replies ?? []).map(toComment)
+              }))
+            }
+          }).json()
+        } catch (err) {
+          failures.push(`${SAMPLE_DISCUSSION.page.path} comments — ${apiErrorMessage(err)}`)
+        }
+      }
+
+      /*
+        Where each idea stands, through the status route -- with its comment where it has one, which
+        is how a maintainer's answer gets into the discussion -- and this account's vote on a few of
+        them, so that Top has something to sort by. The board's own discussion follows, through the
+        same endpoint the page discussion above was written with.
+      */
+      for (const idea of SAMPLE_IDEAS) {
+        const pageId = ideaIds.get(idea.path)
+        if (!pageId) {
+          continue
+        }
+        try {
+          if (idea.status !== 'open') {
+            await API_CLIENT.put(`sites/${siteId}/feedback/ideas/${pageId}/status`, {
+              json: {
+                status: idea.status,
+                ...(idea.statusComment && { comment: idea.statusComment })
+              }
+            }).json()
+          }
+          if (idea.vote) {
+            await API_CLIENT.put(`sites/${siteId}/pages/${pageId}/rating`, {
+              json: { value: 1 }
+            }).json()
+          }
+        } catch (err) {
+          failures.push(`${idea.path} status — ${apiErrorMessage(err)}`)
+        }
+      }
+      const ideaDiscussionId = ideaIds.get(SAMPLE_IDEA_DISCUSSION.path)
+      if (ideaDiscussionId) {
+        const now = Temporal.Now.instant()
+        const toComment = ({ author, content, hoursAgo }) => ({
+          author,
+          content,
+          createdAt: hoursBefore(now, hoursAgo)
+        })
+        try {
+          await API_CLIENT.post('system/sample-content/comments', {
+            json: {
+              siteId,
+              pageId: ideaDiscussionId,
+              authors: SAMPLE_IDEA_DISCUSSION.authors,
+              threads: SAMPLE_IDEA_DISCUSSION.threads.map((thread) => ({
+                ...toComment(thread),
+                replies: (thread.replies ?? []).map(toComment)
+              }))
+            }
+          }).json()
+        } catch (err) {
+          failures.push(`${SAMPLE_IDEA_DISCUSSION.path} comments — ${apiErrorMessage(err)}`)
+        }
+      }
+
+      if (failures.length > 0) {
+        notify({
+          type: created > 0 ? 'warning' : 'negative',
+          message: t('admin.utilities.generateSamplePartial', created, { count: created }),
+          caption: failures.slice(0, 3).join('; ')
+        })
+      } else {
+        notify({
+          type: 'positive',
+          message: t('admin.utilities.generateSampleSuccess', created, { count: created })
+        })
+      }
+    } catch (err) {
+      notify({
+        type: 'negative',
+        message: t('admin.utilities.generateSampleFailed'),
+        caption: apiErrorMessage(err)
+      })
+    }
+    state.sampleLoading = false
+  })
+}
+
+/**
+ * Whether a site has a page at a path, in its primary locale — which is where an unprefixed URL, and
+ * so the site root, looks. Only a 404 means no; any other failure is thrown, since it answers nothing.
+ */
+async function pageExists(siteId, path) {
+  try {
+    await API_CLIENT.get(`sites/${siteId}/pages/${pagePathHash(path)}`).json()
+    return true
+  } catch (err) {
+    if (err.response?.status === 404) {
+      return false
+    }
+    throw err
+  }
+}
+
+/** An instant some hours before another, as the ISO string the API takes. Fractions of an hour count. */
+function hoursBefore(instant, hours) {
+  return instant
+    .subtract({ minutes: Math.round(hours * 60) })
+    .toString({ smallestUnit: 'millisecond' })
+}
+
+/**
+ * Delete every page carrying the sample content tag.
+ *
+ * The tag is the whole of what is consulted, so a page tagged by hand goes with them — which the
+ * confirmation says outright, since it is the one way this can take something nobody generated.
+ * Folders are left standing: they carry no tags, and one somebody made themselves must not go because
+ * a sample page happened to be filed in it.
+ */
+async function purgeSampleContent() {
+  const { SAMPLE_CONTENT_TAG } = await import('@/helpers/sampleContent')
+  confirm({
+    title: t('admin.utilities.purgeSample'),
+    message: t('admin.utilities.purgeSampleConfirm', {
+      tag: SAMPLE_CONTENT_TAG,
+      site: siteName.value
+    }),
+    caption: t('admin.utilities.purgeSampleConfirmWarn', { tag: SAMPLE_CONTENT_TAG }),
+    cancel: true,
+    persistent: true,
+    color: 'negative',
+    okLabel: t('common.actions.proceed')
+  }).onOk(async () => {
+    state.sampleLoading = true
+    try {
+      const resp = await API_CLIENT.post('system/sample-content/purge', {
+        json: { siteId: adminStore.currentSiteId }
+      }).json()
+      if (!resp?.ok) {
+        throw new Error(resp?.message || 'An unexpected error occured.')
+      }
+      const count = resp.count ?? 0
+      notify({
+        type: 'positive',
+        message: t('admin.utilities.purgeSampleSuccess', count, { count })
+      })
+    } catch (err) {
+      notify({
+        type: 'negative',
+        message: t('admin.utilities.purgeSampleFailed'),
+        caption: apiErrorMessage(err)
+      })
+    }
+    state.sampleLoading = false
+  })
+}
+
+/**
+ * Work out again what every page on every wiki links to, from the render each page already stores.
+ *
+ * Queued rather than done in the request: it reads every page in the instance, so it runs in a worker
+ * thread and the response only says it has been scheduled. Confirmed even so — it is a lot of work on
+ * a large wiki — but not coloured as a destruction, since nothing about the content changes and the
+ * rows it rewrites are derived from that content anyway.
+ */
+function rebuildPageLinks() {
+  confirm({
+    title: t('admin.utilities.rebuildPageLinks'),
+    message: t('admin.utilities.rebuildPageLinksConfirm'),
+    caption: t('admin.utilities.rebuildPageLinksConfirmWarn'),
+    cancel: true,
+    persistent: true,
+    okLabel: t('common.actions.proceed')
+  }).onOk(async () => {
+    loading.show()
+    try {
+      const resp = await API_CLIENT.post('system/page-links/rebuild').json()
+      if (!resp?.ok) {
+        throw new Error(resp?.message || 'An unexpected error occured.')
+      }
+      notify({
+        type: 'positive',
+        message: t('admin.utilities.rebuildPageLinksSuccess')
+      })
+    } catch (err) {
+      notify({
+        type: 'negative',
+        message: t('admin.utilities.rebuildPageLinksFailed'),
+        caption: apiErrorMessage(err)
+      })
+    }
+    loading.hide()
+  })
+}
+
+/**
+ * Count every page's rating totals again from the ratings table, on every site.
+ *
+ * Done in the request, unlike the link rebuild above: it is one aggregate over the ratings, not a read
+ * of every page's content, so the answer can say how many pages were out of step. Confirmed because
+ * it locks every page while it runs, not because anything is lost.
+ */
+function rebuildPageRatings() {
+  confirm({
+    title: t('admin.utilities.rebuildPageRatings'),
+    message: t('admin.utilities.rebuildPageRatingsConfirm'),
+    caption: t('admin.utilities.rebuildPageRatingsConfirmWarn'),
+    cancel: true,
+    persistent: true,
+    okLabel: t('common.actions.proceed')
+  }).onOk(async () => {
+    loading.show()
+    try {
+      const resp = await API_CLIENT.post('system/page-ratings/rebuild').json()
+      if (!resp?.ok) {
+        throw new Error(resp?.message || 'An unexpected error occured.')
+      }
+      const count = resp.count ?? 0
+      notify({
+        type: 'positive',
+        message: t('admin.utilities.rebuildPageRatingsSuccess', count, { count })
+      })
+    } catch (err) {
+      notify({
+        type: 'negative',
+        message: t('admin.utilities.rebuildPageRatingsFailed'),
+        caption: apiErrorMessage(err)
+      })
+    }
+    loading.hide()
+  })
+}
+
+/**
+ * Throw away everything the wiki has cached off the database — files, icons, and the site, group and
+ * locale state read on every request. Not confirmed: nothing is lost and nothing stops working, the
+ * next request simply pays for the refill.
+ */
+async function flushCache() {
+  loading.show()
+  try {
+    const resp = await API_CLIENT.post('system/cache/flush').json()
+    if (!resp?.ok) {
+      throw new Error(resp?.message || 'An unexpected error occured.')
+    }
+    notify({
+      type: 'positive',
+      message: t('admin.utilities.flushCacheSuccess')
+    })
+  } catch (err) {
+    notify({
+      type: 'negative',
+      message: t('admin.utilities.flushCacheFailed'),
+      caption: apiErrorMessage(err)
+    })
+  }
+  loading.hide()
+}
+</script>
+
+<style lang="scss"></style>

@@ -1,0 +1,2685 @@
+import { validate as uuidValidate } from 'uuid'
+import type { FastifyInstance, FastifyRequest } from 'fastify'
+import type { PageActor, PageInput } from '../models/pages.ts'
+import type { RulePageRef } from '../helpers/pageRules.ts'
+import { PAGE_PERMISSIONS } from '../models/groups.ts'
+import {
+  SEARCH_ORDER_BY,
+  SEARCH_TAGS_MATCH,
+  type SearchOrderBy,
+  type SearchTagsMatch
+} from '../models/search.ts'
+import { audit } from '../helpers/audit.ts'
+import { requestUserId } from '../helpers/requester.ts'
+import { maySeeUnpublished, maySeeUnpublishedAnywhere } from '../helpers/publishing.ts'
+import { generatePathHash, normalizePagePath } from '../helpers/common.ts'
+import { limitAuthAttempts, limitRenders } from '../helpers/rateLimit.ts'
+
+/** Comma-separated query lists, which is how the browser sends a multi-valued filter here. */
+function splitList(value?: string): string[] {
+  return (
+    value
+      ?.split(',')
+      .map((v) => v.trim())
+      .filter(Boolean) ?? []
+  )
+}
+
+/**
+ * Whether two tag lists say the same thing.
+ *
+ * A set rather than an array comparison: a tag is on a page or it is not, so a list carrying the same
+ * tags in another order assigns nothing. It matters because the editor sends every field on every
+ * save — a body carrying the tags the page already has is not somebody retagging it, and treating it
+ * as one would need `write:tags` of anybody who ever saved a tagged page.
+ */
+function sameTags(a: string[], b: string[]): boolean {
+  const left = new Set(a)
+  const right = new Set(b)
+  return left.size === right.size && [...left].every((tag) => right.has(tag))
+}
+
+/**
+ * Why this requester may not give a page these tags, or null when they may — or when the tags are the
+ * ones it already has, which retags nothing (see `sameTags`).
+ *
+ * Shared by the page update route and the MCP server's `update_page`, so that the two ask the same
+ * three questions in the same order.
+ */
+export function retagRefusal(
+  req: FastifyRequest,
+  target: RulePageRef & { tags?: string[] },
+  tags: string[] | undefined
+): string | null {
+  if (tags === undefined || sameTags(tags, target.tags ?? [])) {
+    return null
+  }
+  const retagged = { siteId: target.siteId, path: target.path, locale: target.locale, tags }
+  /*
+    Assigning and unassigning tags is a permission of its own, and it is asked of the page on both
+    sides of the change the way the move route asks about both locations: a rule may address pages by
+    tag, so taking the tag that carries the rule off a page is as much a retagging as putting one on.
+    Whoever may edit a page is not therefore whoever may decide which set of rules it falls under.
+  */
+  if (!mayOnPage(req, 'write:tags', target) || !mayOnPage(req, 'write:tags', retagged)) {
+    return 'You are not allowed to change the tags on this page.'
+  }
+  /*
+    And write access to the page as the tags leave it. Retagging a page is what a move is to a path:
+    writing a page INTO a set of tags the writer has no say over is the same hole as moving one into a
+    branch they could not have created a page in — and this is the tag half of the check the move
+    route makes.
+  */
+  if (!mayOnPage(req, 'write:pages', retagged)) {
+    return 'You are not allowed to give this page those tags.'
+  }
+  return null
+}
+
+const siteIdParam = {
+  type: 'object',
+  properties: {
+    siteId: {
+      type: 'string',
+      format: 'uuid'
+    }
+  },
+  required: ['siteId']
+}
+
+const pageIdParam = {
+  type: 'object',
+  properties: {
+    siteId: {
+      type: 'string',
+      format: 'uuid'
+    },
+    pageId: {
+      type: 'string',
+      format: 'uuid'
+    }
+  },
+  required: ['siteId', 'pageId']
+}
+
+/**
+ * Who is saving, and what they may embed.
+ *
+ * A page records an author, so it takes a user — signed in, or acting through a personal access
+ * token — rather than a system API key, and the author's permissions are what the render is
+ * sanitized against.
+ */
+export function actorFrom(req: FastifyRequest): PageActor | null {
+  const userId = requestUserId(req)
+  if (!userId) {
+    return null
+  }
+  return {
+    id: userId,
+    permissions: req.apiKey?.permissions ?? req.session?.permissions ?? []
+  }
+}
+
+/**
+ * The refusal for an action that needs a logged in user, saying why when it was an API key that asked.
+ *
+ * A system key acts for the groups it was issued for rather than for anybody, so there is no one to
+ * record as the author of what it would write — and a bare "requires a logged in user" reads, to a
+ * caller holding a perfectly valid key, like the key was not accepted. A personal access token is
+ * what to use instead, and the message says so.
+ *
+ * @param action What was refused, as the start of a sentence: `Saving a page`
+ */
+export function userRequired(req: FastifyRequest, action: string): string {
+  return req.apiKey?.kind === 'system'
+    ? `${action} requires a logged in user. API keys act for groups rather than for a user, so they cannot be used for this — use a personal access token instead.`
+    : `${action} requires a logged in user.`
+}
+
+/**
+ * Permissions that make a page's password irrelevant to the holder.
+ *
+ * Whoever may edit a page can read its source in the editor and can take the password off it
+ * altogether, so asking them for it protects nothing. Everybody else — including a logged in reader —
+ * has to enter it.
+ *
+ * `write:pages` and `manage:pages` are page permissions, so they are asked of the page itself
+ * (`mayBypassPassword`), never looked for in the group-wide list, which does not hold them.
+ */
+export const PASSWORD_BYPASS = ['write:pages', 'manage:pages', 'manage:system']
+
+/** Whether this page's password is no barrier to this requester. */
+export function mayBypassPassword(req: FastifyRequest, page: RulePageRef): boolean {
+  return PASSWORD_BYPASS.some((permission) => mayOnPage(req, permission, page))
+}
+
+/**
+ * Whether the password on a page has already been satisfied for this request.
+ *
+ * The unlock is recorded on the session — server side, by page id — so that reading a page the reader
+ * unlocked a moment ago does not ask again, and so that nothing the browser can set decides this.
+ */
+export function unlockedFor(req: FastifyRequest, page: RulePageRef & { id: string }): boolean {
+  return mayBypassPassword(req, page) || Boolean(req.session?.unlockedPages?.includes(page.id))
+}
+
+/**
+ * Whether this requester holds a page permission ON THIS PAGE.
+ *
+ * Page permissions are granted by a group's rules, not by the group-wide permission list, so this is
+ * a different question from the one the route-level `config.permissions` hook answers — and the only
+ * correct one for anything page-scoped. `helpers/pageRules.ts` sets out how a rule is chosen.
+ */
+export function mayOnPage(req: FastifyRequest, permission: string, page: RulePageRef): boolean {
+  return WIKI.models.groups.checkAccess(WIKI.models.groups.actorForRequest(req), permission, page)
+}
+
+/**
+ * Whether this requester may see and recover a deleted page, asked of where it was when it went.
+ *
+ * `delete:pages` is what opens the recycle bin, and nothing else does: whoever may delete a page at
+ * a path may see what was deleted there and put it back, which is the undo of the same act.
+ * `manage:pages` does not imply it, as no page permission implies another. Nothing in the bin asks
+ * for more either: viewing, downloading and restoring are one grant, since the bin is where a page
+ * is recovered FROM and each of the three is a step of doing so.
+ *
+ * The deletion's path, locale and tags stand in for the page, since there is none left to ask about
+ * -- which is also why this is the only page check that takes a version rather than a page.
+ */
+function mayRecoverPage(
+  req: FastifyRequest,
+  siteId: string,
+  deleted: { path: string; locale: string; tags?: string[] }
+): boolean {
+  const ref = { siteId, path: deleted.path, locale: deleted.locale, tags: deleted.tags ?? [] }
+  return mayOnPage(req, 'delete:pages', ref)
+}
+
+/**
+ * Whether this requester may be handed a page's SOURCE.
+ *
+ * `read:source` is the permission that exists to say so, and a rule grants it to whoever it names —
+ * the guests group included, which is how a wiki opens "view source" to the public. Whoever may write
+ * the page is covered as well, since the editor loads the source in order to edit it: a rule granting
+ * `write:pages` without `read:source` would otherwise be a page that cannot be edited.
+ */
+export const SOURCE_PERMISSIONS = ['read:source', 'write:pages', 'manage:pages']
+
+export function mayReadSource(req: FastifyRequest, page: RulePageRef): boolean {
+  return SOURCE_PERMISSIONS.some((permission) => mayOnPage(req, permission, page))
+}
+
+/**
+ * What `getPage`'s `unpublished` is for this requester: whether a page that is not live — a draft, or
+ * a scheduled page outside its window — may be handed to them.
+ *
+ * Only to a signed-in session holding `write:pages` or `manage:pages` on the page itself, which are
+ * the people working on it. Reading it, its source included, is not enough. A request without a
+ * session is held to live pages outright, API keys included — see `helpers/publishing.ts`.
+ */
+export function unpublishedFor(req: FastifyRequest): false | ((page: RulePageRef) => boolean) {
+  if (!actorFrom(req)) {
+    return false
+  }
+  const actor = WIKI.models.groups.actorForRequest(req)
+  // -> Settled in SQL for the reader who may edit nothing, which is most of them
+  if (!maySeeUnpublishedAnywhere(actor)) {
+    return false
+  }
+  return (page) => maySeeUnpublished(actor, page)
+}
+
+/**
+ * Every page permission this requester holds at a path.
+ *
+ * What the interface hides its controls by, and the reason it is a list rather than a question: each
+ * permission may be decided by a different rule — a branch can be readable but not writable, and one
+ * page within it neither — so they are resolved one at a time.
+ *
+ * Anonymous included: the guests group has rules of its own, and what the public may do is exactly
+ * what they say. Answering an empty list for a reader without a session would hide controls a wiki had
+ * deliberately opened to everyone.
+ */
+export function pagePermissionsFor(req: FastifyRequest, page: RulePageRef): string[] {
+  const actor = WIKI.models.groups.actorForRequest(req)
+  /*
+    An administrator holds all of them, and holds them here too. Deriving the list from their
+    permissions instead would answer `manage:system` → nothing ending in `:pages` → that an
+    administrator has no rights over any page, which is the opposite of true.
+  */
+  if (actor.permissions.includes('manage:system')) {
+    return PAGE_PERMISSIONS
+  }
+  return PAGE_PERMISSIONS.filter((permission) =>
+    WIKI.models.groups.checkAccess(actor, permission, page)
+  )
+}
+
+/**
+ * A page, as this requester is allowed to see it — or null when they are not allowed to see it at all.
+ *
+ * The gate for anything that hangs off a page but is not the page itself. A page that is not live is
+ * only reached by whoever may edit it (`unpublishedFor`), and a password-protected one comes back with `isLocked` set until the
+ * session has satisfied the unlock, which the caller is expected to refuse on.
+ */
+async function loadReadablePage(req: FastifyRequest, siteId: string, pageId: string) {
+  const page = await WIKI.models.pages.getPage({
+    siteId,
+    id: pageId,
+    unpublished: unpublishedFor(req),
+    unlocked: (target) => unlockedFor(req, target)
+  })
+  // -> Not readable is indistinguishable from not there, for anything hanging off the page
+  if (!page || !mayOnPage(req, 'read:pages', page)) {
+    return null
+  }
+  return page
+}
+
+/**
+ * Pages API Routes
+ */
+async function routes(app: FastifyInstance) {
+  /**
+   * LIST RECENTLY EDITED PAGES
+   */
+  app.get<{ Querystring: { limit?: number } }>(
+    '/pages/recent',
+    {
+      config: {
+        // -> `access:admin`, not a page permission: this fills a panel on the admin dashboard, which
+        //    everyone who can open the admin area sees, and it is the same permission
+        //    `users/recent-logins` fills the panel beside it with. Page rules are not consulted, so
+        //    the answer is deliberately thin -- where a page is and when it was last written, and
+        //    nothing of what it says.
+        permissions: ['access:admin']
+      },
+      schema: {
+        summary: 'List the most recently edited pages',
+        description:
+          'What has been written lately, newest first, across every site. Ordered by the last write, which covers a creation as well as an edit — `isNew` says which of the two this row is.',
+        tags: ['Pages'],
+        querystring: {
+          type: 'object',
+          properties: {
+            limit: { type: 'integer', minimum: 1, maximum: 50, default: 10 }
+          }
+        },
+        response: {
+          200: {
+            description: 'The most recently edited pages, newest first',
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string', format: 'uuid' },
+                siteId: { type: 'string', format: 'uuid' },
+                locale: { type: 'string' },
+                path: { type: 'string' },
+                title: { type: 'string' },
+                updatedAt: {
+                  type: 'string',
+                  format: 'date-time',
+                  description: 'RFC 3339 Date Time'
+                },
+                isNew: {
+                  type: 'boolean',
+                  description:
+                    'Whether this is the page first appearing rather than a later edit of it.'
+                },
+                url: {
+                  type: 'string',
+                  description:
+                    "Where the page is, as a path on its own site — carrying a locale prefix only where that site's settings put one there."
+                },
+                hostname: {
+                  type: 'string',
+                  nullable: true,
+                  description:
+                    'The host that site answers on, for linking to a page on a site other than the one being browsed. Null for the catch-all site.'
+                },
+                authorName: {
+                  type: 'string',
+                  nullable: true,
+                  description: 'Who wrote the version that stands. Null once that account is gone.'
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      reply.preventCache()
+      return WIKI.models.pages.getRecentlyEdited({ limit: req.query.limit ?? 10 })
+    }
+  )
+
+  /**
+   * LIST NEWEST PAGES
+   */
+  app.get<{ Querystring: { limit?: number } }>(
+    '/pages/newest',
+    {
+      config: {
+        // -> `access:admin`, for the reason `pages/recent` gives: a dashboard panel, answered with
+        //    where a page is and when it was created, and nothing of what it says.
+        permissions: ['access:admin']
+      },
+      schema: {
+        summary: 'List the newest pages',
+        description:
+          'The pages created most recently, newest first, across every site. Ordered by creation, which no later edit moves.',
+        tags: ['Pages'],
+        querystring: {
+          type: 'object',
+          properties: {
+            limit: { type: 'integer', minimum: 1, maximum: 50, default: 10 }
+          }
+        },
+        response: {
+          200: {
+            description: 'The newest pages, newest first',
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string', format: 'uuid' },
+                siteId: { type: 'string', format: 'uuid' },
+                locale: { type: 'string' },
+                path: { type: 'string' },
+                title: { type: 'string' },
+                createdAt: {
+                  type: 'string',
+                  format: 'date-time',
+                  description: 'RFC 3339 Date Time'
+                },
+                url: {
+                  type: 'string',
+                  description:
+                    "Where the page is, as a path on its own site — carrying a locale prefix only where that site's settings put one there."
+                },
+                hostname: {
+                  type: 'string',
+                  nullable: true,
+                  description:
+                    'The host that site answers on, for linking to a page on a site other than the one being browsed. Null for the catch-all site.'
+                },
+                creatorName: {
+                  type: 'string',
+                  nullable: true,
+                  description: 'Who created the page. Null once that account is gone.'
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      reply.preventCache()
+      return WIKI.models.pages.getNewest({ limit: req.query.limit ?? 10 })
+    }
+  )
+
+  /**
+   * LIST PAGES
+   */
+  app.get<{ Params: { siteId: string } }>(
+    '/sites/:siteId/pages',
+    {
+      config: {
+        scope: 'pages'
+      },
+      /*
+        No route-level `permissions`: page permissions come from a group's RULES, and this would have
+        to filter per page against them. It has nothing to filter yet — see the description.
+      */
+      schema: {
+        summary: 'List all pages',
+        description:
+          'Not implemented yet — always answers with an empty list. Browse the tree instead, which is what the file manager and the navigation use, and which filters what it lists by the page rules.',
+        tags: ['Pages'],
+        params: siteIdParam,
+        response: {
+          200: {
+            description: 'List of pages',
+            type: 'array',
+            items: { $ref: 'Page#' }
+          }
+        }
+      }
+    },
+    async () => {
+      // TODO: Implement, filtering every page by `mayOnPage(req, 'read:pages', page)` and leaving out
+      //       one that is not live unless `unpublishedFor(req)` lets it through, as the tree does
+      return []
+    }
+  )
+
+  /**
+   * SEARCH PAGES
+   */
+  app.get<{
+    Params: { siteId: string }
+    Querystring: {
+      query?: string
+      path?: string
+      locales?: string
+      tags?: string
+      tagsMatch?: SearchTagsMatch
+      editor?: string
+      publishState?: string
+      creatorId?: string
+      authorId?: string
+      orderBy?: SearchOrderBy
+      orderByDirection?: 'asc' | 'desc'
+      offset?: number
+      limit?: number
+    }
+  }>(
+    '/sites/:siteId/pages/search',
+    {
+      config: {
+        scope: 'pages'
+      },
+      schema: {
+        summary: 'Search pages',
+        description:
+          'Postgres full-text search over the pages of a site, ranked by relevance. `query` may be left out, in which case the filters alone decide the results — which is what a search for nothing but tags is.\n\nReadable without a session, for the same reason reading a page is: an anonymous request only matches published pages. Drafts are included only for someone who may write pages. A page marked as not searchable never appears, whoever is asking.\n\nA password-protected page is listed like any other — its title and description are not what the password covers — but it can only be matched on those two, never on the text behind the lock, and it comes back with no `highlight` — for every searcher, including one who could open the page without the password.\n\n`creatorId` and `authorId` narrow the results to the pages of one person — who wrote a page and who touched it last are two different questions, and a public user profile asks both. They are a filter like any other, so a page marked as not searchable stays out of them too.\n\n`highlight` is an excerpt with the matched terms wrapped in `<b>`, and is the only field carrying markup — the excerpt is escaped before those are added. It is absent unless term highlighting is enabled in the search settings.',
+        tags: ['Pages'],
+        params: siteIdParam,
+        querystring: {
+          type: 'object',
+          properties: {
+            query: {
+              type: 'string',
+              maxLength: 2048,
+              description: 'Free text. Understands quoted phrases, `or` and `-exclusions`.'
+            },
+            path: {
+              type: 'string',
+              maxLength: 2048,
+              description: 'Only pages whose path starts with this.'
+            },
+            locales: {
+              type: 'string',
+              maxLength: 255,
+              description: 'Comma-separated locale codes. Every locale when absent.'
+            },
+            tags: {
+              type: 'string',
+              maxLength: 2048,
+              description:
+                "Comma-separated tags to match against a page's own, as `tagsMatch` says."
+            },
+            tagsMatch: {
+              type: 'string',
+              enum: SEARCH_TAGS_MATCH,
+              default: 'all',
+              description:
+                'Whether a page must carry `all` of the tags given (the default) or `any` one of them.'
+            },
+            editor: {
+              type: 'string',
+              maxLength: 255
+            },
+            publishState: {
+              type: 'string',
+              enum: ['draft', 'published', 'scheduled']
+            },
+            creatorId: {
+              type: 'string',
+              format: 'uuid',
+              description: 'Only pages this user created.'
+            },
+            authorId: {
+              type: 'string',
+              format: 'uuid',
+              description: 'Only pages this user edited last.'
+            },
+            orderBy: {
+              type: 'string',
+              enum: SEARCH_ORDER_BY,
+              default: 'relevancy'
+            },
+            orderByDirection: {
+              type: 'string',
+              enum: ['asc', 'desc'],
+              default: 'desc'
+            },
+            offset: {
+              type: 'integer',
+              minimum: 0,
+              default: 0
+            },
+            limit: {
+              type: 'integer',
+              minimum: 1,
+              maximum: 100,
+              default: 25
+            }
+          }
+        },
+        response: {
+          200: {
+            description: 'Matching pages, plus how many there are in total',
+            type: 'object',
+            properties: {
+              results: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    id: { type: 'string', format: 'uuid' },
+                    path: { type: 'string' },
+                    locale: { type: 'string' },
+                    title: { type: 'string' },
+                    description: { type: ['string', 'null'] },
+                    icon: { type: ['string', 'null'] },
+                    iconColor: {
+                      type: 'string',
+                      description:
+                        "The color the icon is drawn in, by Tailwind palette name. Empty for the site's primary color."
+                    },
+                    tags: { type: 'array', items: { type: 'string' } },
+                    createdAt: { type: 'string', format: 'date-time' },
+                    updatedAt: { type: 'string', format: 'date-time' },
+                    relevancy: { type: 'number' },
+                    highlight: {
+                      type: ['string', 'null'],
+                      description: 'Excerpt with matched terms in `<b>`, everything else escaped.'
+                    }
+                  }
+                }
+              },
+              totalHits: {
+                type: 'integer',
+                description: 'How many pages match, ignoring `limit` and `offset`.'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req) => {
+      return WIKI.models.search.searchPages({
+        siteId: req.params.siteId,
+        query: req.query.query,
+        path: req.query.path,
+        locales: splitList(req.query.locales),
+        tags: splitList(req.query.tags),
+        tagsMatch: req.query.tagsMatch,
+        editor: req.query.editor,
+        publishState: req.query.publishState,
+        creatorId: req.query.creatorId,
+        authorId: req.query.authorId,
+        orderBy: req.query.orderBy,
+        orderByDirection: req.query.orderByDirection,
+        offset: req.query.offset,
+        limit: req.query.limit,
+        // -> So that a page the caller could not open never shows up as a result
+        actor: WIKI.models.groups.actorForRequest(req),
+        // -> The page view's rule, asked per result: a page that is not live is only listed for
+        //    whoever may edit it, and never without a session
+        unpublished: Boolean(actorFrom(req))
+      })
+    }
+  )
+
+  /**
+   * SUGGEST PAGES
+   */
+  app.get<{
+    Params: { siteId: string }
+    Querystring: { query: string; locale: string; limit?: number }
+  }>(
+    '/sites/:siteId/pages/suggest',
+    {
+      config: {
+        scope: 'pages'
+      },
+      schema: {
+        summary: 'Suggest pages while a query is typed',
+        description:
+          'Pages in `locale` whose title or path contains every word of `query`, best match first: the whole phrase as the title, then the title starting with it, a word of the title starting with it, the title containing it, and containing each of its words, then a match on the path. Meant to be asked on every keystroke, so it reads titles and paths only — never the body, which is what `pages/search` is for.\n\nThe answer is exact for whoever asks, under the same rules as the search: only pages the caller could open, pages that are not live only for a session that may edit them, and never a page marked as not searchable. A caller who may open very little of a large wiki can get fewer suggestions than `limit` even where more of their pages match, since only a bounded number of candidates is checked.',
+        tags: ['Pages'],
+        params: siteIdParam,
+        querystring: {
+          type: 'object',
+          required: ['query', 'locale'],
+          properties: {
+            query: {
+              type: 'string',
+              minLength: 1,
+              maxLength: 255,
+              description: 'What has been typed so far. Words are matched in any order.'
+            },
+            locale: {
+              type: 'string',
+              minLength: 1,
+              maxLength: 10,
+              description:
+                "The reader's locale. Only pages in it are suggested; the full search covers the others."
+            },
+            limit: {
+              type: 'integer',
+              minimum: 1,
+              maximum: 20,
+              default: 8
+            }
+          }
+        },
+        response: {
+          200: {
+            description: 'Suggested pages, best match first',
+            type: 'object',
+            properties: {
+              results: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    id: { type: 'string', format: 'uuid' },
+                    path: { type: 'string' },
+                    locale: { type: 'string' },
+                    title: { type: 'string' },
+                    description: { type: ['string', 'null'] },
+                    icon: { type: ['string', 'null'] }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req) => {
+      const results = await WIKI.models.search.suggestPages({
+        siteId: req.params.siteId,
+        query: req.query.query,
+        locale: req.query.locale,
+        limit: req.query.limit,
+        actor: WIKI.models.groups.actorForRequest(req),
+        // -> As in the search: a page that is not live only for whoever may edit it
+        unpublished: Boolean(actorFrom(req))
+      })
+      return { results }
+    }
+  )
+
+  /**
+   * SUGGEST PAGE PATHS
+   */
+  app.get<{
+    Params: { siteId: string }
+    Querystring: { prefix?: string; locale: string; limit?: number }
+  }>(
+    '/sites/:siteId/pages/suggest-path',
+    {
+      config: {
+        scope: 'pages'
+      },
+      schema: {
+        summary: 'Suggest pages by the start of their path',
+        description:
+          'Pages in `locale` whose path starts with `prefix`, shallowest first — what the markdown editor offers while a link is typed. Unlike `pages/suggest`, only the path is matched, and a page marked as not searchable is included: it can still be linked to.\n\nThe answer is exact for whoever asks, under the same rules as the suggestions: only pages the caller could open, and pages that are not live only for a session that may edit them.',
+        tags: ['Pages'],
+        params: siteIdParam,
+        querystring: {
+          type: 'object',
+          required: ['locale'],
+          properties: {
+            prefix: {
+              type: 'string',
+              maxLength: 2048,
+              default: '',
+              description:
+                'The start of the path, without a leading slash or a locale prefix. Empty lists the shallowest pages.'
+            },
+            locale: {
+              type: 'string',
+              minLength: 1,
+              maxLength: 10
+            },
+            limit: {
+              type: 'integer',
+              minimum: 1,
+              maximum: 20,
+              default: 5
+            }
+          }
+        },
+        response: {
+          200: {
+            description: 'Suggested pages, shallowest first',
+            type: 'object',
+            properties: {
+              results: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    id: { type: 'string', format: 'uuid' },
+                    path: { type: 'string' },
+                    locale: { type: 'string' },
+                    title: { type: 'string' },
+                    icon: { type: ['string', 'null'] }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req) => {
+      const results = await WIKI.models.search.suggestPagePaths({
+        siteId: req.params.siteId,
+        prefix: req.query.prefix ?? '',
+        locale: req.query.locale,
+        limit: req.query.limit,
+        actor: WIKI.models.groups.actorForRequest(req),
+        unpublished: Boolean(actorFrom(req))
+      })
+      return { results }
+    }
+  )
+
+  /**
+   * GET PAGE FOR INCLUSION
+   */
+  app.get<{ Params: { siteId: string }; Querystring: { path: string; locale?: string } }>(
+    '/sites/:siteId/pages/include',
+    {
+      config: {
+        scope: 'pages'
+      },
+      schema: {
+        summary: 'Get a page for inclusion',
+        description:
+          "What an include block needs to draw another page inside the one being read: its title and its stored render, addressed by path rather than by ID, since a path is what an author writes into the page.\n\nThe reader's own access decides the answer, exactly as it would if they opened the page themselves — a draft, or a scheduled page outside its publishing window, is only there for a signed-in requester holding `write:pages` or `manage:pages` on it, and a password-protected page comes back with `isLocked: true` and no body unless this session has already unlocked it. So an include can never show content its reader could not have reached on their own.",
+        tags: ['Pages'],
+        params: siteIdParam,
+        querystring: {
+          type: 'object',
+          required: ['path'],
+          properties: {
+            path: {
+              type: 'string',
+              maxLength: 2048,
+              description: 'Slash-separated path of the page to include. The home page when empty.'
+            },
+            locale: {
+              type: 'string',
+              maxLength: 10,
+              description: "The site's primary locale when absent."
+            }
+          }
+        },
+        response: {
+          200: { $ref: 'IncludedPage#' }
+        }
+      }
+    },
+    async (req, reply) => {
+      // -> The stored form of whatever the including page wrote, since that is what it is looked up
+      //    by. The site root is the `home` page.
+      const path = normalizePagePath(req.query.path)
+      const page = await WIKI.models.pages.getPage({
+        siteId: req.params.siteId,
+        hash: generatePathHash(path || 'home'),
+        locale: req.query.locale,
+        unpublished: unpublishedFor(req),
+        unlocked: (target) => unlockedFor(req, target),
+        withPassword: false
+      })
+      if (!page) {
+        return reply.notFound('This page does not exist.')
+      }
+      if (!mayOnPage(req, 'read:pages', page)) {
+        return reply.forbidden('You are not allowed to read this page.')
+      }
+      return {
+        path: page.path,
+        locale: page.locale,
+        title: page.title,
+        isLocked: page.isLocked,
+        render: page.render
+      }
+    }
+  )
+
+  /**
+   * GET LOCALE RELATIONS OF A PAGE, BY PATH
+   *
+   * No route-level permissions: this answers about one page, so what governs it is `read:pages` on
+   * that page rather than anything site-wide.
+   */
+  app.get<{ Params: { siteId: string }; Querystring: { path: string; locale?: string } }>(
+    '/sites/:siteId/pages/locale-relations',
+    {
+      config: {
+        scope: 'pages'
+      },
+      schema: {
+        summary: 'Get the translation set a page belongs to',
+        description:
+          'The pages that are the same page as this one, in other locales, addressed by path rather than by ID — which is what a page picker has in hand.\n\nWhat the page properties panel asks before it accepts a chosen page. A page that is already part of a set answers with the rest of it, so the panel can fill its other rows in and say what set is being joined; a page with no counterparts answers with an empty list. Saving is what actually joins them — see `localeRelations` on `PageInput`.\n\nThe set comes back whole, unfiltered by publish state: an author choosing a translation has to be told about a draft one, or they would be shown an empty row and refused on save.',
+        tags: ['Pages'],
+        params: siteIdParam,
+        querystring: {
+          type: 'object',
+          required: ['path'],
+          properties: {
+            path: {
+              type: 'string',
+              maxLength: 255,
+              description:
+                'Slash-separated path of the page to ask about. The home page when empty.'
+            },
+            locale: {
+              type: 'string',
+              maxLength: 10,
+              description: "The site's primary locale when absent."
+            }
+          }
+        },
+        response: {
+          200: {
+            description: 'The page, and the rest of its translation set',
+            type: 'object',
+            properties: {
+              page: { $ref: 'PageLocaleRelation#' },
+              relations: {
+                type: 'array',
+                description: 'Every other page of the set. Empty when the page is in none.',
+                items: { $ref: 'PageLocaleRelation#' }
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const path = normalizePagePath(req.query.path)
+      const group = await WIKI.models.pages.localeGroupAt(req.params.siteId, {
+        locale: req.query.locale,
+        path
+      })
+      if (!group) {
+        return reply.notFound('This page does not exist.')
+      }
+      const siteId = req.params.siteId
+      if (!mayOnPage(req, 'read:pages', { ...group.page, siteId })) {
+        return reply.forbidden('You are not allowed to read this page.')
+      }
+      return {
+        page: { locale: group.page.locale, path: group.page.path, title: group.page.title },
+        /*
+          Filtered by what the asker may read, one page at a time: the set is a list of pages, and a
+          page they have no access to is not one to name at them — even to explain a refusal.
+        */
+        relations: group.relations.filter((rel) => mayOnPage(req, 'read:pages', { ...rel, siteId }))
+      }
+    }
+  )
+
+  /**
+   * GET PAGE
+   */
+  app.get<{
+    Params: { siteId: string; pageIdOrHash: string }
+    Querystring: { withContent?: boolean; locale?: string }
+  }>(
+    '/sites/:siteId/pages/:pageIdOrHash',
+    {
+      config: {
+        scope: 'pages'
+      },
+      schema: {
+        summary: 'Get a single page',
+        description:
+          "Addressed either by ID or by the hash of its path, which is how a page view asks for one. A hash only identifies a page within a locale, so `locale` picks between translations — the site's primary one when absent.\n\nReadable without a session, because a wiki is read by people who are not logged in. A page that is not live — a draft, or a scheduled page outside its publishing window — answers 404 to everybody but a signed-in requester holding `write:pages` or `manage:pages` on it, its source included. `withContent` is answered against `read:source` on the page — or `write:pages`, since the editor loads the source to edit it — which a group's rules grant to whoever they name, guests included.\n\nA password-protected page answers with its metadata and `isLocked: true`, its body withheld, until the session satisfies `POST …/unlock` — or unless the requester may edit the page, for whom the password is not a barrier.",
+        tags: ['Pages'],
+        params: {
+          type: 'object',
+          properties: {
+            siteId: {
+              type: 'string',
+              format: 'uuid'
+            },
+            pageIdOrHash: {
+              type: 'string',
+              oneOf: [{ format: 'uuid' }, { pattern: '^[a-f0-9]+$' }]
+            }
+          },
+          required: ['siteId', 'pageIdOrHash']
+        },
+        querystring: {
+          type: 'object',
+          properties: {
+            withContent: {
+              type: 'boolean',
+              default: false,
+              description:
+                'Include the source. Withheld from a requester who may neither read the source nor write the page here.'
+            },
+            locale: {
+              type: 'string',
+              maxLength: 10
+            }
+          }
+        },
+        response: {
+          200: { $ref: 'Page#' }
+        }
+      }
+    },
+    async (req, reply) => {
+      const isId = uuidValidate(req.params.pageIdOrHash)
+      const actor = actorFrom(req)
+      const page = await WIKI.models.pages.getPage({
+        siteId: req.params.siteId,
+        ...(isId ? { id: req.params.pageIdOrHash } : { hash: req.params.pageIdOrHash }),
+        locale: req.query.locale,
+        /*
+          -> The source is a page rule's to grant, not a session's to have: `mayReadSource` is the
+             whole of it, and the guests group holds it wherever a rule says so. Asked as a predicate
+             because the answer depends on the page, which a request addressing one by hash does not
+             have in hand yet.
+        */
+        withContent: req.query.withContent
+          ? (target: RulePageRef) => mayReadSource(req, target)
+          : false,
+        // -> A draft, or a scheduled page outside its window, is not there for anybody who may not
+        //    edit it — which is what keeps its render and its source alike from a reader
+        unpublished: unpublishedFor(req),
+        // -> Answered once the page is known, since a hash does not say which page it is yet
+        unlocked: (target) => unlockedFor(req, target),
+        withPassword: (target: RulePageRef) => mayBypassPassword(req, target)
+      })
+      if (!page) {
+        return reply.notFound('This page does not exist.')
+      }
+      if (!mayOnPage(req, 'read:pages', page)) {
+        return reply.forbidden('You are not allowed to read this page.')
+      }
+      /*
+        The reader's own standing on this page, carried back with it.
+
+        Three questions the page view used to ask as three more requests — what may I do here, may I
+        suggest an edit, do I review this page — each of which had to load the page again to answer.
+        They are answered here from the page already in hand, against rules already in memory, which
+        is what makes a page view one request instead of four.
+      */
+      const actorId = actor?.id ?? null
+      /*
+        The feedback board this page is an idea of, from the board list held in memory: an idea is a
+        page directly in a board's folder, so this costs no query.
+      */
+      const board = WIKI.models.feedback.boardOfIdea(
+        req.params.siteId,
+        page.locale,
+        page.path,
+        page.editor
+      )
+      /*
+        Both switches: the site's ratings mode and the page's own `allowRatings`. An idea is voted on
+        rather than rated, so it is always thumbs, and the board's own switch stands in for the
+        site's mode (`ratingModeFor` in `api/ratings.ts`).
+      */
+      const ratingMode = !page.allowRatings
+        ? null
+        : board
+          ? board.settings.voting
+            ? 'thumbs'
+            : null
+          : WIKI.models.pageRatings.modeFor(req.params.siteId)
+      /*
+        Which of the reader's notifications are about this page and still unread, so that opening it
+        — or its Talk tab — can mark them read without asking first. One indexed lookup, none for a
+        guest, and the browser only writes anything when this is not empty. Started here so that it
+        runs alongside the rest.
+      */
+      const unreadNotifications = WIKI.models.notifications.unreadCategoriesOnPage(page.id, actorId)
+      const mayWrite = mayOnPage(req, 'write:pages', page)
+      const [
+        approvalState,
+        isWatching,
+        commentsCount,
+        listing,
+        ownRating,
+        ideaStatus,
+        submitter,
+        ownership,
+        lifecycleRules,
+        canMarkReviewed
+      ] = await Promise.all([
+        WIKI.models.approvals.pageViewerState(req, req.params.siteId, {
+          id: page.id,
+          path: page.path,
+          tags: page.tags ?? [],
+          allowContributions: page.allowContributions
+        }),
+        // -> One indexed lookup on (pageId, userId), and none at all for a reader with no account
+        WIKI.models.pageWatching.isWatching(page.id, actorId),
+        /*
+          The badge on the Talk tab, which has to be there before the tab is opened — so it comes with
+          the page rather than with the comments. One indexed count, and not even that for a site
+          whose discussions live at a third party or that has comments turned off -- nor for a page
+          still waiting for its password, whose discussion is behind it with the body.
+        */
+        WIKI.models.comments.usesBuiltIn(req.params.siteId) && !page.isLocked
+          ? WIKI.models.comments.countForPage(page.id)
+          : 0,
+        /*
+          The blog this page is a post of, so that the page view can say where the reader is and link
+          back to it. Worked out rather than stored -- a post is a post because of where it sits --
+          which is one lookup on the unique `(siteId, locale, path)` index over the page's own
+          ancestors, and no lookup at all for a page at the site root, nor for an idea, whose nearest
+          listing page is already known to be its board.
+        */
+        board ? null : WIKI.models.blogs.listingFor(req.params.siteId, page.locale, page.path),
+        /*
+          The reader's own rating, which is theirs and so cannot be cached on the page the way the
+          totals are: one lookup on the primary key, and none for a guest or where ratings are off.
+        */
+        ratingMode ? WIKI.models.pageRatings.valueFor(page.id, actorId, ratingMode) : 0,
+        // -> Where an idea stands: one primary-key read, and none for a page that is not one
+        board ? WIKI.models.feedback.statusOf(page.id) : null,
+        // -> And who submitted it, for its head: the same, on the users table
+        board ? WIKI.models.feedback.submitterOf(page.creatorId) : null,
+        /*
+          Who owns it, for the properties panel -- so only for whoever could open that panel and save
+          it. A label nobody else is shown yet, and the group names in it are not every reader's to see.
+        */
+        mayWrite ? WIKI.models.pageOwners.ownershipOf(page.id) : null,
+        // -> Its lifecycle rules, for the same panel and on the same terms
+        mayWrite ? WIKI.models.pageLifecycle.rulesOf(page.id) : null,
+        /*
+          Whether this reader may take the lifecycle banner down. Only asked when there is one, and
+          the owner lookup only for a reader the page rules have not already answered for.
+        */
+        page.lifecycleBanner && actorId
+          ? mayWrite ||
+            mayOnPage(req, 'manage:pages', page) ||
+            WIKI.models.pageOwners.isOwner(page, actorId)
+          : false
+      ])
+      const blog = listing?.kind === 'blog' ? listing.blog : null
+      const { ratings, ...pageFields } = page
+      return {
+        ...pageFields,
+        commentsCount,
+        // -> Off the totals cached on the row just loaded, so no aggregate per view
+        rating: ratingMode ? WIKI.models.pageRatings.summaryFromCache(ratings, ratingMode) : null,
+        /*
+          Only what the page view draws: a post shows the name of the blog it is in and links to it.
+          The blog's own settings are not a fact about this page -- the front page carries them, and
+          it is the front page that draws a listing.
+        */
+        blog: blog ? { path: blog.path, title: blog.title } : null,
+        feedback:
+          board && ideaStatus
+            ? {
+                board: {
+                  path: board.path,
+                  title: board.title,
+                  voting: board.settings.voting,
+                  acceptsIdeas: board.settings.acceptsIdeas,
+                  submitterCategories: board.settings.submitterCategories,
+                  categories: board.settings.categories
+                },
+                status: ideaStatus.status,
+                statusUpdatedAt: ideaStatus.updatedAt,
+                statusUpdatedBy: ideaStatus.updatedById
+                  ? { id: ideaStatus.updatedById, name: ideaStatus.updatedByName ?? '' }
+                  : null,
+                statusCommentId: ideaStatus.commentId,
+                submittedBy: submitter,
+                canSetStatus:
+                  mayOnPage(req, 'review:pages', page) || mayOnPage(req, 'manage:pages', page),
+                canEditOwn: WIKI.models.feedback.mayEditOwn(
+                  actorId,
+                  page,
+                  ideaStatus.status,
+                  (permission) => mayOnPage(req, permission, page)
+                )
+              }
+            : null,
+        ownership,
+        lifecycleRules,
+        viewer: {
+          canMarkReviewed,
+          permissions: pagePermissionsFor(req, page),
+          ...approvalState,
+          isWatching,
+          rating: ownRating,
+          unreadNotifications: await unreadNotifications
+        }
+      }
+    }
+  )
+
+  /**
+   * UNLOCK PAGE
+   */
+  app.post<{
+    Params: { siteId: string; pageIdOrHash: string }
+    Querystring: { locale?: string }
+    Body: { password: string }
+  }>(
+    '/sites/:siteId/pages/:pageIdOrHash/unlock',
+    {
+      // -> A password endpoint like the ones in `api/authentication.ts`, and limited with them
+      onRequest: limitAuthAttempts,
+      schema: {
+        summary: 'Unlock a password-protected page',
+        description:
+          'Answers with the page, body included, when the password matches — and records the unlock on the session, so that reading the page again does not ask a second time. A wrong password is a 401 and says nothing more; a page with no password on it answers the same way, so that this cannot be used to find out which pages are protected.\n\nCallable without a session, because a protected page is written for readers who have the password rather than an account. Unlocking one is what first gives an anonymous reader a session.\n\nWhoever may edit the page never needs this: they can read the source and remove the password, so `GET` already hands them the body.',
+        tags: ['Pages'],
+        params: {
+          type: 'object',
+          properties: {
+            siteId: {
+              type: 'string',
+              format: 'uuid'
+            },
+            pageIdOrHash: {
+              type: 'string',
+              oneOf: [{ format: 'uuid' }, { pattern: '^[a-f0-9]+$' }]
+            }
+          },
+          required: ['siteId', 'pageIdOrHash']
+        },
+        querystring: {
+          type: 'object',
+          properties: {
+            locale: {
+              type: 'string',
+              maxLength: 10
+            }
+          }
+        },
+        body: {
+          type: 'object',
+          required: ['password'],
+          properties: {
+            password: {
+              type: 'string',
+              minLength: 1,
+              maxLength: 255
+            }
+          }
+        },
+        response: {
+          200: { $ref: 'Page#' }
+        }
+      }
+    },
+    async (req, reply) => {
+      const isId = uuidValidate(req.params.pageIdOrHash)
+      const page = await WIKI.models.pages.unlockPage({
+        siteId: req.params.siteId,
+        ...(isId ? { id: req.params.pageIdOrHash } : { hash: req.params.pageIdOrHash }),
+        locale: req.query.locale,
+        password: req.body.password,
+        unpublished: unpublishedFor(req)
+      })
+      if (!page) {
+        return reply.unauthorized('Incorrect password.')
+      }
+      /*
+        Recorded per page rather than as a blanket "this session may read protected pages": each
+        password is a separate secret, and knowing one says nothing about the others.
+
+        Writing to the session is what creates one for an anonymous reader — `saveUninitialized` is
+        off, so no row exists until this point. That is the intent: the unlock has to outlive the
+        request, and it is the reader's own deliberate action that starts it.
+      */
+      req.session.unlockedPages = [...new Set([...(req.session.unlockedPages ?? []), page.id])]
+
+      // -> The one read this log records, because it is a password being accepted rather than a page
+      //    being looked at. A wrong password is not recorded, for the same reason a failed login is
+      //    not: this endpoint is open to anybody who can reach the page.
+      await audit(req, 'page', 'unlockPage', {
+        pageId: page.id,
+        siteId: req.params.siteId,
+        locale: page.locale,
+        path: page.path
+      })
+
+      // -> The Talk tab's badge, withheld while the page was locked (see the page route) and now the
+      //    reader's to see along with the discussion itself
+      const commentsCount = WIKI.models.comments.usesBuiltIn(req.params.siteId)
+        ? await WIKI.models.comments.countForPage(page.id)
+        : 0
+      return { ...page, commentsCount }
+    }
+  )
+
+  /**
+   * CREATE PAGE
+   */
+  app.post<{ Params: { siteId: string }; Body: PageInput }>(
+    '/sites/:siteId/pages',
+    {
+      config: {
+        scope: 'pages'
+      },
+      /*
+        No route-level `permissions`: that hook reads the group-wide list, and page permissions are
+        granted by a group's RULES. Checked against the page in question below instead — which is
+        also what lets a rule open one branch to somebody the group as a whole cannot write to.
+      */
+      schema: {
+        summary: 'Create a page',
+        description:
+          'The content is the source and `render` is the HTML the editor produced from it. The render is sanitized against what the author may embed, stripped of editor scaffolding, given heading anchors, and reduced to a table of contents and search text — so read the response rather than assuming what was sent is what was stored.',
+        tags: ['Pages'],
+        params: siteIdParam,
+        body: {
+          allOf: [
+            { $ref: 'PageInput#' },
+            { type: 'object', required: ['path', 'title', 'editor', 'content'] }
+          ]
+        },
+        response: {
+          200: {
+            description: 'Page created successfully',
+            type: 'object',
+            properties: {
+              ok: { type: 'boolean' },
+              message: { type: 'string' },
+              page: { $ref: 'Page#' }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const actor = actorFrom(req)
+      if (!actor) {
+        return reply.unauthorized(userRequired(req, 'Saving a page'))
+      }
+      /*
+        Against the page as it is about to be, since there is no page to ask about yet: the path it
+        is going to and the tags it is arriving with. A tag rule has nothing else to read here — the
+        tags a new page carries are the ones in this request — and leaving them out would make a
+        rule addressing tags silently miss every page the moment it was created.
+      */
+      const incoming = {
+        siteId: req.params.siteId,
+        path: req.body.path,
+        locale: req.body.locale,
+        tags: req.body.tags ?? []
+      }
+      if (!mayOnPage(req, 'write:pages', incoming)) {
+        return reply.forbidden('You are not allowed to create a page here.')
+      }
+      /*
+        Tags are a permission of their own, and creating a page carrying them is assigning them —
+        otherwise the way around `write:tags` would be to make a new page instead of tagging an old
+        one. Only a non-empty list asks anything: a page created untagged assigns nothing.
+      */
+      if (incoming.tags.length > 0 && !mayOnPage(req, 'write:tags', incoming)) {
+        return reply.forbidden('You are not allowed to assign tags to a page here.')
+      }
+      const { page, versionId } = await WIKI.models.pages.createPage(
+        req.params.siteId,
+        req.body,
+        actor
+      )
+
+      await audit(req, 'page', 'createPage', {
+        pageId: page.id,
+        siteId: req.params.siteId,
+        locale: page.locale,
+        path: page.path,
+        title: page.title,
+        versionId
+      })
+
+      return {
+        ok: true,
+        message: 'Page created successfully.',
+        page
+      }
+    }
+  )
+
+  /**
+   * UPDATE PAGE
+   */
+  app.patch<{ Params: { siteId: string; pageId: string }; Body: Partial<PageInput> }>(
+    '/sites/:siteId/pages/:pageId',
+    {
+      config: {
+        scope: 'pages'
+      },
+      /*
+        No route-level `permissions`: that hook reads the group-wide list, and page permissions are
+        granted by a group's RULES. Checked against the page in question below instead — which is
+        also what lets a rule open one branch to somebody the group as a whole cannot write to.
+      */
+      schema: {
+        summary: 'Update a page',
+        description:
+          'Accepts any subset of the fields. Sending `render` replaces the stored HTML, its table of contents and its search text; sending `content` without it leaves the previous render in place, which is what a source-only edit means.',
+        tags: ['Pages'],
+        params: pageIdParam,
+        body: { $ref: 'PageInput#' },
+        response: {
+          200: {
+            description: 'Page updated successfully',
+            type: 'object',
+            properties: {
+              ok: { type: 'boolean' },
+              message: { type: 'string' },
+              page: { $ref: 'Page#' }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const actor = actorFrom(req)
+      if (!actor) {
+        return reply.unauthorized(userRequired(req, 'Saving a page'))
+      }
+      const target = await WIKI.models.pages.getPage({
+        siteId: req.params.siteId,
+        id: req.params.pageId
+      })
+      if (!target) {
+        return reply.notFound('This page does not exist.')
+      }
+      if (!mayOnPage(req, 'write:pages', target)) {
+        return reply.forbidden('You are not allowed to edit this page.')
+      }
+      /*
+        Whether this save actually retags the page, and may — compared against the row rather than
+        read off the body being present, because the editor sends every field on every save.
+      */
+      const retagRefused = retagRefusal(req, target, req.body.tags)
+      if (retagRefused) {
+        return reply.forbidden(retagRefused)
+      }
+      const change = await WIKI.models.pages.updatePage(
+        req.params.siteId,
+        req.params.pageId,
+        req.body,
+        actor
+      )
+      if (!change) {
+        return reply.notFound('This page does not exist.')
+      }
+      const { page, versionId } = change
+
+      // -> What changed is not repeated here: `versionId` points at the `pageHistory` row that holds
+      //    the page as it now stands, which is the record of the edit itself
+      await audit(req, 'page', 'updatePage', {
+        pageId: page.id,
+        siteId: req.params.siteId,
+        locale: page.locale,
+        path: page.path,
+        title: page.title,
+        versionId
+      })
+      /*
+        Anyone else editing this page right now is looking at the text that was just stored, so their
+        editor should stop calling it unsaved. Told through the collaboration room rather than answered
+        here, since they are on their own requests — and, quite possibly, on another instance.
+      */
+      WIKI.collab.pageSaved(page.id, {
+        versionDate: page.updatedAt.toTemporalInstant().toString({ smallestUnit: 'millisecond' }),
+        authorId: actor.id,
+        authorName: page.authorName ?? ''
+      })
+      return {
+        ok: true,
+        message: 'Page updated successfully.',
+        page
+      }
+    }
+  )
+
+  /**
+   * CONVERT PAGE TO ANOTHER EDITOR
+   */
+  app.put<{
+    Params: { siteId: string; pageId: string }
+    Body: { editor: string; content?: string; render?: string; reasonForChange?: string }
+  }>(
+    '/sites/:siteId/pages/:pageId/editor',
+    {
+      config: {
+        scope: 'pages'
+      },
+      /*
+        No route-level `permissions`: that hook reads the group-wide list, and page permissions are
+        granted by a group's RULES. Checked against the page in question below instead — which is
+        also what lets a rule open one branch to somebody the group as a whole cannot write to.
+      */
+      schema: {
+        summary: 'Change which editor a page is written with',
+        description:
+          "A page has one editor and everybody who opens it gets that one, so this is how a page moves between them. Only between editors that produce the same content type — Markdown and Visual are two views of one markdown source — which is what makes it a change of tooling rather than a translation.\n\nThe optional `content` is that source written the way the new editor writes it; the Visual editor normalises spelling that markdown leaves free (quote style, list indentation, table padding), and sending it here spends that rewrite on one history version of its own instead of burying it in somebody's next real edit. Left out, the source is untouched.\n\nRecorded as an ordinary page edit, so the version it produces holds the page exactly as it now stands.",
+        tags: ['Pages'],
+        params: pageIdParam,
+        body: {
+          type: 'object',
+          required: ['editor'],
+          properties: {
+            editor: {
+              type: 'string',
+              description: 'The editor to open this page with from now on.'
+            },
+            content: { type: 'string', description: 'The source, rewritten for the new editor.' },
+            render: { type: 'string', description: 'The HTML that source renders to.' },
+            reasonForChange: { type: 'string', maxLength: 255 }
+          }
+        },
+        response: {
+          200: {
+            description: 'Page converted successfully',
+            type: 'object',
+            properties: {
+              ok: { type: 'boolean' },
+              message: { type: 'string' },
+              page: { $ref: 'Page#' }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const actor = actorFrom(req)
+      if (!actor) {
+        return reply.unauthorized(userRequired(req, 'Converting a page'))
+      }
+      const target = await WIKI.models.pages.getPage({
+        siteId: req.params.siteId,
+        id: req.params.pageId
+      })
+      if (!target) {
+        return reply.notFound('This page does not exist.')
+      }
+      if (!mayOnPage(req, 'write:pages', target)) {
+        return reply.forbidden('You are not allowed to edit this page.')
+      }
+      /*
+        The site has to have the editor turned on. A page converted to an editor nobody can open is a
+        page nobody can edit, and the Editors screen is where that is decided.
+      */
+      const editors = WIKI.sites[req.params.siteId]?.config?.editors ?? {}
+      if (!editors[req.body.editor]?.isActive) {
+        return reply.badRequest('That editor is not enabled on this site.')
+      }
+
+      const previousEditor = target.editor
+      const change = await WIKI.models.pages.convertPage(
+        req.params.siteId,
+        req.params.pageId,
+        req.body,
+        actor
+      )
+      if (!change) {
+        return reply.notFound('This page does not exist.')
+      }
+      const { page, versionId } = change
+
+      await audit(req, 'page', 'convertPage', {
+        pageId: page.id,
+        siteId: req.params.siteId,
+        locale: page.locale,
+        path: page.path,
+        title: page.title,
+        from: previousEditor,
+        to: page.editor,
+        versionId
+      })
+      return {
+        ok: true,
+        message: 'Page converted successfully.',
+        page
+      }
+    }
+  )
+
+  /**
+   * MOVE / RENAME PAGE
+   */
+  app.put<{
+    Params: { siteId: string; pageId: string }
+    Body: { path: string; locale?: string; title?: string; updateLinks?: boolean }
+  }>(
+    '/sites/:siteId/pages/:pageId/path',
+    {
+      config: {
+        scope: 'pages'
+      },
+      /*
+        No route-level `permissions`: that hook reads the group-wide list, and page permissions are
+        granted by a group's RULES. Checked against the page in question below instead — which is
+        also what lets a rule open one branch to somebody the group as a whole cannot write to.
+      */
+      schema: {
+        summary: 'Move a page to another path',
+        description:
+          'Also renames it when a title is given, and moves it to another locale when one is given. The tree entry moves with it, any folder the new path needs is created, and the copy on every storage target follows.\n\nMoving between locales needs `manage:pages` at the destination as well as at the source, since page rules are granted per locale.\n\nWith `updateLinks`, every page linking to the old address by path is edited to point at the new one — its source and its stored render, as a new version with the move as its reason. Each needs `write:pages` of its own; a page the caller may not edit, or whose link could not be found in its source, is left alone and reported under `relinked.skipped`.',
+        tags: ['Pages'],
+        params: pageIdParam,
+        body: {
+          type: 'object',
+          required: ['path'],
+          properties: {
+            path: {
+              type: 'string',
+              maxLength: 255,
+              pattern: '^/?[\\p{L}\\p{M}\\p{N}\\s_/-]*$'
+            },
+            locale: {
+              type: 'string',
+              maxLength: 255,
+              description: 'The locale to move it to. Stays in its own when absent.'
+            },
+            title: {
+              type: 'string',
+              minLength: 1,
+              maxLength: 255
+            },
+            updateLinks: {
+              type: 'boolean',
+              default: false,
+              description:
+                'Rewrite the links of every page pointing at the old address so they point at the new one.'
+            }
+          }
+        },
+        response: {
+          200: {
+            description: 'Page moved successfully',
+            type: 'object',
+            properties: {
+              ok: { type: 'boolean' },
+              message: { type: 'string' },
+              page: { $ref: 'Page#' },
+              relinked: {
+                type: 'object',
+                description:
+                  'Present when `updateLinks` was asked for and the page changed address.',
+                properties: {
+                  updated: {
+                    type: 'integer',
+                    description: 'How many linking pages were edited.'
+                  },
+                  skippedCount: {
+                    type: 'integer',
+                    description:
+                      'How many linking pages were left as they were, including any the caller may not read.'
+                  },
+                  skipped: {
+                    type: 'array',
+                    description:
+                      'The skipped pages the caller may read. `forbidden`: the caller may not edit it. `notInSource`: the link could not be found in its source. `failed`: the save was refused.',
+                    items: {
+                      type: 'object',
+                      properties: {
+                        id: { type: 'string', format: 'uuid' },
+                        locale: { type: 'string' },
+                        path: { type: 'string' },
+                        title: { type: 'string' },
+                        reason: { type: 'string', enum: ['forbidden', 'notInSource', 'failed'] }
+                      }
+                    }
+                  },
+                  glossary: {
+                    type: 'object',
+                    description:
+                      'The glossary terms documented by the page. `updated`: now pointing at its new path. `cleared`: their documentation page was removed, because the page moved to another locale and a term may only be documented in its own.',
+                    properties: {
+                      updated: { type: 'integer' },
+                      cleared: { type: 'integer' }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const actor = actorFrom(req)
+      if (!actor) {
+        return reply.unauthorized(userRequired(req, 'Moving a page'))
+      }
+      const target = await WIKI.models.pages.getPage({
+        siteId: req.params.siteId,
+        id: req.params.pageId
+      })
+      if (!target) {
+        return reply.notFound('This page does not exist.')
+      }
+      if (!mayOnPage(req, 'manage:pages', target)) {
+        return reply.forbidden('You are not allowed to move this page.')
+      }
+      /*
+        And at the destination, when that is somewhere else: rules are granted per path AND per
+        locale, so a move is a write to a place the mover may have no say over — which without this
+        is a way to put a page somewhere they could not have created one.
+      */
+      const destination = {
+        siteId: req.params.siteId,
+        path: req.body.path.replace(/^\/+/, ''),
+        locale: req.body.locale || target.locale,
+        tags: target.tags
+      }
+      if (
+        (destination.path !== target.path || destination.locale !== target.locale) &&
+        !mayOnPage(req, 'manage:pages', destination)
+      ) {
+        return reply.forbidden('You are not allowed to move this page there.')
+      }
+      const change = await WIKI.models.pages.movePage(
+        req.params.siteId,
+        req.params.pageId,
+        req.body,
+        actor
+      )
+      if (!change) {
+        return reply.notFound('This page does not exist.')
+      }
+      const { page, versionId } = change
+
+      /*
+        After the move rather than inside it: the move is complete on its own, and what follows is a
+        set of ordinary edits to other people's pages, each asked about separately -- `write:pages` on
+        that page, which is what saving it from the editor would have taken.
+      */
+      const relink =
+        req.body.updateLinks && (page.path !== target.path || page.locale !== target.locale)
+          ? await WIKI.models.pages.relinkMovedPage(
+              req.params.siteId,
+              page.id,
+              { locale: target.locale, path: target.path },
+              actor,
+              (linking) => mayOnPage(req, 'write:pages', linking)
+            )
+          : null
+
+      await audit(req, 'page', 'movePage', {
+        pageId: page.id,
+        siteId: req.params.siteId,
+        locale: page.locale,
+        path: page.path,
+        previousLocale: target.locale,
+        previousPath: target.path,
+        versionId,
+        // -> Each edited page by id and the version its edit produced, which is the record of it
+        ...(relink ? { relinked: relink.updated } : {}),
+        // -> The glossary terms it rewrote, here rather than as entries of their own (spec §8)
+        ...(relink?.glossary.updated.length ? { glossaryRelinked: relink.glossary.updated } : {}),
+        ...(relink?.glossary.cleared.length ? { glossaryCleared: relink.glossary.cleared } : {})
+      })
+
+      return {
+        ok: true,
+        message: 'Page moved successfully.',
+        page,
+        ...(relink
+          ? {
+              relinked: {
+                updated: relink.updated.length,
+                skippedCount: relink.skipped.length,
+                // -> Named only where the caller may read the page: a page they may not edit may well
+                //    be one whose title they are not allowed to know either
+                skipped: relink.skipped.filter((skip) => mayOnPage(req, 'read:pages', skip)),
+                // -> Counts only: the terms are in a glossary the mover need not be able to read
+                glossary: {
+                  updated: relink.glossary.updated.length,
+                  cleared: relink.glossary.cleared.length
+                }
+              }
+            }
+          : {})
+      }
+    }
+  )
+
+  /**
+   * RE-RENDER PAGE
+   */
+  app.post<{ Params: { siteId: string; pageId: string } }>(
+    '/sites/:siteId/pages/:pageId/render',
+    {
+      config: {
+        scope: 'pages'
+      },
+      /*
+        No route-level `permissions`: that hook reads the group-wide list, and page permissions are
+        granted by a group's RULES. Checked against the page in question below instead — which is
+        also what lets a rule open one branch to somebody the group as a whole cannot write to.
+      */
+      // -> Bounds how fast one client can fill the queue; see `helpers/rateLimit.ts`
+      preHandler: limitRenders,
+      schema: {
+        summary: 'Queue a page to be rendered again from its source',
+        description:
+          'For when a stored render has gone stale and nobody has the page open to re-save it. The markdown pipeline lives in the frontend, so the server drives it in a headless browser and the result matches what the editor would produce — which means this needs the Puppeteer extension, and answers 503 without it.\n\nAnswers 202: a browser is far too heavy to hold a request open for, so the page joins a queue that is drained one page at a time and its render is replaced when its turn comes. Asking twice for the same page is one render of whatever the content has become by then. Rate limited, to bound how fast the queue can be filled.',
+        tags: ['Pages'],
+        params: pageIdParam,
+        response: {
+          202: {
+            description: 'Page queued for rendering',
+            type: 'object',
+            properties: {
+              ok: { type: 'boolean' },
+              message: { type: 'string' }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const actor = actorFrom(req)
+      if (!actor) {
+        return reply.unauthorized(userRequired(req, 'Rendering a page'))
+      }
+      const target = await WIKI.models.pages.getPage({
+        siteId: req.params.siteId,
+        id: req.params.pageId
+      })
+      if (!target) {
+        return reply.notFound('This page does not exist.')
+      }
+      // -> Rewrites what the page shows, so it is an edit and takes the same permission as one
+      if (!mayOnPage(req, 'write:pages', target)) {
+        return reply.forbidden('You are not allowed to edit this page.')
+      }
+      const queued = await WIKI.models.pages.queueRerender(
+        req.params.siteId,
+        req.params.pageId,
+        actor
+      )
+      if (!queued) {
+        return reply.notFound('This page does not exist.')
+      }
+
+      await audit(req, 'page', 'renderPage', {
+        pageId: req.params.pageId,
+        siteId: req.params.siteId,
+        locale: target.locale,
+        path: target.path
+      })
+
+      return reply.code(202).send({
+        ok: true,
+        message: 'Page queued for rendering.'
+      })
+    }
+  )
+
+  /**
+   * DELETE PAGE
+   */
+  app.delete<{ Params: { siteId: string; pageId: string } }>(
+    '/sites/:siteId/pages/:pageId',
+    {
+      config: {
+        scope: 'pages'
+      },
+      /*
+        No route-level `permissions`: that hook reads the group-wide list, and page permissions are
+        granted by a group's RULES. Checked against the page in question below instead — which is
+        also what lets a rule open one branch to somebody the group as a whole cannot write to.
+      */
+      schema: {
+        summary: 'Delete a page',
+        tags: ['Pages'],
+        params: pageIdParam,
+        response: {
+          204: {
+            description: 'Page deleted successfully'
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const actor = actorFrom(req)
+      if (!actor) {
+        return reply.unauthorized(userRequired(req, 'Deleting a page'))
+      }
+      const target = await WIKI.models.pages.getPage({
+        siteId: req.params.siteId,
+        id: req.params.pageId
+      })
+      if (!target) {
+        return reply.notFound('This page does not exist.')
+      }
+      if (!mayOnPage(req, 'delete:pages', target)) {
+        return reply.forbidden('You are not allowed to delete this page.')
+      }
+      const deleted = await WIKI.models.pages.deletePage(
+        req.params.siteId,
+        req.params.pageId,
+        actor
+      )
+      if (!deleted) {
+        return reply.notFound('This page does not exist.')
+      }
+
+      // -> The version recorded here is the deletion itself, which is what recovering the page would
+      //    be built from — so the entry says where to find the page that is no longer there
+      await audit(req, 'page', 'deletePage', {
+        pageId: req.params.pageId,
+        siteId: req.params.siteId,
+        locale: target.locale,
+        path: target.path,
+        title: target.title,
+        versionId: deleted.versionId
+      })
+
+      return reply.code(204).send()
+    }
+  )
+
+  /**
+   * RECYCLE BIN
+   */
+  app.get<{ Params: { siteId: string }; Querystring: { locale: string } }>(
+    '/sites/:siteId/pages/deleted',
+    {
+      config: {
+        scope: 'pages'
+      },
+      /*
+        No route-level `permissions`: the bin is gated by the page rule `delete:pages`, resolved
+        per deleted page against where it was.
+      */
+      schema: {
+        summary: 'List deleted pages',
+        description:
+          "The site's recycle bin: every page whose newest version is its deletion, most recently deleted first, in one locale.\n\nOnly the pages the caller holds `delete:pages` on, where each page was when it was deleted. Each entry names the version recording the deletion, which is what `GET /sites/:siteId/versions/:versionId` reads and `POST /sites/:siteId/pages/:pageId/restore` restores from.",
+        tags: ['Pages'],
+        params: siteIdParam,
+        querystring: {
+          type: 'object',
+          properties: {
+            locale: {
+              type: 'string',
+              description: 'The locale the page was in when it was deleted.'
+            }
+          },
+          required: ['locale']
+        },
+        response: {
+          200: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                versionId: {
+                  type: 'string',
+                  format: 'uuid',
+                  description: 'The version recording the deletion.'
+                },
+                pageId: { type: 'string', format: 'uuid' },
+                locale: { type: 'string' },
+                path: {
+                  type: 'string',
+                  description: 'Where the page was when it was deleted.'
+                },
+                title: { type: 'string' },
+                icon: {
+                  type: 'string',
+                  description: 'An Iconify reference. Empty when the page had none of its own.'
+                },
+                editor: { type: 'string' },
+                deletedAt: {
+                  type: 'string',
+                  format: 'date-time',
+                  description: 'RFC 3339 Date Time'
+                },
+                deletedBy: {
+                  type: 'object',
+                  description:
+                    'Who deleted it. Null id and empty name once that account is deleted.',
+                  properties: {
+                    id: { type: ['string', 'null'], format: 'uuid' },
+                    name: { type: 'string' }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req) => {
+      const entries = await WIKI.models.pageHistory.listDeleted(req.params.siteId, req.query.locale)
+      return entries.filter((entry) => mayRecoverPage(req, req.params.siteId, entry))
+    }
+  )
+
+  app.post<{
+    Params: { siteId: string; pageId: string }
+    Body: { versionId: string; render?: string; path?: string; locale?: string; title?: string }
+  }>(
+    '/sites/:siteId/pages/:pageId/restore',
+    {
+      config: {
+        scope: 'pages'
+      },
+      // -> Checked per page below, for the same reason as the recycle bin listing above
+      schema: {
+        summary: 'Restore a deleted page',
+        description:
+          "Bring a page back out of the recycle bin under its own id, so its whole history comes back with it. The page is restored as the deletion's snapshot held it; only its render is the caller's, produced from that snapshot's source the way an editor produces one, and sanitized against what the caller may embed.\n\nBack where it was unless `path` / `locale` say otherwise. A path another page has taken since answers 409 `pageDuplicatePath`, and a `versionId` that is no longer the page's deletion (it was restored and deleted again meanwhile) answers 409 `pageRestoreStale`.\n\nNeeds `delete:pages` where the page was when it was deleted, and at the destination when that is somewhere else.",
+        tags: ['Pages'],
+        params: pageIdParam,
+        body: {
+          type: 'object',
+          properties: {
+            versionId: {
+              type: 'string',
+              format: 'uuid',
+              description: 'The deletion being undone, as the recycle bin listed it.'
+            },
+            render: {
+              type: 'string',
+              description: "The HTML produced from the snapshot's source."
+            },
+            path: {
+              type: 'string',
+              description: 'Where to restore it, when not back where it was.'
+            },
+            locale: {
+              type: 'string',
+              description: 'The locale to restore it into, when not the one it was in.'
+            },
+            title: {
+              type: 'string',
+              description: 'A new title, when not the one it had.'
+            }
+          },
+          required: ['versionId']
+        },
+        response: {
+          200: {
+            description: 'Page restored successfully',
+            type: 'object',
+            properties: {
+              ok: { type: 'boolean' },
+              message: { type: 'string' },
+              page: { $ref: 'Page#' }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const actor = actorFrom(req)
+      if (!actor) {
+        return reply.unauthorized(userRequired(req, 'Restoring a page'))
+      }
+      const deletion = await WIKI.models.pageHistory.deletionOf(
+        req.params.siteId,
+        req.params.pageId
+      )
+      if (
+        !deletion ||
+        !mayRecoverPage(req, req.params.siteId, {
+          path: deletion.path,
+          locale: deletion.locale,
+          tags: deletion.meta.tags
+        })
+      ) {
+        return reply.notFound('This page is not in the recycle bin.')
+      }
+      // -> Somewhere else is somewhere this caller has to be allowed to put it, on the same terms
+      const destination = {
+        path: req.body.path ? normalizePagePath(req.body.path) : deletion.path,
+        locale: req.body.locale || deletion.locale,
+        tags: deletion.meta.tags
+      }
+      if (
+        (destination.path !== deletion.path || destination.locale !== deletion.locale) &&
+        !mayRecoverPage(req, req.params.siteId, destination)
+      ) {
+        return reply.forbidden('You are not allowed to restore a page here.')
+      }
+      const { page, versionId } = await WIKI.models.pages.restorePage(
+        req.params.siteId,
+        {
+          pageId: req.params.pageId,
+          versionId: req.body.versionId,
+          render: req.body.render,
+          path: destination.path,
+          locale: destination.locale,
+          title: req.body.title
+        },
+        actor
+      )
+
+      await audit(req, 'page', 'restorePage', {
+        pageId: page.id,
+        siteId: req.params.siteId,
+        locale: page.locale,
+        path: page.path,
+        title: page.title,
+        // -> Both ends: the deletion undone, and the version the page came back as
+        deletedVersionId: deletion.id,
+        versionId
+      })
+
+      return {
+        ok: true,
+        message: 'Page restored successfully.',
+        page
+      }
+    }
+  )
+
+  /**
+   * PAGE HISTORY
+   */
+  app.get<{ Params: { siteId: string; pageId: string } }>(
+    '/sites/:siteId/pages/:pageId/history',
+    {
+      config: {
+        scope: 'pages'
+      },
+      /*
+        No route-level `permissions`: that hook reads the group-wide list, and `read:history` is a
+        page permission granted by a rule. Checked against this page below instead.
+      */
+      schema: {
+        summary: "Get a page's version history",
+        description:
+          'Every recorded version of the page, newest first — the first entry is the page as it stands now.\n\nNeeds `read:history` ON THIS PAGE, granted by a group rule — the permission that says who may see what a page used to contain. Reading the page itself is required on top, so a page the caller could not open answers 404 and a password-protected one answers only once the session has satisfied `POST …/unlock`.',
+        tags: ['Pages'],
+        params: pageIdParam,
+        response: {
+          200: {
+            description: 'Versions of this page, newest first',
+            type: 'array',
+            items: { $ref: 'PageHistoryEntry#' }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const page = await loadReadablePage(req, req.params.siteId, req.params.pageId)
+      if (!page) {
+        return reply.notFound('This page does not exist.')
+      }
+      if (!mayOnPage(req, 'read:history', page)) {
+        return reply.forbidden("You are not allowed to read this page's history.")
+      }
+      if (page.isLocked) {
+        return reply.forbidden('This page is password protected.')
+      }
+      return WIKI.models.pageHistory.list(req.params.siteId, req.params.pageId)
+    }
+  )
+
+  /**
+   * PAGE HISTORY VERSION
+   */
+  app.get<{ Params: { siteId: string; pageId: string; versionId: string } }>(
+    '/sites/:siteId/pages/:pageId/history/:versionId',
+    {
+      config: {
+        scope: 'pages'
+      },
+      // -> Checked per page below, for the same reason as the history list above
+      schema: {
+        summary: 'Get a single version of a page',
+        description:
+          'One version in full, source included — one side of a comparison. Needs `read:history` and the ability to read the page, on the same terms as the history list.',
+        tags: ['Pages'],
+        params: {
+          type: 'object',
+          properties: {
+            siteId: {
+              type: 'string',
+              format: 'uuid'
+            },
+            pageId: {
+              type: 'string',
+              format: 'uuid'
+            },
+            versionId: {
+              type: 'string',
+              format: 'uuid'
+            }
+          },
+          required: ['siteId', 'pageId', 'versionId']
+        },
+        response: {
+          200: { $ref: 'PageHistoryVersion#' }
+        }
+      }
+    },
+    async (req, reply) => {
+      const page = await loadReadablePage(req, req.params.siteId, req.params.pageId)
+      if (!page) {
+        return reply.notFound('This page does not exist.')
+      }
+      if (!mayOnPage(req, 'read:history', page)) {
+        return reply.forbidden("You are not allowed to read this page's history.")
+      }
+      if (page.isLocked) {
+        return reply.forbidden('This page is password protected.')
+      }
+      const version = await WIKI.models.pageHistory.getVersion(
+        req.params.siteId,
+        req.params.pageId,
+        req.params.versionId
+      )
+      if (!version) {
+        return reply.notFound('This version does not exist.')
+      }
+      return version
+    }
+  )
+
+  /**
+   * PAGE VERSION BY ID
+   */
+  app.get<{ Params: { siteId: string; versionId: string } }>(
+    '/sites/:siteId/versions/:versionId',
+    {
+      config: {
+        scope: 'pages'
+      },
+      // -> Checked per page below, for the same reason as the history routes above
+      schema: {
+        summary: 'Get a page version by its ID alone',
+        description:
+          "The same version as the history route, addressed WITHOUT naming the page — what a `/_version/<id>` link resolves. The page it came off is named in the reply, since that is what the reader is asking to be told.\n\nNeeds `read:history` and the ability to read that page, on the same terms as the history list.\n\nA version of a page that is in the recycle bin is answered on the recycle bin's terms instead: `delete:pages` where the page was when it was deleted, since there is no page left for the rules to be matched against. `pageIsDeleted` is then true, and `pagePath` / `pageLocale` are where it was.",
+        tags: ['Pages'],
+        params: {
+          type: 'object',
+          properties: {
+            siteId: {
+              type: 'string',
+              format: 'uuid'
+            },
+            versionId: {
+              type: 'string',
+              format: 'uuid'
+            }
+          },
+          required: ['siteId', 'versionId']
+        },
+        response: {
+          200: { $ref: 'PageVersionById#' }
+        }
+      }
+    },
+    async (req, reply) => {
+      const version = await WIKI.models.pageHistory.getVersionById(
+        req.params.siteId,
+        req.params.versionId
+      )
+      if (!version) {
+        return reply.notFound('This version does not exist.')
+      }
+      /*
+        A page in the recycle bin has no row for the rules to be matched against, so the deletion
+        stands in for it: where the page was when it went, which is where the bin decides who may see
+        it. Every version of it is readable on those terms -- the bin's View opens the deletion, and
+        the history walked from there is the same page's.
+      */
+      const deletion = await WIKI.models.pageHistory.deletionOf(req.params.siteId, version.pageId)
+      if (deletion) {
+        if (
+          !mayRecoverPage(req, req.params.siteId, {
+            path: deletion.path,
+            locale: deletion.locale,
+            tags: deletion.meta.tags
+          })
+        ) {
+          return reply.notFound('This version does not exist.')
+        }
+        // -> As for a live page: a password guarded the content, and the bin is not a way around it
+        if (
+          deletion.meta.password &&
+          !mayBypassPassword(req, {
+            siteId: req.params.siteId,
+            path: deletion.path,
+            locale: deletion.locale,
+            tags: deletion.meta.tags
+          })
+        ) {
+          return reply.forbidden('This page is password protected.')
+        }
+        return {
+          ...version,
+          pageIsDeleted: true,
+          pagePath: deletion.path,
+          pageLocale: deletion.locale
+        }
+      }
+      /*
+        The page as it stands, which is what carries the access rules — a version has none of its own.
+        Note the rules are matched against the page's CURRENT path, not the path the version was
+        written at: a page that has moved is one page, and who may read its history is a question about
+        where it is now.
+      */
+      const page = await loadReadablePage(req, req.params.siteId, version.pageId)
+      if (!page) {
+        return reply.notFound('This version does not exist.')
+      }
+      if (!mayOnPage(req, 'read:history', page)) {
+        return reply.forbidden("You are not allowed to read this page's history.")
+      }
+      if (page.isLocked) {
+        return reply.forbidden('This page is password protected.')
+      }
+      /*
+        The page's CURRENT path and locale, alongside the historical ones already on the version.
+
+        Both are here so a reader looking at a snapshot can be sent to the page as it stands, and
+        `version.path` cannot do that job: it is where the page was WHEN the version was written, so
+        for a page that has since moved it points at nothing. Free to include — the page is already
+        loaded, one line above, to decide whether this reader may be here at all.
+      */
+      return { ...version, pageIsDeleted: false, pagePath: page.path, pageLocale: page.locale }
+    }
+  )
+
+  /**
+   * RESOLVE ALIAS
+   */
+  app.get<{ Params: { siteId: string; alias: string } }>(
+    '/sites/:siteId/pages/alias/:alias',
+    {
+      config: {
+        scope: 'pages'
+      },
+      /*
+        No route-level `permissions`: that hook reads the group-wide list, and page permissions are
+        granted by a group's RULES. Checked against the page in question below instead — which is
+        also what lets a rule open one branch to somebody the group as a whole cannot write to.
+      */
+      schema: {
+        summary: 'Resolve a page alias to its path',
+        tags: ['Pages'],
+        params: {
+          type: 'object',
+          properties: {
+            siteId: {
+              type: 'string',
+              format: 'uuid'
+            },
+            alias: {
+              type: 'string',
+              maxLength: 255,
+              pattern: '^[a-zA-Z0-9-_]+$'
+            }
+          },
+          required: ['siteId', 'alias']
+        },
+        response: {
+          200: {
+            description: 'The page the alias points at',
+            type: 'object',
+            properties: {
+              id: { type: 'string', format: 'uuid' },
+              path: { type: 'string' },
+              // -> A path alone does not say where the page IS on a site that brackets its URLs by
+              //    locale, and the caller is about to build one
+              locale: { type: 'string' }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const target = await WIKI.models.pages.getPathFromAlias(req.params.siteId, req.params.alias)
+      if (!target) {
+        return reply.notFound('No page uses this alias.')
+      }
+      // -> Resolving an alias tells the caller a page exists and where it is, which is only theirs
+      //    to know if they may read it
+      if (!mayOnPage(req, 'read:pages', { ...target, siteId: req.params.siteId })) {
+        return reply.notFound('No page uses this alias.')
+      }
+      // -> `id`, `path` and `locale` are what the response schema keeps; the tags were for the check
+      return target
+    }
+  )
+
+  /**
+   * RESOLVE ID
+   */
+  app.get<{ Params: { siteId: string; pageId: string } }>(
+    '/sites/:siteId/pages/id/:pageId',
+    {
+      config: {
+        scope: 'pages'
+      },
+      /*
+        No route-level `permissions`, for the reason the alias route above gives: page permissions are
+        granted by a group's RULES and are checked against the page itself.
+      */
+      schema: {
+        summary: 'Resolve a page id to its path',
+        description:
+          'The id half of the alias lookup, for the short link that names a page by the one thing about it that never changes: an alias can be retyped and a path can be moved, and neither breaks a link built on the id.\n\nAnswers 404 rather than 403 for a page the caller may not read — that a page exists at all is only theirs to know if they may read it.',
+        tags: ['Pages'],
+        params: {
+          type: 'object',
+          properties: {
+            siteId: {
+              type: 'string',
+              format: 'uuid'
+            },
+            pageId: {
+              type: 'string',
+              format: 'uuid'
+            }
+          },
+          required: ['siteId', 'pageId']
+        },
+        response: {
+          200: {
+            description: 'The page with this id',
+            type: 'object',
+            properties: {
+              id: { type: 'string', format: 'uuid' },
+              path: { type: 'string' },
+              locale: { type: 'string' }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const target = await WIKI.models.pages.getPathFromId(req.params.siteId, req.params.pageId)
+      if (!target) {
+        return reply.notFound('No page has this id.')
+      }
+      // -> Resolving an id tells the caller a page exists and where it is, which is only theirs to
+      //    know if they may read it
+      if (!mayOnPage(req, 'read:pages', { ...target, siteId: req.params.siteId })) {
+        return reply.notFound('No page has this id.')
+      }
+      return target
+    }
+  )
+
+  /**
+   * LIST BACKLINKS
+   *
+   * What links to this page.
+   *
+   * Asked by the page's ADDRESS rather than by its id, which is the whole reason the table stores an
+   * address: a link says where it points, so the pages pointing at one that has moved still point at
+   * where it was. The two short links are folded in by id and by alias, since those two survive a move
+   * by design and belong in the same list.
+   */
+  app.get<{ Params: { siteId: string; pageId: string } }>(
+    '/sites/:siteId/pages/:pageId/backlinks',
+    {
+      config: {
+        scope: 'pages'
+      },
+      /*
+        No route-level `permissions`: reading a page's backlinks is `read:pages` ON THAT PAGE, and on
+        every page in the answer — see below.
+      */
+      schema: {
+        summary: 'List the pages linking to a page',
+        description:
+          "Every page of this instance whose content, redirection target or sidebar relations point at this one, with the href each of them wrote.\n\nAnswers 404 where the site has `features.backlinks` off, which is the switch under General → Features. A page that has turned its own Links tab off with `allowBacklinks` still answers here — that flag hides the tab, and what it hides is not a secret.\n\nFiltered by what the caller may read, one page at a time: a backlink names a page, its title and where it sits, so listing one the caller has no `read:pages` rule for would hand them the existence of a page they cannot open. A link written on another SITE of this instance is included, since a move here breaks it just the same.\n\nNote that links pointing at a page's OLD path are not listed here — after a move they address a path this page no longer has, which is what makes them findable as the links that move broke.",
+        tags: ['Pages'],
+        params: pageIdParam,
+        response: {
+          200: {
+            description: 'Pages linking here',
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string', format: 'uuid' },
+                siteId: { type: 'string', format: 'uuid' },
+                locale: { type: 'string' },
+                path: { type: 'string' },
+                title: { type: 'string' },
+                description: { type: 'string' },
+                icon: {
+                  type: 'string',
+                  description:
+                    "The page's own icon as an Iconify reference, or empty where it has none."
+                },
+                url: {
+                  type: 'string',
+                  description: 'Where that page is, as a path on its own site.'
+                },
+                hostname: {
+                  type: 'string',
+                  nullable: true,
+                  description:
+                    'The host its site answers on, for a page on another site of this instance. Null when it is on the site being read, or on the catch-all site.'
+                },
+                href: {
+                  type: 'string',
+                  description: 'The link as that page writes it, which is what a repair would edit.'
+                },
+                kind: {
+                  type: 'string',
+                  description: 'How the link addresses this page: by path, by alias or by id.'
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      // -> The site-wide switch, as `requireBuiltInPage` checks the comments one: with the feature
+      //    off there is nothing here to answer, however the page itself is set
+      if (!WIKI.models.pageLinks.isAllowed(req.params.siteId)) {
+        return reply.notFound('This site does not show what links to a page.')
+      }
+      const page = await loadReadablePage(req, req.params.siteId, req.params.pageId)
+      if (!page) {
+        return reply.notFound('This page does not exist.')
+      }
+      // -> As the history route does: a page withheld until its password is entered withholds what is
+      //    derived from it too, and its link graph names it in one direction and reads its content in
+      //    the other
+      if (page.isLocked) {
+        return reply.forbidden('This page is password protected.')
+      }
+
+      const backlinks = await WIKI.models.pageLinks.backlinksFor(
+        { siteId: req.params.siteId, locale: page.locale, path: page.path },
+        { pageId: page.id, alias: page.alias }
+      )
+
+      return backlinks
+        .filter((link) =>
+          mayOnPage(req, 'read:pages', {
+            siteId: link.siteId,
+            locale: link.locale,
+            path: link.path,
+            tags: link.tags
+          })
+        )
+        .map((link) => ({
+          id: link.pageId,
+          siteId: link.siteId,
+          locale: link.locale,
+          path: link.path,
+          title: link.title,
+          description: link.description ?? '',
+          icon: link.icon ?? '',
+          url: link.url,
+          hostname: link.hostname,
+          href: link.href,
+          kind: link.kind
+        }))
+    }
+  )
+
+  /**
+   * LIST OUTBOUND LINKS
+   *
+   * What this page links to, and whether anything is there.
+   *
+   * The red-link question. Resolution is a join rather than a stored flag, so a page created at a path
+   * somebody had already linked to makes that link good without anything having to notice.
+   */
+  app.get<{ Params: { siteId: string; pageId: string } }>(
+    '/sites/:siteId/pages/:pageId/links',
+    {
+      config: {
+        scope: 'pages'
+      },
+      // -> No route-level `permissions`: `read:pages` on the page itself, as above
+      schema: {
+        summary: 'List the links written on a page',
+        description:
+          "Every link this page's content, redirection target or sidebar relations point at, each with the href as written and what it resolves to. `exists` is false for a link addressing a page that is not there — the state a wiki draws as a red link.\n\nLinks leaving the wiki are not recorded and are not listed. Uploaded files are listed but never resolved: they are tracked so a moved file can be traced back to what pointed at it, and answering whether one exists is a different lookup.",
+        tags: ['Pages'],
+        params: pageIdParam,
+        response: {
+          200: {
+            description: 'Links written on this page',
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                href: { type: 'string' },
+                kind: { type: 'string' },
+                targetSiteId: { type: 'string', format: 'uuid' },
+                targetLocale: { type: 'string', nullable: true },
+                targetPath: { type: 'string', nullable: true },
+                targetId: { type: 'string', format: 'uuid', nullable: true },
+                targetTitle: { type: 'string', nullable: true },
+                exists: { type: 'boolean' }
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const page = await loadReadablePage(req, req.params.siteId, req.params.pageId)
+      if (!page) {
+        return reply.notFound('This page does not exist.')
+      }
+      // -> These come out of the page's own body, which is the half a password withholds
+      if (page.isLocked) {
+        return reply.forbidden('This page is password protected.')
+      }
+
+      const links = await WIKI.models.pageLinks.outboundFor(page.id)
+
+      return links.map((link) => ({
+        href: link.href,
+        kind: link.kind,
+        targetSiteId: link.targetSiteId,
+        targetLocale: link.targetLocale,
+        targetPath: link.targetPath,
+        targetId: link.targetPageId,
+        /*
+          Only what the caller may read, for the reason the backlinks route filters: whether a page
+          exists at a path is something a rule decides they may know. A link to a page they may not
+          read reads as a link to nothing, which is also what clicking it would give them.
+
+          Judged on where the RESOLVED page sits rather than on what the link said about it — an alias
+          or an id link names no address at all — and with its tags, since a rule may be written
+          against those.
+        */
+        ...(link.targetPageId &&
+        !mayOnPage(req, 'read:pages', {
+          siteId: link.targetSiteId,
+          locale: link.targetPageLocale ?? undefined,
+          path: link.targetPagePath ?? '',
+          tags: link.targetPageTags ?? []
+        })
+          ? { targetTitle: null, exists: false }
+          : { targetTitle: link.targetTitle, exists: Boolean(link.targetPageId) })
+      }))
+    }
+  )
+
+  /**
+   * PAGE USER PERMISSIONS
+   */
+  app.post<{ Params: { siteId: string }; Body: { path: string; locale?: string } }>(
+    '/sites/:siteId/pages/userPermissions',
+    {
+      config: {
+        scope: 'pages:read'
+      },
+      schema: {
+        summary: 'Get page user permissions',
+        description:
+          "Which page permissions the caller holds AT THIS PATH, as their groups' rules decide. This is what the interface hides its controls by, so it answers the same question the endpoints themselves do rather than a broader one.\n\nA rule may address pages by tag, so the tags of the page actually sitting at the path are part of the answer — they are read here rather than sent, and a path with no page on it has none.\n\nAn administrator holds all of them. Everybody else gets whatever their rules grant, which for a path nobody wrote a rule for is nothing at all.",
+        tags: ['Pages'],
+        params: siteIdParam,
+        body: {
+          type: 'object',
+          required: ['path'],
+          properties: {
+            path: {
+              type: 'string',
+              minLength: 1,
+              maxLength: 255
+            },
+            locale: {
+              type: 'string',
+              maxLength: 255,
+              description:
+                "The locale the path is in. Rules are granted per locale, so a path answers differently in each. The site's primary one when absent."
+            }
+          },
+          examples: [
+            {
+              path: 'foo/bar',
+              locale: 'en'
+            }
+          ]
+        },
+        response: {
+          200: {
+            description: 'Permissions the current user holds for this page',
+            type: 'array',
+            items: { type: 'string' }
+          }
+        }
+      }
+    },
+    async (req) => {
+      const path = req.body.path.replace(/^\/+/, '')
+      /*
+        The page's own tags, looked up rather than taken from the request: a rule may address pages
+        by tag, so the answer is only the same one the endpoints give if it is asked of the page that
+        is actually there. A path with no page answers with none, which is right — there is nothing
+        for a tag rule to have matched, and what may be done at an empty path is a question about the
+        path alone.
+      */
+      const tags = await WIKI.models.pages.tagsAt(req.params.siteId, {
+        path,
+        locale: req.body.locale
+      })
+      return pagePermissionsFor(req, {
+        siteId: req.params.siteId,
+        path,
+        locale: req.body.locale,
+        tags
+      })
+    }
+  )
+}
+
+export default routes

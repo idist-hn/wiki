@@ -1,0 +1,473 @@
+import * as client from 'openid-client'
+import { describeAuthError, missingSettings, strategyDebug } from '../../../helpers/authDebug.ts'
+import type {
+  AuthFlow,
+  AuthFlowCallback,
+  AuthLogout,
+  ProviderProfile,
+  ProviderProfileMetaKey
+} from '../../../models/authentication.ts'
+
+/** Which setting names the claim for each profile field a provider may fill in. */
+const META_CLAIM_SETTINGS: Record<ProviderProfileMetaKey, string> = {
+  location: 'locationClaim',
+  jobTitle: 'jobTitleClaim',
+  pronouns: 'pronounsClaim'
+}
+
+/**
+ * OpenID Connect / OAuth2
+ *
+ * The authorization code flow with PKCE, against any provider that speaks OpenID Connect. What makes
+ * it OIDC rather than bare OAuth2 is the ID token: a signed statement of who signed in, which is
+ * verified here against the provider's published keys — issuer, audience, nonce and signature — before
+ * anything is believed about the person behind it.
+ *
+ * That verification is why this goes through `openid-client` rather than a handful of `fetch` calls.
+ * The requests themselves are trivial; the checks around them are where a mistake is silent, because
+ * a token that is never verified still logs somebody in.
+ *
+ * Everything past the verification is reading claims, and which claim carries what is configurable
+ * throughout — providers agree on the flow far more than they agree on their vocabulary.
+ */
+export default class OidcAuthentication {
+  strategyId: string
+  conf: Record<string, any>
+  /** Set by `models/authentication.ts` right after construction. */
+  module?: string
+
+  /**
+   * The provider as `openid-client` sees it. Built once and kept: with discovery on it is a network
+   * round trip, and it is the same answer for every login until the strategy is saved again.
+   */
+  private config: client.Configuration | null = null
+
+  constructor(strategyId: string, conf: Record<string, any>) {
+    this.strategyId = strategyId
+    this.conf = conf
+  }
+
+  /**
+   * Resolve the provider's metadata.
+   *
+   * Discovery is the path worth taking: the endpoints AND the signing keys come from the issuer
+   * itself, so a provider rotating either is followed without an administrator editing anything. The
+   * manual path exists for providers that publish no discovery document, and needs the JWKS URL for
+   * the same reason — without keys there is nothing to check the ID token against.
+   */
+  private async configuration(): Promise<client.Configuration> {
+    if (this.config) {
+      return this.config
+    }
+    const { clientId, clientSecret, issuer } = this.conf
+    if (!clientId || !clientSecret || !issuer) {
+      strategyDebug(
+        this,
+        `is not configured: ${missingSettings({ 'Client ID': clientId, 'Client Secret': clientSecret, Issuer: issuer })}`
+      )
+      throw new Error('ERR_STRATEGY_MISCONFIGURED')
+    }
+    if (this.conf.useDiscovery !== false) {
+      strategyDebug(this, `reading the provider's metadata from ${issuer}`)
+      try {
+        this.config = await client.discovery(new URL(issuer), clientId, clientSecret)
+      } catch (err: any) {
+        // -> The first thing to fail on a new strategy, and it fails for reasons the log has to
+        //    carry: an issuer that is not a URL, one publishing no discovery document, TLS
+        strategyDebug(
+          this,
+          `could not read the provider's metadata from ${issuer}: ${describeAuthError(err)}`
+        )
+        throw err
+      }
+      const meta = this.config.serverMetadata()
+      strategyDebug(
+        this,
+        `the provider is ${meta.issuer} — authorization at ${meta.authorization_endpoint}, token at ${meta.token_endpoint}, userinfo at ${meta.userinfo_endpoint ?? 'nowhere (it publishes none)'}`
+      )
+    } else {
+      if (!this.conf.authorizationURL || !this.conf.tokenURL || !this.conf.jwksURL) {
+        strategyDebug(
+          this,
+          `has discovery turned off and is not configured: ${missingSettings({ 'Authorization Endpoint URL': this.conf.authorizationURL, 'Token Endpoint URL': this.conf.tokenURL, 'JWKS Endpoint URL': this.conf.jwksURL })}`
+        )
+        throw new Error('ERR_STRATEGY_MISCONFIGURED')
+      }
+      this.config = new client.Configuration(
+        {
+          issuer,
+          authorization_endpoint: this.conf.authorizationURL,
+          token_endpoint: this.conf.tokenURL,
+          userinfo_endpoint: this.conf.userInfoURL || undefined,
+          jwks_uri: this.conf.jwksURL,
+          // -> So `logoutUrl()` reads it from one place whichever way the provider was described
+          end_session_endpoint: this.conf.logoutURL || undefined
+        },
+        clientId,
+        clientSecret
+      )
+    }
+    // -> After either branch: which endpoint the userinfo request goes to is what discovery answers,
+    //    and how the token is presented to it is a separate question with the same answer either way
+    if (this.conf.useQueryStringForAccessToken === true) {
+      this.accessTokenInQueryString(this.config)
+    }
+    return this.config
+  }
+
+  /**
+   * Move the access token out of the Authorization header and onto the userinfo request's query
+   * string, as `access_token`.
+   *
+   * Both are ways OAuth2 defines of presenting a bearer token, and the header is the one to use — the
+   * query string puts a live credential in every access log and referrer between here and the
+   * provider, which is why the spec discourages it. It is offered because some providers read the
+   * token from nowhere else, which has nothing to do with whether they publish a discovery document.
+   *
+   * The request is rewritten rather than written out again, because reimplementing the call would
+   * mean reimplementing its subject check and its signed-response handling too, and a userinfo answer
+   * nobody checked may be about somebody else.
+   */
+  private accessTokenInQueryString(config: client.Configuration): void {
+    const endpoint = config.serverMetadata().userinfo_endpoint
+    // -> The library asks for the endpoint's `href`, so the configured string is normalized once here
+    //    rather than compared as it was typed
+    const userInfoHref = endpoint ? new URL(endpoint).href : null
+    config[client.customFetch] = (url, options) => {
+      // -> Only a Bearer presentation is moved: a DPoP-bound token is not a credential the query
+      //    string can carry, and every other request the library makes is somebody else's business
+      const bearer = /^Bearer (.+)$/.exec(options.headers.authorization ?? '')?.[1]
+      if (!userInfoHref || !bearer || new URL(url).href !== userInfoHref) {
+        return fetch(url, options)
+      }
+      const target = new URL(url)
+      target.searchParams.set('access_token', bearer)
+      const headers = { ...options.headers }
+      delete headers.authorization
+      return fetch(target, { ...options, headers })
+    }
+  }
+
+  /**
+   * Where to send the browser to sign in.
+   *
+   * `acr_values` asks the provider for a kind of authentication rather than telling it to use one:
+   * OpenID Connect makes the parameter voluntary, and the context actually satisfied comes back as
+   * the `acr` claim. So it goes on the request here and is checked again in `profile()` — the same
+   * division the Google module makes for a Workspace domain.
+   */
+  async authorizationUrl({ redirectUri, state, nonce, codeVerifier }: AuthFlow): Promise<string> {
+    const config = await this.configuration()
+    const acr = this.acrValues()
+    return client
+      .buildAuthorizationUrl(config, {
+        redirect_uri: redirectUri,
+        scope: this.conf.scopes || 'openid profile email',
+        state,
+        nonce,
+        code_challenge: await client.calculatePKCECodeChallenge(codeVerifier),
+        code_challenge_method: 'S256',
+        ...(acr.length > 0 ? { acr_values: acr.join(' ') } : {})
+      })
+      .toString()
+  }
+
+  /**
+   * Turn the code the provider sent back into who signed in.
+   *
+   * `authorizationCodeGrant` is what does the checking: it refuses a response whose state does not
+   * match the one this flow started with, exchanges the code with the PKCE verifier, and validates
+   * the ID token's signature, issuer, audience and nonce. Everything after it is reading claims.
+   */
+  async profile({
+    currentUrl,
+    state,
+    nonce,
+    codeVerifier
+  }: AuthFlowCallback): Promise<ProviderProfile> {
+    const config = await this.configuration()
+    let tokens
+    try {
+      tokens = await client.authorizationCodeGrant(config, new URL(currentUrl), {
+        expectedState: state,
+        expectedNonce: nonce,
+        pkceCodeVerifier: codeVerifier
+      })
+    } catch (err: any) {
+      /*
+        Everything the flow is checked by is in here — the state, the PKCE verifier, the code
+        exchange, and the ID token's signature, issuer, audience and nonce — so this one line covers a
+        redirect URI the provider does not have registered, a client secret that has been rotated, a
+        clock that is out, and a token signed by a key the issuer does not publish.
+      */
+      strategyDebug(this, `the provider's answer did not check out: ${describeAuthError(err)}`)
+      throw err
+    }
+    const claims = tokens.claims()
+    if (!claims?.sub) {
+      strategyDebug(
+        this,
+        'the provider returned no ID token, so there is nothing signed saying who signed in'
+      )
+      throw new Error('ERR_NO_ID_TOKEN')
+    }
+    // -> Before the userinfo round trip: no point spending one on a login already being refused
+    this.checkAuthContext(claims)
+
+    /*
+      The userinfo endpoint is consulted when the provider has one, because a provider is free to keep
+      claims out of the ID token and behind it — several put the email address there only, and group
+      membership is behind it more often than not. Its answer is merged over the token's, and
+      `fetchUserInfo` checks that it is about the same subject.
+    */
+    let info: Record<string, any> = claims
+    if (config.serverMetadata().userinfo_endpoint) {
+      try {
+        info = {
+          ...claims,
+          ...(await client.fetchUserInfo(config, tokens.access_token, claims.sub))
+        }
+      } catch (err: any) {
+        strategyDebug(this, `the userinfo endpoint could not be read: ${describeAuthError(err)}`)
+        throw err
+      }
+    }
+    strategyDebug(this, `the provider says: ${Object.keys(info).join(', ')}`)
+
+    /*
+      `sub` is the identifier OIDC guarantees is stable and never reassigned, and is what this reads
+      unless an administrator names another claim. Whichever it is, it is what the account is linked
+      by from here on — the ID token's own subject stays what the library verified the answer against.
+    */
+    const idClaim = this.conf.idClaim || 'sub'
+    const id = info[idClaim]
+    if (!id || typeof id !== 'string') {
+      strategyDebug(
+        this,
+        `the \`${idClaim}\` claim carries no identifier for this account (Unique ID Claim)`
+      )
+      throw new Error('ERR_NO_PROVIDER_ACCOUNT')
+    }
+    const emailClaim = this.conf.emailClaim || 'email'
+    const email = info[emailClaim]
+    if (!email || typeof email !== 'string') {
+      strategyDebug(
+        this,
+        `the \`${emailClaim}\` claim carries no address, and an account here is matched by address (Email Claim)`
+      )
+      throw new Error('ERR_NO_EMAIL_FROM_PROVIDER')
+    }
+    this.checkEmailVerified(info, email)
+    const groups = this.conf.mapGroups === true ? this.groupsFrom(info) : undefined
+    strategyDebug(
+      this,
+      `${id} signs in as <${email}>${groups ? `, in ${groups.length} provider group(s)` : ', groups not mapped'}`
+    )
+    return {
+      id,
+      email,
+      name: (info[this.conf.displayNameClaim || 'name'] as string) || email,
+      picture: this.pictureFrom(info),
+      meta: this.metaFrom(info),
+      // -> Absent rather than empty when groups are not mapped: an empty list is the provider saying
+      //    this person is in none, which with `unassignMissingGroups` on takes memberships away
+      ...(groups
+        ? {
+            groups,
+            groupsExclusive: this.conf.unassignMissingGroups === true
+          }
+        : {})
+    }
+  }
+
+  /**
+   * The authentication contexts this wiki asks for, most preferred first.
+   *
+   * Empty unless the setting is on, so turning it off stops asking rather than leaving whatever was
+   * typed on every request.
+   */
+  private acrValues(): string[] {
+    if (this.conf.useAcrValues !== true) {
+      return []
+    }
+    return String(this.conf.acrValues || '')
+      .split(/\s+/)
+      .filter((one) => one.length > 0)
+  }
+
+  /**
+   * Hold the provider to the authentication context that was asked for.
+   *
+   * Read from the ID TOKEN's claims and not from the merged userinfo answer, deliberately: `acr` is a
+   * statement about how the person authenticated, and the only thing entitled to make it is the
+   * document the provider signed. A userinfo response is fetched with an access token and must not be
+   * able to assert its own authentication context.
+   *
+   * Strict about the shape as well as the value. `acr` is a single string in the spec, so anything
+   * else — absent, an array from a provider that has misread it — counts as not satisfied: this is the
+   * check that stands between a wiki and a login weaker than it asked for, and the useful direction
+   * for it to fail in is closed.
+   *
+   * @throws `ERR_ACR_NOT_SATISFIED`, or `ERR_STRATEGY_MISCONFIGURED` when the requirement is turned
+   *         on with nothing named to require
+   */
+  private checkAuthContext(claims: Record<string, any>): void {
+    if (this.conf.useAcrValues !== true || this.conf.requireAcr !== true) {
+      return
+    }
+    const wanted = this.acrValues()
+    if (wanted.length < 1) {
+      // -> Fails closed. "Require the context" with no context named cannot be satisfied or refuted,
+      //    and silently letting everybody through is the one answer that must not be given.
+      WIKI.logger.warn(
+        `OIDC strategy ${this.strategyId} requires an authentication context but names none — refusing logins until ACR Values is filled in or the requirement is turned off.`
+      )
+      throw new Error('ERR_STRATEGY_MISCONFIGURED')
+    }
+    const satisfied = claims.acr
+    if (typeof satisfied !== 'string' || !wanted.includes(satisfied)) {
+      WIKI.logger.warn(
+        `OIDC strategy ${this.strategyId} refused a login: asked for acr ${wanted.join(' ')}, the provider answered ${JSON.stringify(satisfied) ?? 'nothing'}.`
+      )
+      throw new Error('ERR_ACR_NOT_SATISFIED')
+    }
+  }
+
+  /**
+   * Hold the provider to having verified the email address, when the strategy requires it.
+   *
+   * Read from the merged answer rather than the ID token alone, unlike `acr`: the address itself is
+   * read from there, and a provider that keeps `email` behind the userinfo endpoint keeps
+   * `email_verified` beside it.
+   *
+   * The spec makes `email_verified` a JSON boolean, and `true` is the answer to expect. The rest of
+   * what counts is what providers are known to send instead, all of it unambiguous: the string
+   * `"true"` in any casing (Cognito sends `"true"`, a claim mapped from a string attribute or written
+   * by Python's `str()` comes out `"True"`), and `1` or `"1"` from a provider storing the flag as an
+   * integer column. Nothing looser — `"yes"` or `"verified"` is a value this would have to guess at,
+   * and one it should refuse.
+   *
+   * Absent counts as not verified — this is the check that stops an address nobody proved they hold
+   * from logging into the account that has it, so the direction for it to fail in is closed.
+   *
+   * @throws `ERR_EMAIL_NOT_VERIFIED`
+   */
+  private checkEmailVerified(info: Record<string, any>, email: string): void {
+    if (this.conf.requireVerifiedEmail !== true) {
+      return
+    }
+    const claim = this.conf.verifiedEmailClaim || 'email_verified'
+    const verified = info[claim]
+    const normalized = typeof verified === 'string' ? verified.trim().toLowerCase() : verified
+    if (normalized !== true && normalized !== 1 && normalized !== 'true' && normalized !== '1') {
+      strategyDebug(
+        this,
+        `the \`${claim}\` claim does not say <${email}> is verified (it says ${JSON.stringify(verified) ?? 'nothing'}), and this strategy requires a verified address (Verified Email Claim)`
+      )
+      throw new Error('ERR_EMAIL_NOT_VERIFIED')
+    }
+  }
+
+  /**
+   * The URL of the account's picture, if the claim carrying it names one.
+   *
+   * An empty claim name turns this off, which is how a wiki lets people keep an avatar they chose
+   * here rather than having it replaced at every sign-in.
+   */
+  private pictureFrom(info: Record<string, any>): string | undefined {
+    const claim = this.conf.pictureClaim ?? 'picture'
+    if (!claim) {
+      return undefined
+    }
+    const value = info[claim]
+    return typeof value === 'string' && value.length > 0 ? value : undefined
+  }
+
+  /**
+   * The profile fields the claims carry, for those an administrator has mapped.
+   *
+   * Every one is unmapped by default, so people keep what they set here. A mapped claim that is
+   * missing from the answer leaves the field alone too — a provider that leaves a claim out has
+   * usually not been asked for it (a scope, an attribute not released to this client), which is not
+   * the same as saying the person has none. A claim that is present but empty does clear it.
+   */
+  private metaFrom(info: Record<string, any>): ProviderProfile['meta'] {
+    const meta: ProviderProfile['meta'] = {}
+    for (const [key, setting] of Object.entries(META_CLAIM_SETTINGS) as [
+      ProviderProfileMetaKey,
+      string
+    ][]) {
+      const claim = this.conf[setting]
+      if (!claim) {
+        continue
+      }
+      const value = info[claim]
+      if (typeof value !== 'string') {
+        strategyDebug(
+          this,
+          `the \`${claim}\` claim carries no text for ${key}, which is left as it was`
+        )
+        continue
+      }
+      meta[key] = value
+    }
+    return meta
+  }
+
+  /**
+   * The group names the claim carries.
+   *
+   * Either one name or a list of them: a provider with a single group per account commonly sends the
+   * bare string, and both forms mean the same thing here. Anything else in the list — a nested object
+   * from a provider that sends group records rather than names — is skipped rather than stringified,
+   * since a name that matches nothing is a membership silently not granted.
+   */
+  private groupsFrom(info: Record<string, any>): string[] {
+    const claim = this.conf.groupsClaim || 'groups'
+    const value = info[claim]
+    const raw = typeof value === 'string' ? [value] : Array.isArray(value) ? value : []
+    const names = raw
+      .filter((entry) => typeof entry === 'string' && entry.trim().length > 0)
+      .map((entry) => entry.trim())
+    /*
+      Said even when it is empty, and especially then: a provider that emits the groups claim only for
+      a client asking for the right scope — or only once the claim is configured on the application —
+      answers with nothing here, which is not distinguishable on the wiki side from somebody genuinely
+      being in no group.
+    */
+    strategyDebug(
+      this,
+      `the \`${claim}\` claim names ${names.length} group(s): ${names.join(', ') || 'none'}`
+    )
+    return names
+  }
+
+  /**
+   * Where a logout should continue, so that the session at the provider ends too.
+   *
+   * Discovered when discovery is on, which is why the field is only asked for when it is off: the
+   * `end_session_endpoint` is published in the same document as every other endpoint, and a provider
+   * that moves it is then followed without an administrator editing anything. Null when the provider
+   * publishes none — plenty do not, and RP-initiated logout is optional in the spec.
+   *
+   * Sent bare unless Return After Logout is on, and the provider then decides where the browser goes
+   * — usually a page of its own saying the session has ended. On, it carries
+   * `post_logout_redirect_uri`, the wiki's own Logout Redirect, and the `client_id` the spec asks to
+   * accompany it when there is no `id_token_hint` (which would mean keeping ID tokens). A provider
+   * only honours an address registered for the client, which is why this is off by default: turned
+   * on before the address is registered, it makes the provider refuse the logout with an error page.
+   */
+  async logoutUrl({ returnTo }: AuthLogout): Promise<string | null> {
+    const config = await this.configuration()
+    const endpoint = config.serverMetadata().end_session_endpoint
+    if (!endpoint) {
+      return null
+    }
+    if (this.conf.returnAfterLogout !== true) {
+      return endpoint
+    }
+    strategyDebug(this, `asking the provider to return to ${returnTo} after its logout`)
+    // -> `client_id` is added by the library itself
+    return client.buildEndSessionUrl(config, { post_logout_redirect_uri: returnTo }).toString()
+  }
+}
